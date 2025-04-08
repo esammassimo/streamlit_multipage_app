@@ -1,0 +1,6 @@
+streamlit
+pandas
+requests
+openai
+youtube-transcript-api
+python-docx
