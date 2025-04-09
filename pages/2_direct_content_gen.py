@@ -9,12 +9,26 @@ st.set_page_config(page_title="AI Content Generator", layout="wide")
 st.title("📝 AI Content Generator - Articles & Recipes")
 
 # 📌 Inserimento della chiave API di OpenAI
-oai_api_key = st.text_input("Insert your OpenAI API KEY", type="password")
-if not oai_api_key:
-    st.warning("⚠️ Insert your API KEY to continue.")
-    st.stop()
+def get_openai_api_key():
+    with st.sidebar:
+        st.subheader("🔐 API Key OpenAI")
+        if 'oai_api_key' not in st.session_state:
+            st.session_state['oai_api_key'] = ""
 
-oai_client = openai.Client(api_key=oai_api_key)
+        oai_api_key = st.text_input(
+            "Insert your OpenAI API KEY",
+            type="password",
+            value=st.session_state['oai_api_key']
+        )
+
+        if not oai_api_key:
+            st.warning("⚠️ Insert your API KEY to continue.")
+            st.stop()
+
+        # Salva in sessione
+        st.session_state['oai_api_key'] = oai_api_key
+        return oai_api_key
+    oai_client = openai.Client(api_key=oai_api_key)
 
 # 📌 Creazione delle due Tab
 tab1, tab2 = st.tabs(["📝 Articles", "🍽 Recipes"])

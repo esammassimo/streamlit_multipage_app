@@ -12,8 +12,27 @@ def extract_video_id(url):
 
 st.title("🎥 YouTube Transcript & Summary Generator")
 
-# Input API Key
-oai_key = st.text_input("🔑 Enter your OpenAI API Key", type="password")
+# 📌 Inserimento della chiave API di OpenAI
+def get_openai_api_key():
+    with st.sidebar:
+        st.subheader("🔐 API Key OpenAI")
+        if 'oai_api_key' not in st.session_state:
+            st.session_state['oai_api_key'] = ""
+
+        oai_api_key = st.text_input(
+            "Insert your OpenAI API KEY",
+            type="password",
+            value=st.session_state['oai_api_key']
+        )
+
+        if not oai_api_key:
+            st.warning("⚠️ Insert your API KEY to continue.")
+            st.stop()
+
+        # Salva in sessione
+        st.session_state['oai_api_key'] = oai_api_key
+        return oai_api_key
+    oai_key = openai.Client(api_key=oai_api_key)
 
 # Input YouTube video URL and language
 youtube_url = st.text_input("📺 Enter YouTube video URL")
