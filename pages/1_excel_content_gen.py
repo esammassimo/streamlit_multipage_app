@@ -11,13 +11,26 @@ import zipfile
 st.title("OpenAI Content Generation 📝")
 
 # 📌 Inserimento della chiave API di OpenAI
-oai_api_key = st.text_input("Insert your OpenAI API KEY", type="password")
-if not oai_api_key:
-    st.warning("⚠️ Insert your API KEY to continue.")
-    st.stop()
+def get_openai_api_key():
+    with st.sidebar:
+        st.subheader("🔐 API Key OpenAI")
+        if 'oai_api_key' not in st.session_state:
+            st.session_state['oai_api_key'] = ""
 
-# 📌 Configurazione API OpenAI
-oai_client = openai.Client(api_key=oai_api_key)
+        oai_api_key = st.text_input(
+            "Insert your OpenAI API KEY",
+            type="password",
+            value=st.session_state['oai_api_key']
+        )
+
+        if not oai_api_key:
+            st.warning("⚠️ Insert your API KEY to continue.")
+            st.stop()
+
+        # Salva in sessione
+        st.session_state['oai_api_key'] = oai_api_key
+        return oai_api_key
+    oai_client = openai.Client(api_key=oai_api_key)
 
 # 📌 Caricamento del file Excel
 uploaded_file = st.file_uploader("Upload Excel file", type=["xlsx"])
