@@ -4,49 +4,48 @@ import os
 import tempfile
 from docx import Document
 
-# 📌 Configurazione API OpenAI
+# 📌 Configurazione pagina
 st.set_page_config(page_title="AI Content Generator", layout="wide")
 st.title("📝 AI Content Generator - Articles & Recipes")
 
-# 📌 Inserimento della chiave API di OpenAI
+# 📌 Inserimento API Key OpenAI
 def get_openai_api_key():
     with st.sidebar:
         st.subheader("🔐 API Key OpenAI")
-        if 'oai_api_key' not in st.session_state:
-            st.session_state['oai_api_key'] = ""
-
-        oai_api_key = st.text_input(
-            "Insert your OpenAI API KEY",
-            type="password",
-            value=st.session_state['oai_api_key']
-        )
-
-        if not oai_api_key:
+        api_key = st.text_input("Insert your OpenAI API KEY", type="password")
+        if not api_key:
             st.warning("⚠️ Insert your API KEY to continue.")
             st.stop()
+        return api_key
 
-        # Salva in sessione
-        st.session_state['oai_api_key'] = oai_api_key
-        return oai_api_key
-    oai_client = openai.Client(api_key=oai_api_key)
+openai.api_key = get_openai_api_key()
 
-# 📌 Creazione delle due Tab
+# 📌 Funzione generica per generazione contenuto
+def generate_openai_content(system_prompt, user_prompt, model="gpt-4", temperature=0.7, max_tokens=1500):
+    response = openai.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature=temperature,
+        max_tokens=max_tokens
+    )
+    return response.choices[0].message.content.strip()
+
+# 📌 Creazione Tabs
 tab1, tab2 = st.tabs(["📝 Articles", "🍽 Recipes"])
 
-# 📌 📝 TAB 1 - Generazione Articoli
+# 📝 TAB ARTICOLI
 with tab1:
     st.header("📄 Generate Articles")
 
     with st.form("article_form"):
-        title = st.text_input("Title of the content")
+        title = st.text_input("Title of the article")
         seo_title = st.text_input("SEO Title")
         meta_description = st.text_area("Meta Description")
         min_words = st.number_input("Minimum number of words:", min_value=100, value=800, step=100)
-
-        # 📌 Tone of Voice
         tone_of_voice = st.selectbox("Tone of Voice", ["Informale", "Professionale", "Formale"])
-
-        # 📌 Fonte autorevole (non citata nel testo)
         source_text = st.text_area("Fonte autorevole (non verrà citata direttamente)")
 
         st.subheader("📝 Paragraphs (max 5)")
@@ -64,17 +63,34 @@ with tab1:
         submit_article = st.form_submit_button("Generate Article")
 
     if submit_article:
-        if not title or not seo_title or not meta_description or len(paragraphs) == 0:
+        if not title or not seo_title or not meta_description or not paragraphs:
             st.error("❌ Please fill out all required fields.")
         else:
-            st.write(f"📝 Generating article: {title}...")
+            st.success(f"📝 Generating article: {title}...")
 
-            full_text = []
+            generated_sections = []
             for p_title, p_desc in paragraphs:
-                paragraph_text = f"## {p_title}\n\n{p_desc}"
-                full_text.append(paragraph_text)
+                prompt = f"""
+                Scrivi un paragrafo con il titolo "{p_title}".
+                Il tono deve essere {tone_of_voice.lower()}.
+                Il contenuto deve sviluppare questa idea: "{p_desc}".
+                Deve contenere almeno {min_words // len(paragraphs)} parole.
+                La fonte seguente può servire da contesto (non citarla): {source_text}
+                """
+                content = generate_openai_content(
+                    "Sei un esperto redattore SEO.", prompt,
+                    temperature=0.7, max_tokens=1800
+                )
+                generated_sections.append((p_title, content))
 
-            # 📌 Creazione del file Word
+            # 📄 Anteprima del contenuto
+            st.subheader("📖 Anteprima Articolo")
+            st.markdown(f"# {title}")
+            st.markdown(f"**SEO Title**: {seo_title}\n\n**Meta Description**: {meta_description}")
+            for p_title, p_text in generated_sections:
+                st.markdown(f"## {p_title}\n\n{p_text}")
+
+            # 📁 Esporta in Word
             temp_dir = tempfile.mkdtemp()
             file_path = os.path.join(temp_dir, f"{title.replace(' ', '_')}.docx")
 
@@ -84,32 +100,24 @@ with tab1:
             doc.add_paragraph(f"Meta Description: {meta_description}")
             doc.add_paragraph(f"Tone of Voice: {tone_of_voice}")
 
-            for paragraph in full_text:
-                doc.add_paragraph(paragraph)
+            for p_title, p_text in generated_sections:
+                doc.add_heading(p_title, level=2)
+                doc.add_paragraph(p_text)
 
             doc.save(file_path)
+            with open(file_path, "rb") as f:
+                st.download_button("📥 Download Article (.docx)", f, file_name=os.path.basename(file_path))
 
-            with open(file_path, "rb") as docx_file:
-                st.download_button("📥 Download Article (.docx)", docx_file, file_name=f"{title.replace(' ', '_')}.docx")
-
-# 📌 🍽 TAB 2 - Generazione Ricette
+# 🍽 TAB RICETTE
 with tab2:
     st.header("🍽 Generate Recipes")
 
     with st.form("recipe_form"):
         recipe_title = st.text_input("Recipe Title")
         min_words_recipe = st.number_input("Minimum number of words:", min_value=100, value=500, step=50)
-
-        # 📌 Tone of Voice
         recipe_tone = st.selectbox("Tone of Voice", ["Informale", "Professionale", "Formale"], key="recipe_tone")
-
-        # 📌 Fonte autorevole (non citata direttamente)
         recipe_source = st.text_area("Fonte autorevole (non verrà citata direttamente)", key="recipe_source")
-
-        # 📌 Elenco ingredienti (dato in input, da non modificare)
         ingredients = st.text_area("Insert ingredients (one per line)", key="ingredients")
-
-        # 📌 Descrizione della preparazione
         preparation_desc = st.text_area("Describe the preparation process", key="preparation_desc")
 
         submit_recipe = st.form_submit_button("Generate Recipe")
@@ -118,57 +126,49 @@ with tab2:
         if not recipe_title or not ingredients or not preparation_desc:
             st.error("❌ Please fill out all required fields.")
         else:
-            st.write(f"🍽 Generating recipe: {recipe_title}...")
+            st.success(f"🍽 Generating recipe: {recipe_title}...")
 
-            # 📌 Generazione del testo
             intro_prompt = f"""
-            Scrivi una breve introduzione per la ricetta **{recipe_title}**. 
-            Il tono di voce deve essere **{recipe_tone.lower()}**. 
-            La fonte autorevole è fornita solo per contesto e **non deve essere citata direttamente**.
+            Scrivi una breve introduzione per la ricetta "{recipe_title}".
+            Il tono deve essere {recipe_tone.lower()}.
+            La fonte è solo per contesto (non citarla): {recipe_source}
             """
 
-            preparation_prompt = f"""
-            Scrivi un paragrafo dettagliato per la preparazione della ricetta **{recipe_title}**.
-            Il tono di voce deve essere **{recipe_tone.lower()}**.
+            prep_prompt = f"""
+            Scrivi un paragrafo dettagliato per spiegare come preparare "{recipe_title}".
             Deve contenere almeno {min_words_recipe} parole.
+            Gli ingredienti sono: {ingredients}
+            Il tono deve essere {recipe_tone.lower()}.
+            {preparation_desc}
             """
 
-            response_intro = oai_client.chat.completions.create(
-                model="gpt-4",
-                messages=[{"role": "system", "content": "Sei un esperto di cucina."},
-                          {"role": "user", "content": intro_prompt}],
-                temperature=0.7,
-                max_tokens=1500
-            )
+            recipe_intro = generate_openai_content("Sei un esperto di cucina.", intro_prompt)
+            recipe_prep = generate_openai_content("Sei un esperto di cucina.", prep_prompt, max_tokens=2500)
 
-            response_prep = oai_client.chat.completions.create(
-                model="gpt-4",
-                messages=[{"role": "system", "content": "Sei un esperto di cucina."},
-                          {"role": "user", "content": preparation_prompt}],
-                temperature=0.7,
-                max_tokens=2500
-            )
+            # 📄 Anteprima
+            st.subheader("📖 Anteprima Ricetta")
+            st.markdown(f"# {recipe_title}")
+            st.markdown(recipe_intro)
+            st.markdown("## Ingredienti")
+            st.markdown("\n".join([f"- {i}" for i in ingredients.strip().split("\n") if i.strip()]))
+            st.markdown("## Preparazione")
+            st.markdown(recipe_prep)
 
-            recipe_intro = response_intro.choices[0].message.content
-            recipe_prep = response_prep.choices[0].message.content
-
-            # 📌 Creazione del file Word
+            # 📁 Word export
             temp_dir = tempfile.mkdtemp()
             file_path = os.path.join(temp_dir, f"{recipe_title.replace(' ', '_')}.docx")
 
             doc = Document()
             doc.add_heading(recipe_title, level=1)
             doc.add_paragraph(f"Tone of Voice: {recipe_tone}")
-
             doc.add_paragraph(recipe_intro)
             doc.add_heading("Ingredienti", level=2)
-            for ingredient in ingredients.split("\n"):
-                doc.add_paragraph(f"• {ingredient}")
-
+            for ing in ingredients.strip().split("\n"):
+                if ing.strip():
+                    doc.add_paragraph(f"• {ing.strip()}")
             doc.add_heading("Preparazione", level=2)
             doc.add_paragraph(recipe_prep)
 
             doc.save(file_path)
-
-            with open(file_path, "rb") as docx_file:
-                st.download_button("📥 Download Recipe (.docx)", docx_file, file_name=f"{recipe_title.replace(' ', '_')}.docx")
+            with open(file_path, "rb") as f:
+                st.download_button("📥 Download Recipe (.docx)", f, file_name=os.path.basename(file_path))
