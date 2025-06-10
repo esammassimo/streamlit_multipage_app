@@ -7,6 +7,8 @@ import openai
 import time
 import streamlit as st
 
+st.title("🔍 Link Profiler")
+
 # === FUNZIONE DI RILEVAMENTO ENCODING ===
 def detect_encoding(file_path):
     with open(file_path, 'rb') as f:
@@ -26,7 +28,7 @@ def classify_anchor(text, brand_keywords):
         return "UNKNOWN"
     text_lower = text.lower().strip()
     word_count = len(text_lower.split())
-    if re.search(r'https?://|www\\.|\\.it|\\.com|\\.net|\\.org', text_lower):
+    if re.search(r'https?://|www\.|\.it|\.com|\.net', text_lower):
         return "URL"
     if any(brand.lower() in text_lower for brand in brand_keywords):
         return "BRAND"
@@ -97,7 +99,7 @@ def gpt_semantic_url_classification(urls, api_key, model="gpt-4", batch_size=10,
     return result_map
 
 # === STREAMLIT APP ===
-st.title("🔎 Link Profiler")
+st.title("🔎 Link Profiler per Brand")
 
 api_key = st.text_input("Inserisci la tua OpenAI API Key:", type="password")
 if not api_key:
@@ -107,37 +109,41 @@ if not api_key:
 brand_keywords_input = st.text_input("Parole chiave del brand (separate da virgola):")
 brand_keywords = [kw.strip().lower() for kw in brand_keywords_input.split(",") if kw.strip() != ""]
 
-output_name = st.text_input("Nome file brand/output (senza estensione):", value="link-analysis")
+uploaded_files = st.file_uploader("Carica uno o più file CSV (uno per brand) con le colonne 'Target URL', 'Anchor', 'Domain rating':", type=["csv"], accept_multiple_files=True)
 
-uploaded_file = st.file_uploader("Carica un file CSV con le colonne 'Target URL', 'Anchor', 'Domain rating':", type=["csv"])
-if uploaded_file:
-    encoding = detect_encoding(uploaded_file.name)
-    df = pd.read_csv(uploaded_file, encoding=encoding, sep=None, engine="python")
+if uploaded_files:
+    dfs = []
+    for uploaded_file in uploaded_files:
+        st.markdown(f"### 📄 {uploaded_file.name}")
+        encoding = detect_encoding(uploaded_file.name)
+        df = pd.read_csv(uploaded_file, encoding=encoding, sep=None, engine="python")
 
-    if not all(col in df.columns for col in ["Target URL", "Anchor", "Domain rating"]):
-        st.error("❌ Il file deve contenere le colonne 'Target URL', 'Anchor' e 'Domain rating'")
-        st.stop()
+        if not all(col in df.columns for col in ["Target URL", "Anchor", "Domain rating"]):
+            st.error(f"❌ Il file {uploaded_file.name} deve contenere le colonne richieste.")
+            continue
 
-    with st.spinner("🔄 Elaborazione in corso..."):
-        df["Domain rating class"] = df["Domain rating"].apply(classify_domain_rating)
-        df["Anchor class"] = df["Anchor"].apply(lambda x: classify_anchor(x, brand_keywords))
-        df["URL structure class"] = df["Target URL"].apply(classify_url_structure)
+        with st.spinner(f"🔄 Elaborazione in corso per {uploaded_file.name}..."):
+            df["Dominio"] = os.path.splitext(uploaded_file.name)[0]
+            df["Domain rating class"] = df["Domain rating"].apply(classify_domain_rating)
+            df["Anchor class"] = df["Anchor"].apply(lambda x: classify_anchor(x, brand_keywords))
+            df["URL structure class"] = df["Target URL"].apply(classify_url_structure)
 
-        url_list = df["Target URL"].dropna().unique().tolist()
-        url_category_map = gpt_semantic_url_classification(url_list, api_key)
-        df["URL Category"] = df["Target URL"].apply(lambda x: url_category_map.get(x, "UNKNOWN"))
+            url_list = df["Target URL"].dropna().unique().tolist()
+            url_category_map = gpt_semantic_url_classification(url_list, api_key)
+            df["URL Category"] = df["Target URL"].apply(lambda x: url_category_map.get(x, "UNKNOWN"))
 
-        st.success("✅ Classificazione completata")
+            st.success("✅ Classificazione completata")
+            st.dataframe(df.head(50))
 
-        st.dataframe(df.head(50))
+            dfs.append(df)
 
-        # Download file
-        output_file_path = f"{output_name}.xlsx"
-        df.to_excel(output_file_path, index=False)
-        with open(output_file_path, "rb") as f:
-            st.download_button("📥 Scarica file Excel completo", f, file_name=output_file_path)
+    if dfs:
+        final_df = pd.concat(dfs, ignore_index=True)
+        full_output_path = "classificazione_completa_tutti_brand.xlsx"
+        final_df.to_excel(full_output_path, index=False)
+        with open(full_output_path, "rb") as f:
+            st.download_button("📥 Scarica file Excel unificato", f, file_name=full_output_path)
 
-        # Riepilogo per categoria
-        grouped = df.groupby(["URL Category"]).size().reset_index(name="Totale link")
-        st.subheader("📊 Riepilogo URL per categoria")
+        grouped = final_df.groupby(["Dominio", "URL Category"]).size().reset_index(name="Totale link")
+        st.subheader("📊 Riepilogo per Dominio e Categoria")
         st.dataframe(grouped)
