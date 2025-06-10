@@ -58,6 +58,13 @@ def classify_url_structure(url):
     except:
         return "UNKNOWN"
 
+def extract_domain_from_url(url):
+    try:
+        parsed_url = urlparse(url)
+        return parsed_url.netloc.replace("www.", "")
+    except:
+        return "UNKNOWN"
+
 # === GPT CLASSIFIER ===
 def gpt_semantic_url_classification(urls, api_key, model="gpt-4", batch_size=10, pause=1.5):
     from openai import OpenAI
@@ -128,7 +135,7 @@ if uploaded_files:
                 st.error(f"❌ Il file {uploaded_file.name} non contiene tutte le colonne richieste e sarà ignorato.")
                 continue
 
-            df["Dominio"] = os.path.splitext(uploaded_file.name)[0]
+            df["Dominio"] = df["Target URL"].apply(extract_domain_from_url)
             df["Domain rating class"] = df["Domain rating"].apply(classify_domain_rating)
             df["Anchor class"] = df["Anchor"].apply(lambda x: classify_anchor(x, brand_keywords))
             df["URL structure class"] = df["Target URL"].apply(classify_url_structure)
