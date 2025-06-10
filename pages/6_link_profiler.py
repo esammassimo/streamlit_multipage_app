@@ -162,6 +162,29 @@ if uploaded_files:
             with open(full_output_path, "rb") as f:
                 st.download_button("📥 Scarica file Excel unificato", f, file_name="classificazione_completa_tutti_brand.xlsx")
 
+        st.subheader("📊 Riepiloghi per Dominio")
+
+        # 1. Numero di link per dominio
+        link_count = final_df.groupby("Dominio").size().reset_index(name="Totale link")
+        st.markdown("**Numero di link per Dominio**")
+        st.dataframe(link_count)
+
+        # 2. Domain rating per dominio
+        dr_summary = final_df.groupby(["Dominio", "Domain rating class"]).size().reset_index(name="Totale")
+        st.markdown("**Classificazione Domain Rating per Dominio**")
+        st.dataframe(dr_summary)
+
+        # 3. Anchor type per dominio
+        anchor_summary = final_df.groupby(["Dominio", "Anchor class"]).size().reset_index(name="Totale")
+        st.markdown("**Anchor Type per Dominio**")
+        st.dataframe(anchor_summary)
+
+        # 4. URL structure per dominio
+        structure_summary = final_df.groupby(["Dominio", "URL structure class"]).size().reset_index(name="Totale")
+        st.markdown("**Page Level per Dominio**")
+        st.dataframe(structure_summary)
+
+        # 5. Categoria GPT
         grouped = final_df.groupby(["Dominio", "URL Category"]).size().reset_index(name="Totale link")
-        st.subheader("📊 Riepilogo per Dominio e Categoria")
+        st.markdown("**Categorie assegnate da GPT**")
         st.dataframe(grouped)
