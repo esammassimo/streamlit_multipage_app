@@ -112,19 +112,22 @@ uploaded_files = st.file_uploader("Carica uno o più file CSV (uno per brand) co
 
 if uploaded_files:
     dfs = []
-    for uploaded_file in uploaded_files:
-        st.markdown(f"### 📄 {uploaded_file.name}")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
-            tmp.write(uploaded_file.getvalue())
-            tmp_path = tmp.name
-        encoding = detect_encoding(tmp_path)
-        df = pd.read_csv(tmp_path, encoding=encoding, sep=None, engine="python")
+    progress_bar = st.progress(0)
+    status_text = st.empty()
 
-        if not all(col in df.columns for col in ["Target URL", "Anchor", "Domain rating"]):
-            st.error(f"❌ Il file {uploaded_file.name} deve contenere le colonne richieste.")
-            continue
+    for idx, uploaded_file in enumerate(uploaded_files):
+        status_text.text(f"Elaborazione file: {uploaded_file.name} ({idx+1}/{len(uploaded_files)})")
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+                tmp.write(uploaded_file.getvalue())
+                tmp_path = tmp.name
+            encoding = detect_encoding(tmp_path)
+            df = pd.read_csv(tmp_path, encoding=encoding, sep=None, engine="python")
 
-        with st.spinner(f"🔄 Elaborazione in corso per {uploaded_file.name}..."):
+            if not all(col in df.columns for col in ["Target URL", "Anchor", "Domain rating"]):
+                st.error(f"❌ Il file {uploaded_file.name} non contiene tutte le colonne richieste e sarà ignorato.")
+                continue
+
             df["Dominio"] = os.path.splitext(uploaded_file.name)[0]
             df["Domain rating class"] = df["Domain rating"].apply(classify_domain_rating)
             df["Anchor class"] = df["Anchor"].apply(lambda x: classify_anchor(x, brand_keywords))
@@ -134,10 +137,15 @@ if uploaded_files:
             url_category_map = gpt_semantic_url_classification(url_list, api_key)
             df["URL Category"] = df["Target URL"].apply(lambda x: url_category_map.get(x, "UNKNOWN"))
 
-            st.success("✅ Classificazione completata")
-            st.dataframe(df.head(50))
-
             dfs.append(df)
+        except Exception as e:
+            st.error(f"❌ Errore durante l'elaborazione del file {uploaded_file.name}: {e}")
+            continue
+
+        progress_bar.progress((idx + 1) / len(uploaded_files))
+
+    progress_bar.empty()
+    status_text.text("✅ Tutti i file sono stati elaborati.")
 
     if dfs:
         final_df = pd.concat(dfs, ignore_index=True)
