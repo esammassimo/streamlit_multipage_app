@@ -166,25 +166,30 @@ if uploaded_files:
 
         # 1. Numero di link per dominio
         link_count = final_df.groupby("Dominio").size().reset_index(name="Totale link")
+        link_count = link_count.set_index("Dominio")
         st.markdown("**Numero di link per Dominio**")
         st.dataframe(link_count)
 
         # 2. Domain rating per dominio
-        dr_summary = final_df.groupby(["Dominio", "Domain rating class"]).size().reset_index(name="Totale")
+        dr_summary = final_df.pivot_table(index="Dominio", columns="Domain rating class", aggfunc="size", fill_value=0)
+        dr_summary.loc["TOTALE"] = dr_summary.sum()
         st.markdown("**Classificazione Domain Rating per Dominio**")
         st.dataframe(dr_summary)
 
         # 3. Anchor type per dominio
-        anchor_summary = final_df.groupby(["Dominio", "Anchor class"]).size().reset_index(name="Totale")
+        anchor_summary = final_df.pivot_table(index="Dominio", columns="Anchor class", aggfunc="size", fill_value=0)
+        anchor_summary.loc["TOTALE"] = anchor_summary.sum()
         st.markdown("**Anchor Type per Dominio**")
         st.dataframe(anchor_summary)
 
         # 4. URL structure per dominio
-        structure_summary = final_df.groupby(["Dominio", "URL structure class"]).size().reset_index(name="Totale")
+        structure_summary = final_df.pivot_table(index="Dominio", columns="URL structure class", aggfunc="size", fill_value=0)
+        structure_summary.loc["TOTALE"] = structure_summary.sum()
         st.markdown("**Page Level per Dominio**")
         st.dataframe(structure_summary)
 
         # 5. Categoria GPT
-        grouped = final_df.groupby(["Dominio", "URL Category"]).size().reset_index(name="Totale link")
+        gpt_summary = final_df.pivot_table(index="Dominio", columns="URL Category", aggfunc="size", fill_value=0)
+        gpt_summary.loc["TOTALE"] = gpt_summary.sum()
         st.markdown("**Categorie assegnate da GPT**")
-        st.dataframe(grouped)
+        st.dataframe(gpt_summary)
