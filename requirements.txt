@@ -5,3 +5,4 @@ openai
 youtube-transcript-api
 python-docx
 openpyxl
+chardet
