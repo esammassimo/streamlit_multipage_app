@@ -6,6 +6,7 @@ import re
 import openai
 import time
 import streamlit as st
+import tempfile
 
 # === FUNZIONE DI RILEVAMENTO ENCODING ===
 def detect_encoding(file_path):
@@ -113,8 +114,11 @@ if uploaded_files:
     dfs = []
     for uploaded_file in uploaded_files:
         st.markdown(f"### 📄 {uploaded_file.name}")
-        encoding = detect_encoding(uploaded_file.name)
-        df = pd.read_csv(uploaded_file, encoding=encoding, sep=None, engine="python")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+            tmp.write(uploaded_file.getvalue())
+            tmp_path = tmp.name
+        encoding = detect_encoding(tmp_path)
+        df = pd.read_csv(tmp_path, encoding=encoding, sep=None, engine="python")
 
         if not all(col in df.columns for col in ["Target URL", "Anchor", "Domain rating"]):
             st.error(f"❌ Il file {uploaded_file.name} deve contenere le colonne richieste.")
@@ -137,10 +141,11 @@ if uploaded_files:
 
     if dfs:
         final_df = pd.concat(dfs, ignore_index=True)
-        full_output_path = "classificazione_completa_tutti_brand.xlsx"
-        final_df.to_excel(full_output_path, index=False)
-        with open(full_output_path, "rb") as f:
-            st.download_button("📥 Scarica file Excel unificato", f, file_name=full_output_path)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_output:
+            full_output_path = tmp_output.name
+            final_df.to_excel(full_output_path, index=False)
+            with open(full_output_path, "rb") as f:
+                st.download_button("📥 Scarica file Excel unificato", f, file_name="classificazione_completa_tutti_brand.xlsx")
 
         grouped = final_df.groupby(["Dominio", "URL Category"]).size().reset_index(name="Totale link")
         st.subheader("📊 Riepilogo per Dominio e Categoria")
