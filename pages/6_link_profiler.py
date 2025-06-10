@@ -7,8 +7,6 @@ import openai
 import time
 import streamlit as st
 
-st.title("🔍 Link Profiler")
-
 # === FUNZIONE DI RILEVAMENTO ENCODING ===
 def detect_encoding(file_path):
     with open(file_path, 'rb') as f:
