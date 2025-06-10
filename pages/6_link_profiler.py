@@ -107,7 +107,7 @@ if not api_key:
 brand_keywords_input = st.text_input("Parole chiave del brand (separate da virgola):")
 brand_keywords = [kw.strip().lower() for kw in brand_keywords_input.split(",") if kw.strip() != ""]
 
-output_name = st.text_input("Nome file brand/output (senza estensione):", value="classificazione_brand")
+output_name = st.text_input("Nome file brand/output (senza estensione):", value="link-analysis")
 
 uploaded_file = st.file_uploader("Carica un file CSV con le colonne 'Target URL', 'Anchor', 'Domain rating':", type=["csv"])
 if uploaded_file:
