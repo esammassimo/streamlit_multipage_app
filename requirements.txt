@@ -6,3 +6,4 @@ youtube-transcript-api
 python-docx
 openpyxl
 chardet
+beautifulsoup4
