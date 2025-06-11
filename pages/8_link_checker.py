@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import requests
@@ -6,6 +5,7 @@ from bs4 import BeautifulSoup
 from io import BytesIO
 from time import sleep
 
+# Funzione per verificare il link
 def verifica_link(url, anchor_text, target_url):
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -15,17 +15,16 @@ def verifica_link(url, anchor_text, target_url):
 
         soup = BeautifulSoup(response.text, 'html.parser')
         links = soup.find_all('a', href=True)
-
         for link in links:
             href = link['href'].strip()
             text = link.get_text().strip()
             if href == target_url and anchor_text.lower() in text.lower():
                 return "✅ Link corretto"
         return "❌ Link non trovato"
-
     except Exception as e:
         return f"❌ Errore: {str(e)}"
 
+# Funzione per generare bozza email
 def genera_bozza_email(nome_sito, url, anchor_text, target_url, validazione):
     if validazione.startswith("✅"):
         return ""
@@ -43,7 +42,8 @@ Ti chiediamo cortesemente di aggiornare il link nel più breve tempo possibile.
 Grazie per la collaborazione!
 """
 
-st.title("🔗 Validazione Link e Bozze Email")
+# Streamlit UI
+st.title("🔗 Controllo Link in Tempo Reale con Bozze Email")
 
 uploaded_file = st.file_uploader("📤 Carica il file Excel (.xlsx)", type=["xlsx"])
 
@@ -51,40 +51,44 @@ if uploaded_file:
     sheet_name = "Report Mensile"
     try:
         df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
-        df_check = df[['URL', 'Anchor Text', 'Target URL', 'Sito']].copy()
-        df_check.dropna(inplace=True)
+        df_check = df[['URL', 'Anchor Text', 'Target URL', 'Sito']].dropna().copy()
 
         results = []
-        email_drafts = []
+        drafts = []
 
-        with st.spinner("🔍 Analisi dei link in corso..."):
-            for idx, row in df_check.iterrows():
-                st.text(f"Controllo {idx+1}/{len(df_check)}: {row['URL']}")
+        st.subheader("🟢 Stato dei Link")
+
+        for idx, row in df_check.iterrows():
+            with st.container():
+                col1, col2 = st.columns([0.05, 0.95])
                 result = verifica_link(row['URL'], row['Anchor Text'], row['Target URL'])
+                icon = "✅" if result.startswith("✅") else "❌"
+                col1.markdown(icon)
+                col2.markdown(f"[{row['URL']}]({row['URL']}) — `{result}`")
+
                 results.append(result)
-                draft = genera_bozza_email(
+                drafts.append(genera_bozza_email(
                     nome_sito=row['Sito'],
                     url=row['URL'],
                     anchor_text=row['Anchor Text'],
                     target_url=row['Target URL'],
                     validazione=result
-                )
-                email_drafts.append(draft)
-                sleep(1)
+                ))
 
+                sleep(1)  # per evitare rate limit
+
+        # Aggiunge i risultati al dataframe
         df_check['Validazione Link'] = results
-        df_check['Bozza Email'] = email_drafts
-
+        df_check['Bozza Email'] = drafts
         df_finale = df.merge(df_check[['URL', 'Validazione Link', 'Bozza Email']], on='URL', how='left')
 
-        st.success("✅ Analisi completata.")
-        st.dataframe(df_finale)
-
+        # Esporta il risultato
         output = BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df_finale.to_excel(writer, sheet_name=sheet_name, index=False)
         output.seek(0)
 
+        st.success("✅ Analisi completata.")
         st.download_button(
             label="📥 Scarica il file con i risultati",
             data=output,
@@ -93,4 +97,4 @@ if uploaded_file:
         )
 
     except Exception as e:
-        st.error(f"Errore durante la lettura o elaborazione del file: {e}")
+        st.error(f"❌ Errore durante la lettura del file: {e}")
