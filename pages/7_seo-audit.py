@@ -243,6 +243,12 @@ with tab2:
 
         if output:
             df_totale = pd.concat(report_completo, ignore_index=True)
+            df_visual = df_totale.copy()
+            df_visual['Status Error %'] = round(((df_visual['Pagine 3xx'] + df_visual['Pagine 4xx'] + df_visual['Bloccate da Robots.txt']) / df_visual['Pagine Totali']) * 100, 1)
+            df_visual['HTML Error %'] = round(((df_visual['Title Duplicati'] + df_visual['Title Mancanti'] + df_visual['Meta Description Duplicati'] + df_visual['Meta Description Mancanti'] + df_visual['H1 Duplicati'] + df_visual['H1 Mancanti']) / (3 * df_visual['Pagine Totali'])) * 100, 1)
+            df_visual['Canonical Non-Self %'] = 0  # placeholder, canonical check solo disponibile da parsing
+            df_visual['Contenuti Duplicati %'] = round((df_visual['Pagine Duplicate'] / df_visual['Pagine Totali']) * 100, 1)
+            df_riepilogo = df_visual[['Dominio', 'SEO Score', 'Penalità Status Code %', 'Penalità Canonical %', 'Penalità Tag HTML %', 'Penalità Contenuti Duplicati %', 'Penalità CWV %']]
             st.subheader("Riepilogo Complessivo")
             if MATPLOTLIB_OK:
                 # Radar chart per ogni dominio selezionabile
@@ -259,19 +265,19 @@ with tab2:
                     df_dominio['Penalità CWV %'].iloc[0]
                 ]
 
-            values = [v if isinstance(v, (int, float)) else 0 for v in values]
-            angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
-            values += values[:1]
-            angles += angles[:1]
+                values = [v if isinstance(v, (int, float)) else 0 for v in values]
+                angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
+                values += values[:1]
+                angles += angles[:1]
 
-            fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
-            ax.plot(angles, values, 'o-', linewidth=2)
-            ax.fill(angles, values, alpha=0.25)
-            ax.set_yticklabels([])
-            ax.set_xticks(angles[:-1])
-            ax.set_xticklabels(labels)
-            ax.set_title(f"Radar Chart - {dominio_scelto}")
-            st.pyplot(fig)
+                fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
+                ax.plot(angles, values, 'o-', linewidth=2)
+                ax.fill(angles, values, alpha=0.25)
+                ax.set_yticklabels([])
+                ax.set_xticks(angles[:-1])
+                ax.set_xticklabels(labels)
+                ax.set_title(f"Radar Chart - {dominio_scelto}")
+                st.pyplot(fig)
         else:
             st.info("Radar chart non disponibile. Installa matplotlib con: pip install matplotlib")
             df_visual = df_totale.copy()
