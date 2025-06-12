@@ -129,6 +129,13 @@ def estrai_kpi(df):
     return pd.DataFrame([kpi])
 
 st.title("SEO Audit Tool")
+
+# Import sicuro per radar chart
+try:
+    import matplotlib.pyplot as plt
+    import numpy as np
+except ModuleNotFoundError:
+    st.warning("Modulo 'matplotlib' mancante. Per visualizzare i radar chart, esegui: pip install matplotlib")
 tab1, tab2 = st.tabs(["Singolo File", "Multi File"])
 
 with tab1:
