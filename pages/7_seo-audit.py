@@ -151,8 +151,16 @@ with tab1:
             df = xls.parse(sheet_name)
             kpi = estrai_kpi(df)
             st.subheader("Riepilogo SEO")
-            import matplotlib.pyplot as plt
-            import numpy as np
+            
+
+            
+            kpi_visual = kpi.copy()
+            pagine = kpi_visual['Pagine Totali'].iloc[0]
+            kpi_visual['Status Error %'] = round(((kpi_visual['Pagine 3xx'] + kpi_visual['Pagine 4xx'] + kpi_visual['Bloccate da Robots.txt']) / pagine) * 100, 1)
+            kpi_visual['HTML Error %'] = round(((kpi_visual['Title Duplicati'] + kpi_visual['Title Mancanti'] + kpi_visual['Meta Description Duplicati'] + kpi_visual['Meta Description Mancanti'] + kpi_visual['H1 Duplicati'] + kpi_visual['H1 Mancanti']) / (3 * pagine)) * 100, 1)
+            kpi_visual['Canonical Non-Self %'] = 0  # placeholder, no canonical check in single tab
+            kpi_visual['Contenuti Duplicati %'] = round((kpi_visual['Pagine Duplicate'] / pagine) * 100, 1) if isinstance(kpi_visual['Pagine Duplicate'].iloc[0], (int, float)) else 'N/D'
+            kpi_riepilogo = kpi_visual[['SEO Score', 'Penalità Status Code %', 'Penalità Canonical %', 'Penalità Tag HTML %', 'Penalità Contenuti Duplicati %', 'Penalità CWV %']]
 
             # Radar chart per il singolo file
             labels = ['Status Code', 'Canonical', 'Tag HTML', 'Contenuti Duplicati', 'CWV']
@@ -163,7 +171,6 @@ with tab1:
                 kpi_riepilogo['Penalità Contenuti Duplicati %'].iloc[0],
                 kpi_riepilogo['Penalità CWV %'].iloc[0]
             ]
-
             values = [v if isinstance(v, (int, float)) else 0 for v in values]
             angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
             values += values[:1]
@@ -178,45 +185,6 @@ with tab1:
             ax.set_title("Penalità SEO Radar Chart")
 
             st.pyplot(fig)
-
-            # Radar chart comparativo tra domini
-            st.subheader("Confronto Radar tra Domini")
-            domini_disponibili = df_riepilogo['Dominio'].tolist()
-            domini_selezionati = st.multiselect("Seleziona uno o più domini da confrontare", domini_disponibili, default=domini_disponibili[:2])
-
-            if domini_selezionati:
-                fig2, ax2 = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
-                labels = ['Status Code', 'Canonical', 'Tag HTML', 'Contenuti Duplicati', 'CWV']
-                angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
-                angles += angles[:1]
-
-                for dominio in domini_selezionati:
-                    riga = df_riepilogo[df_riepilogo['Dominio'] == dominio].iloc[0]
-                    values = [
-                        riga['Penalità Status Code %'],
-                        riga['Penalità Canonical %'],
-                        riga['Penalità Tag HTML %'],
-                        riga['Penalità Contenuti Duplicati %'],
-                        riga['Penalità CWV %'] if 'Penalità CWV %' in riga else 0
-                    ]
-                    values = [v if isinstance(v, (int, float)) else 0 for v in values]
-                    values += values[:1]
-                    ax2.plot(angles, values, label=dominio)
-                    ax2.fill(angles, values, alpha=0.1)
-
-                ax2.set_yticklabels([])
-                ax2.set_xticks(angles[:-1])
-                ax2.set_xticklabels(labels)
-                ax2.set_title("Radar Chart Comparativo")
-                ax2.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1))
-                st.pyplot(fig2)
-            kpi_visual = kpi.copy()
-            pagine = kpi_visual['Pagine Totali'].iloc[0]
-            kpi_visual['Status Error %'] = round(((kpi_visual['Pagine 3xx'] + kpi_visual['Pagine 4xx'] + kpi_visual['Bloccate da Robots.txt']) / pagine) * 100, 1)
-            kpi_visual['HTML Error %'] = round(((kpi_visual['Title Duplicati'] + kpi_visual['Title Mancanti'] + kpi_visual['Meta Description Duplicati'] + kpi_visual['Meta Description Mancanti'] + kpi_visual['H1 Duplicati'] + kpi_visual['H1 Mancanti']) / (3 * pagine)) * 100, 1)
-            kpi_visual['Canonical Non-Self %'] = 0  # placeholder, no canonical check in single tab
-            kpi_visual['Contenuti Duplicati %'] = round((kpi_visual['Pagine Duplicate'] / pagine) * 100, 1) if isinstance(kpi_visual['Pagine Duplicate'].iloc[0], (int, float)) else 'N/D'
-            kpi_riepilogo = kpi_visual[['SEO Score', 'Penalità Status Code %', 'Penalità Canonical %', 'Penalità Tag HTML %', 'Penalità Contenuti Duplicati %', 'Penalità CWV %']]
             kpi_riepilogo['Stato'] = kpi_riepilogo['SEO Score'].apply(lambda x: 'Critico' if x < 50 else ('Medio' if x < 70 else 'Buono'))
             st.dataframe(
                 kpi_riepilogo.style.apply(
@@ -302,6 +270,38 @@ with tab2:
             df_visual['Canonical Non-Self %'] = 0  # placeholder, canonical check solo disponibile da parsing
             df_visual['Contenuti Duplicati %'] = round((df_visual['Pagine Duplicate'] / df_visual['Pagine Totali']) * 100, 1)
             df_riepilogo = df_visual[['Dominio', 'SEO Score', 'Penalità Status Code %', 'Penalità Canonical %', 'Penalità Tag HTML %', 'Penalità Contenuti Duplicati %', 'Penalità CWV %']]
+
+            # Radar chart comparativo tra domini
+            st.subheader("Confronto Radar tra Domini")
+            domini_disponibili = df_riepilogo['Dominio'].tolist()
+            domini_selezionati = st.multiselect("Seleziona uno o più domini da confrontare", domini_disponibili, default=domini_disponibili[:2])
+
+            if domini_selezionati:
+                fig2, ax2 = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
+                labels = ['Status Code', 'Canonical', 'Tag HTML', 'Contenuti Duplicati', 'CWV']
+                angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
+                angles += angles[:1]
+
+                for dominio in domini_selezionati:
+                    riga = df_riepilogo[df_riepilogo['Dominio'] == dominio].iloc[0]
+                    values = [
+                        riga['Penalità Status Code %'],
+                        riga['Penalità Canonical %'],
+                        riga['Penalità Tag HTML %'],
+                        riga['Penalità Contenuti Duplicati %'],
+                        riga['Penalità CWV %'] if 'Penalità CWV %' in riga else 0
+                    ]
+                    values = [v if isinstance(v, (int, float)) else 0 for v in values]
+                    values += values[:1]
+                    ax2.plot(angles, values, label=dominio)
+                    ax2.fill(angles, values, alpha=0.1)
+
+                ax2.set_yticklabels([])
+                ax2.set_xticks(angles[:-1])
+                ax2.set_xticklabels(labels)
+                ax2.set_title("Radar Chart Comparativo")
+                ax2.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1))
+                st.pyplot(fig2)
             df_riepilogo['Stato'] = df_riepilogo['SEO Score'].apply(lambda x: 'Critico' if x < 50 else ('Medio' if x < 70 else 'Buono'))
             st.dataframe(
                 df_riepilogo.style.apply(
