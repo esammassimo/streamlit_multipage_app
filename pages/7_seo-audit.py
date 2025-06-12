@@ -5,9 +5,6 @@ from urllib.parse import urlparse
 import io
 import os
 
-# Titolo app
-st.title("SEO Audit")
-
 def estrai_dominio(df):
     try:
         url_sample = df['Address'].dropna().iloc[0]
@@ -15,6 +12,56 @@ def estrai_dominio(df):
         return dominio if dominio else None
     except Exception:
         return None
+
+def calcola_score(df, kpi):
+    pagine_totali = df.shape[0]
+    if pagine_totali == 0:
+        return 0
+
+    # Status Code e robots
+    penalita_status = (kpi['Pagine 3xx'] + kpi['Pagine 4xx'] + kpi['Bloccate da Robots.txt']) / pagine_totali
+
+    # Canonical non self-referencing
+    canonical_non_self = 0
+    if 'Canonical Link Element 1' in df.columns and 'Canonical Link Element 1 Resolved' in df.columns:
+        canon_df = df[['Address', 'Canonical Link Element 1 Resolved']].dropna()
+        canonical_non_self = (canon_df['Address'] != canon_df['Canonical Link Element 1 Resolved']).sum() / pagine_totali
+
+    # HTML Tag (Title, Desc, H1)
+    html_penalita = (
+        (kpi['Title Duplicati'] + kpi['Title Mancanti']) +
+        (kpi['Meta Description Duplicati'] + kpi['Meta Description Mancanti']) +
+        (kpi['H1 Duplicati'] + kpi['H1 Mancanti'])
+    ) / (3 * pagine_totali)
+
+    # Contenuti duplicati
+    penalita_duplicate = kpi['Pagine Duplicate'] / pagine_totali if isinstance(kpi['Pagine Duplicate'], (int, float)) else 0
+
+    # CWV penalty (valore tra 0 e 1)
+    cwv_penalita = 0
+    cwv_colonne = ['LCP', 'INP', 'CLS', 'FCP', 'TTFB']
+    soglie = {'LCP': 2500, 'INP': 200, 'CLS': 0.1, 'FCP': 1800, 'TTFB': 800}
+    penalita_cwv = []
+    for metrica in cwv_colonne:
+        if metrica in kpi:
+            val = kpi[metrica]
+            soglia = soglie[metrica]
+            if val > 0:
+                if metrica == 'CLS':
+                    penalita_cwv.append(min(1.0, val / soglia))
+                else:
+                    penalita_cwv.append(min(1.0, (val - soglia) / soglia))
+    if penalita_cwv:
+        cwv_penalita = sum(penalita_cwv) / len(penalita_cwv)
+
+    score = 100 * (1 - (
+        0.30 * penalita_status +
+        0.15 * canonical_non_self +
+        0.20 * html_penalita +
+        0.10 * penalita_duplicate +
+        0.20 * cwv_penalita
+    ))
+    return round(max(score, 0), 2)
 
 def estrai_kpi(df):
     df.columns = df.columns.str.strip()
@@ -62,12 +109,15 @@ def estrai_kpi(df):
         if col in df.columns:
             cwv[metrica] = round(df[col].mean(), 2)
 
-    return pd.DataFrame([{
+    kpi = {
         **status,
         **html_tag,
         **content,
         **cwv
-    }])
+    }
+    score = calcola_score(df, kpi)
+    kpi['SEO Score'] = score
+    return pd.DataFrame([kpi])
 
 st.title("SEO Audit Tool")
 tab1, tab2 = st.tabs(["Singolo File", "Multi File"])
@@ -85,7 +135,7 @@ with tab1:
             df = xls.parse(sheet_name)
             kpi = estrai_kpi(df)
             st.subheader("Riepilogo SEO")
-            st.dataframe(kpi)
+            st.dataframe(kpi.style.apply(lambda row: ['background-color: #f8d7da' if 0 <= row['SEO Score'] <= 49 else ('background-color: #fff3cd' if 50 <= row['SEO Score'] <= 69 else 'background-color: #d4edda') if 'SEO Score' in row else '' for _ in row], axis=1))
 
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
@@ -124,7 +174,7 @@ with tab2:
         if output:
             df_totale = pd.concat(report_completo, ignore_index=True)
             st.subheader("Riepilogo Complessivo")
-            st.dataframe(df_totale)
+            st.dataframe(df_totale.style.apply(lambda row: ['background-color: #f8d7da' if 0 <= row['SEO Score'] <= 49 else ('background-color: #fff3cd' if 50 <= row['SEO Score'] <= 69 else 'background-color: #d4edda') if 'SEO Score' in row else '' for _ in row], axis=1))
 
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
