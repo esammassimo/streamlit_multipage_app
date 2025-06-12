@@ -144,6 +144,33 @@ with tab1:
             df = xls.parse(sheet_name)
             kpi = estrai_kpi(df)
             st.subheader("Riepilogo SEO")
+            import matplotlib.pyplot as plt
+            import numpy as np
+
+            # Radar chart per il singolo file
+            labels = ['Status Code', 'Canonical', 'Tag HTML', 'Contenuti Duplicati', 'CWV']
+            values = [
+                kpi_riepilogo['Penalità Status Code %'].iloc[0],
+                kpi_riepilogo['Penalità Canonical %'].iloc[0],
+                kpi_riepilogo['Penalità Tag HTML %'].iloc[0],
+                kpi_riepilogo['Penalità Contenuti Duplicati %'].iloc[0],
+                kpi_riepilogo['Penalità CWV %'].iloc[0]
+            ]
+
+            values = [v if isinstance(v, (int, float)) else 0 for v in values]
+            angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
+            values += values[:1]
+            angles += angles[:1]
+
+            fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
+            ax.plot(angles, values, 'o-', linewidth=2)
+            ax.fill(angles, values, alpha=0.25)
+            ax.set_yticklabels([])
+            ax.set_xticks(angles[:-1])
+            ax.set_xticklabels(labels)
+            ax.set_title("Penalità SEO Radar Chart")
+
+            st.pyplot(fig)
             kpi_visual = kpi.copy()
             pagine = kpi_visual['Pagine Totali'].iloc[0]
             kpi_visual['Status Error %'] = round(((kpi_visual['Pagine 3xx'] + kpi_visual['Pagine 4xx'] + kpi_visual['Bloccate da Robots.txt']) / pagine) * 100, 1)
@@ -199,6 +226,37 @@ with tab2:
         if output:
             df_totale = pd.concat(report_completo, ignore_index=True)
             st.subheader("Riepilogo Complessivo")
+            import matplotlib.pyplot as plt
+            import numpy as np
+
+            # Radar chart per ogni dominio selezionabile
+            domini_unici = df_riepilogo['Dominio'].tolist()
+            dominio_scelto = st.selectbox("Seleziona un dominio per visualizzare il radar chart", domini_unici)
+            df_dominio = df_riepilogo[df_riepilogo['Dominio'] == dominio_scelto]
+
+            labels = ['Status Code', 'Canonical', 'Tag HTML', 'Contenuti Duplicati', 'CWV']
+            values = [
+                df_dominio['Penalità Status Code %'].iloc[0],
+                df_dominio['Penalità Canonical %'].iloc[0],
+                df_dominio['Penalità Tag HTML %'].iloc[0],
+                df_dominio['Penalità Contenuti Duplicati %'].iloc[0],
+                df_dominio['Penalità CWV %'].iloc[0]
+            ]
+
+            values = [v if isinstance(v, (int, float)) else 0 for v in values]
+            angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
+            values += values[:1]
+            angles += angles[:1]
+
+            fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
+            ax.plot(angles, values, 'o-', linewidth=2)
+            ax.fill(angles, values, alpha=0.25)
+            ax.set_yticklabels([])
+            ax.set_xticks(angles[:-1])
+            ax.set_xticklabels(labels)
+            ax.set_title(f"Radar Chart - {dominio_scelto}")
+
+            st.pyplot(fig)
             df_visual = df_totale.copy()
             df_visual['Status Error %'] = round(((df_visual['Pagine 3xx'] + df_visual['Pagine 4xx'] + df_visual['Bloccate da Robots.txt']) / df_visual['Pagine Totali']) * 100, 1)
             df_visual['HTML Error %'] = round(((df_visual['Title Duplicati'] + df_visual['Title Mancanti'] + df_visual['Meta Description Duplicati'] + df_visual['Meta Description Mancanti'] + df_visual['H1 Duplicati'] + df_visual['H1 Mancanti']) / (3 * df_visual['Pagine Totali'])) * 100, 1)
