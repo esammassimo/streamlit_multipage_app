@@ -5,6 +5,14 @@ from urllib.parse import urlparse
 import io
 import os
 
+try:
+    import matplotlib.pyplot as plt
+    import numpy as np
+    MATPLOTLIB_OK = True
+except ModuleNotFoundError:
+    MATPLOTLIB_OK = False
+    st.warning("Modulo 'matplotlib' mancante. Per visualizzare i radar chart, esegui: pip install matplotlib")
+
 def estrai_dominio(df):
     try:
         url_sample = df['Address'].dropna().iloc[0]
@@ -18,26 +26,23 @@ def calcola_score(df, kpi):
     if pagine_totali == 0:
         return 0, {}
 
-    # Status Code e robots
     penalita_status = (kpi['Pagine 3xx'] + kpi['Pagine 4xx'] + kpi['Bloccate da Robots.txt']) / pagine_totali
 
-    # Canonical non self-referencing
     canonical_non_self = 0
     if 'Canonical Link Element 1' in df.columns and 'Canonical Link Element 1 Resolved' in df.columns:
         canon_df = df[['Address', 'Canonical Link Element 1 Resolved']].dropna()
-        canonical_non_self = (canon_df['Address'] != canon_df['Canonical Link Element 1 Resolved']).sum() / pagine_totali
+        canonical_non_self = canon_df.apply(
+            lambda r: r['Address'].rstrip('/').lower() != r['Canonical Link Element 1 Resolved'].rstrip('/').lower(), axis=1
+        ).sum() / pagine_totali
 
-    # HTML Tag (Title, Desc, H1)
     html_penalita = (
         (kpi['Title Duplicati'] + kpi['Title Mancanti']) +
         (kpi['Meta Description Duplicati'] + kpi['Meta Description Mancanti']) +
         (kpi['H1 Duplicati'] + kpi['H1 Mancanti'])
     ) / (3 * pagine_totali)
 
-    # Contenuti duplicati
     penalita_duplicate = kpi['Pagine Duplicate'] / pagine_totali if isinstance(kpi['Pagine Duplicate'], (int, float)) else 0
 
-    # CWV penalty (valore tra 0 e 1)
     cwv_penalita = 0
     cwv_colonne = ['LCP', 'INP', 'CLS', 'FCP', 'TTFB']
     soglie = {'LCP': 2500, 'INP': 200, 'CLS': 0.1, 'FCP': 1800, 'TTFB': 800}
@@ -46,7 +51,7 @@ def calcola_score(df, kpi):
         if metrica in kpi:
             val = kpi[metrica]
             soglia = soglie[metrica]
-            if val > 0:
+            if isinstance(val, (int, float)) and val > 0:
                 if metrica == 'CLS':
                     penalita_cwv.append(min(1.0, val / soglia))
                 else:
@@ -88,7 +93,7 @@ def estrai_kpi(df):
             return (0, 0, 0)
         valid = df[col].dropna()
         return (
-            len(valid[valid.duplicated(keep=False)].unique()),
+            valid[valid.duplicated(keep=False)].nunique(),
             df[col].isna().sum(),
             df[col].notna().sum()
         )
@@ -103,7 +108,7 @@ def estrai_kpi(df):
         'H1 Duplicati': h1[0], 'H1 Mancanti': h1[1], 'Totale H1': h1[2]
     }
 
-    pagine_duplicate = df['Duplicate Content'].sum() if 'Duplicate Content' in df.columns else 'N/D'
+    pagine_duplicate = df['Duplicate Content'].sum() if 'Duplicate Content' in df.columns and pd.api.types.is_numeric_dtype(df['Duplicate Content']) else 0
     immagini_senza_alt = df['Images Missing Alt Text'].sum() if 'Images Missing Alt Text' in df.columns else 'N/D'
     content = {
         'Pagine Duplicate': pagine_duplicate,
@@ -114,7 +119,7 @@ def estrai_kpi(df):
     cwv = {}
     for metrica in ['LCP', 'INP', 'CLS', 'FCP', 'TTFB']:
         col = f"{metrica} (ms)"
-        if col in df.columns:
+        if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
             cwv[metrica] = round(df[col].mean(), 2)
 
     kpi = {
@@ -127,214 +132,3 @@ def estrai_kpi(df):
     kpi['SEO Score'] = score
     kpi.update(components)
     return pd.DataFrame([kpi])
-
-st.title("SEO Audit Tool")
-
-# Import sicuro per radar chart
-try:
-    import matplotlib.pyplot as plt
-    import numpy as np
-    MATPLOTLIB_OK = True
-except ModuleNotFoundError:
-    MATPLOTLIB_OK = False
-    st.warning("Modulo 'matplotlib' mancante. Per visualizzare i radar chart, esegui: pip install matplotlib")
-
-# Import sicuro per radar chart
-try:
-    import matplotlib.pyplot as plt
-    import numpy as np
-except ModuleNotFoundError:
-    st.warning("Modulo 'matplotlib' mancante. Per visualizzare i radar chart, esegui: pip install matplotlib")
-tab1, tab2 = st.tabs(["Singolo File", "Multi File"])
-
-with tab1:
-    file = st.file_uploader("Carica un file .xlsx (Screaming Frog)", type="xlsx", key="single")
-    if file:
-        xls = pd.ExcelFile(file)
-        sheet_name = None
-        for name in ['1 - HTML', '1 - All']:
-            if name in xls.sheet_names:
-                sheet_name = name
-                break
-        if sheet_name:
-            df = xls.parse(sheet_name)
-            kpi = estrai_kpi(df)
-            st.subheader("Riepilogo SEO")
-            
-
-            
-            kpi_visual = kpi.copy()
-            pagine = kpi_visual['Pagine Totali'].iloc[0]
-            kpi_visual['Status Error %'] = round(((kpi_visual['Pagine 3xx'] + kpi_visual['Pagine 4xx'] + kpi_visual['Bloccate da Robots.txt']) / pagine) * 100, 1)
-            kpi_visual['HTML Error %'] = round(((kpi_visual['Title Duplicati'] + kpi_visual['Title Mancanti'] + kpi_visual['Meta Description Duplicati'] + kpi_visual['Meta Description Mancanti'] + kpi_visual['H1 Duplicati'] + kpi_visual['H1 Mancanti']) / (3 * pagine)) * 100, 1)
-            kpi_visual['Canonical Non-Self %'] = 0  # placeholder, no canonical check in single tab
-            kpi_visual['Contenuti Duplicati %'] = round((kpi_visual['Pagine Duplicate'] / pagine) * 100, 1) if isinstance(kpi_visual['Pagine Duplicate'].iloc[0], (int, float)) else 'N/D'
-            kpi_riepilogo = kpi_visual[['SEO Score', 'Penalità Status Code %', 'Penalità Canonical %', 'Penalità Tag HTML %', 'Penalità Contenuti Duplicati %', 'Penalità CWV %']]
-
-            if MATPLOTLIB_OK:
-                # Radar chart per il singolo file
-                labels = ['Status Code', 'Canonical', 'Tag HTML', 'Contenuti Duplicati', 'CWV']
-                values = [
-                    kpi_riepilogo['Penalità Status Code %'].iloc[0],
-                    kpi_riepilogo['Penalità Canonical %'].iloc[0],
-                    kpi_riepilogo['Penalità Tag HTML %'].iloc[0],
-                    kpi_riepilogo['Penalità Contenuti Duplicati %'].iloc[0],
-                    kpi_riepilogo['Penalità CWV %'].iloc[0]
-                ]
-                values = [v if isinstance(v, (int, float)) else 0 for v in values]
-                angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
-                values += values[:1]
-                angles += angles[:1]
-
-                fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
-                ax.plot(angles, values, 'o-', linewidth=2)
-                ax.fill(angles, values, alpha=0.25)
-                ax.set_yticklabels([])
-                ax.set_xticks(angles[:-1])
-                ax.set_xticklabels(labels)
-                ax.set_title("Penalità SEO Radar Chart")
-                st.pyplot(fig)
-            else:
-                st.info("Radar chart non disponibile. Installa matplotlib con: pip install matplotlib")
-            kpi_riepilogo['Stato'] = kpi_riepilogo['SEO Score'].apply(lambda x: 'Critico' if x < 50 else ('Medio' if x < 70 else 'Buono'))
-            st.dataframe(
-                kpi_riepilogo.style.apply(
-                    lambda row: ['background-color: #f8d7da' if row['SEO Score'] <= 49
-                                 else 'background-color: #fff3cd' if row['SEO Score'] <= 69
-                                 else 'background-color: #d4edda' for _ in row],
-                    axis=1
-                )
-            )
-
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                kpi.to_excel(writer, sheet_name='Report SEO', index=False)
-                kpi_riepilogo.to_excel(writer, sheet_name='Riepilogo Score', index=False)
-
-            st.download_button("📥 Scarica il report Excel", buffer.getvalue(), file_name="seo_report_singolo.xlsx")
-        else:
-            st.warning("Il file non contiene un foglio valido ('1 - HTML' o '1 - All').")
-
-with tab2:
-    files = st.file_uploader("Carica più file .xlsx (Screaming Frog)", type="xlsx", accept_multiple_files=True, key="multi")
-
-    if files:
-        output = {}
-        report_completo = []
-
-        for f in files:
-            xls = pd.ExcelFile(f)
-            sheet_name = None
-            for name in ['1 - HTML', '1 - All']:
-                if name in xls.sheet_names:
-                    sheet_name = name
-                    break
-            if not sheet_name:
-                continue
-
-            df = xls.parse(sheet_name)
-            dominio = estrai_dominio(df)
-            if not dominio:
-                dominio = os.path.splitext(f.name)[0].split("_")[0]
-            kpi = estrai_kpi(df)
-            kpi.insert(0, 'Dominio', dominio)
-            report_completo.append(kpi)
-            output[dominio] = kpi.drop(columns=['Dominio'])
-
-        if output:
-            df_totale = pd.concat(report_completo, ignore_index=True)
-            df_visual = df_totale.copy()
-            df_visual['Status Error %'] = round(((df_visual['Pagine 3xx'] + df_visual['Pagine 4xx'] + df_visual['Bloccate da Robots.txt']) / df_visual['Pagine Totali']) * 100, 1)
-            df_visual['HTML Error %'] = round(((df_visual['Title Duplicati'] + df_visual['Title Mancanti'] + df_visual['Meta Description Duplicati'] + df_visual['Meta Description Mancanti'] + df_visual['H1 Duplicati'] + df_visual['H1 Mancanti']) / (3 * df_visual['Pagine Totali'])) * 100, 1)
-            df_visual['Canonical Non-Self %'] = 0  # placeholder, canonical check solo disponibile da parsing
-            df_visual['Contenuti Duplicati %'] = round((df_visual['Pagine Duplicate'] / df_visual['Pagine Totali']) * 100, 1)
-            df_riepilogo = df_visual[['Dominio', 'SEO Score', 'Penalità Status Code %', 'Penalità Canonical %', 'Penalità Tag HTML %', 'Penalità Contenuti Duplicati %', 'Penalità CWV %']]
-            st.subheader("Riepilogo Complessivo")
-            if MATPLOTLIB_OK:
-                # Radar chart per ogni dominio selezionabile
-                domini_unici = df_riepilogo['Dominio'].tolist()
-                dominio_scelto = st.selectbox("Seleziona un dominio per visualizzare il radar chart", domini_unici)
-                df_dominio = df_riepilogo[df_riepilogo['Dominio'] == dominio_scelto]
-
-                labels = ['Status Code', 'Canonical', 'Tag HTML', 'Contenuti Duplicati', 'CWV']
-                values = [
-                    df_dominio['Penalità Status Code %'].iloc[0],
-                    df_dominio['Penalità Canonical %'].iloc[0],
-                    df_dominio['Penalità Tag HTML %'].iloc[0],
-                    df_dominio['Penalità Contenuti Duplicati %'].iloc[0],
-                    df_dominio['Penalità CWV %'].iloc[0]
-                ]
-
-                values = [v if isinstance(v, (int, float)) else 0 for v in values]
-                angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
-                values += values[:1]
-                angles += angles[:1]
-
-                fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
-                ax.plot(angles, values, 'o-', linewidth=2)
-                ax.fill(angles, values, alpha=0.25)
-                ax.set_yticklabels([])
-                ax.set_xticks(angles[:-1])
-                ax.set_xticklabels(labels)
-                ax.set_title(f"Radar Chart - {dominio_scelto}")
-                st.pyplot(fig)
-        else:
-            st.info("Radar chart non disponibile. Installa matplotlib con: pip install matplotlib")
-            df_visual = df_totale.copy()
-            df_visual['Status Error %'] = round(((df_visual['Pagine 3xx'] + df_visual['Pagine 4xx'] + df_visual['Bloccate da Robots.txt']) / df_visual['Pagine Totali']) * 100, 1)
-            df_visual['HTML Error %'] = round(((df_visual['Title Duplicati'] + df_visual['Title Mancanti'] + df_visual['Meta Description Duplicati'] + df_visual['Meta Description Mancanti'] + df_visual['H1 Duplicati'] + df_visual['H1 Mancanti']) / (3 * df_visual['Pagine Totali'])) * 100, 1)
-            df_visual['Canonical Non-Self %'] = 0  # placeholder, canonical check solo disponibile da parsing
-            df_visual['Contenuti Duplicati %'] = round((df_visual['Pagine Duplicate'] / df_visual['Pagine Totali']) * 100, 1)
-            df_riepilogo = df_visual[['Dominio', 'SEO Score', 'Penalità Status Code %', 'Penalità Canonical %', 'Penalità Tag HTML %', 'Penalità Contenuti Duplicati %', 'Penalità CWV %']]
-
-            # Radar chart comparativo tra domini
-            st.subheader("Confronto Radar tra Domini")
-            domini_disponibili = df_riepilogo['Dominio'].tolist()
-            domini_selezionati = st.multiselect("Seleziona uno o più domini da confrontare", domini_disponibili, default=domini_disponibili[:2])
-
-            if domini_selezionati:
-                fig2, ax2 = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
-                labels = ['Status Code', 'Canonical', 'Tag HTML', 'Contenuti Duplicati', 'CWV']
-                angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
-                angles += angles[:1]
-
-                for dominio in domini_selezionati:
-                    riga = df_riepilogo[df_riepilogo['Dominio'] == dominio].iloc[0]
-                    values = [
-                        riga['Penalità Status Code %'],
-                        riga['Penalità Canonical %'],
-                        riga['Penalità Tag HTML %'],
-                        riga['Penalità Contenuti Duplicati %'],
-                        riga['Penalità CWV %'] if 'Penalità CWV %' in riga else 0
-                    ]
-                    values = [v if isinstance(v, (int, float)) else 0 for v in values]
-                    values += values[:1]
-                    ax2.plot(angles, values, label=dominio)
-                    ax2.fill(angles, values, alpha=0.1)
-
-                ax2.set_yticklabels([])
-                ax2.set_xticks(angles[:-1])
-                ax2.set_xticklabels(labels)
-                ax2.set_title("Radar Chart Comparativo")
-                ax2.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1))
-                st.pyplot(fig2)
-            df_riepilogo['Stato'] = df_riepilogo['SEO Score'].apply(lambda x: 'Critico' if x < 50 else ('Medio' if x < 70 else 'Buono'))
-            st.dataframe(
-                df_riepilogo.style.apply(
-                    lambda row: ['background-color: #f8d7da' if row['SEO Score'] <= 49
-                                 else 'background-color: #fff3cd' if row['SEO Score'] <= 69
-                                 else 'background-color: #d4edda' for _ in row],
-                    axis=1
-                )
-            )
-
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                for dominio, df_kpi in output.items():
-                    df_kpi.to_excel(writer, sheet_name=dominio[:31], index=False)
-                df_totale.to_excel(writer, sheet_name='Riepilogo', index=False)
-                df_riepilogo.to_excel(writer, sheet_name='Riepilogo Score', index=False)
-
-            st.download_button("📥 Scarica il report Excel", buffer.getvalue(), file_name="multi_seo_audit.xlsx")
-    else:
-        st.warning("Nessun file valido caricato. Assicurati che ogni file contenga il foglio '1 - HTML' o '1 - All'.")
