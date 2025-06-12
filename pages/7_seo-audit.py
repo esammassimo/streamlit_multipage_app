@@ -150,7 +150,7 @@ with tab1:
             kpi_visual['HTML Error %'] = round(((kpi_visual['Title Duplicati'] + kpi_visual['Title Mancanti'] + kpi_visual['Meta Description Duplicati'] + kpi_visual['Meta Description Mancanti'] + kpi_visual['H1 Duplicati'] + kpi_visual['H1 Mancanti']) / (3 * pagine)) * 100, 1)
             kpi_visual['Canonical Non-Self %'] = 0  # placeholder, no canonical check in single tab
             kpi_visual['Contenuti Duplicati %'] = round((kpi_visual['Pagine Duplicate'] / pagine) * 100, 1) if isinstance(kpi_visual['Pagine Duplicate'].iloc[0], (int, float)) else 'N/D'
-            kpi_riepilogo = kpi_visual[['SEO Score', 'Status Error %', 'HTML Error %', 'Canonical Non-Self %', 'Contenuti Duplicati %']]
+            kpi_riepilogo = kpi_visual[['SEO Score', 'Penalità Status Code %', 'Penalità Canonical %', 'Penalità Tag HTML %', 'Penalità Contenuti Duplicati %', 'Penalità CWV %']]
             kpi_riepilogo['Stato'] = kpi_riepilogo['SEO Score'].apply(lambda x: 'Critico' if x < 50 else ('Medio' if x < 70 else 'Buono'))
             st.dataframe(
                 kpi_riepilogo.style.apply(
@@ -204,7 +204,7 @@ with tab2:
             df_visual['HTML Error %'] = round(((df_visual['Title Duplicati'] + df_visual['Title Mancanti'] + df_visual['Meta Description Duplicati'] + df_visual['Meta Description Mancanti'] + df_visual['H1 Duplicati'] + df_visual['H1 Mancanti']) / (3 * df_visual['Pagine Totali'])) * 100, 1)
             df_visual['Canonical Non-Self %'] = 0  # placeholder, canonical check solo disponibile da parsing
             df_visual['Contenuti Duplicati %'] = round((df_visual['Pagine Duplicate'] / df_visual['Pagine Totali']) * 100, 1)
-            df_riepilogo = df_visual[['Dominio', 'SEO Score', 'Status Error %', 'HTML Error %', 'Canonical Non-Self %', 'Contenuti Duplicati %']]
+            df_riepilogo = df_visual[['Dominio', 'SEO Score', 'Penalità Status Code %', 'Penalità Canonical %', 'Penalità Tag HTML %', 'Penalità Contenuti Duplicati %', 'Penalità CWV %']]
             df_riepilogo['Stato'] = df_riepilogo['SEO Score'].apply(lambda x: 'Critico' if x < 50 else ('Medio' if x < 70 else 'Buono'))
             st.dataframe(
                 df_riepilogo.style.apply(
