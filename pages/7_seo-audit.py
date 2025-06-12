@@ -134,6 +134,15 @@ st.title("SEO Audit Tool")
 try:
     import matplotlib.pyplot as plt
     import numpy as np
+    MATPLOTLIB_OK = True
+except ModuleNotFoundError:
+    MATPLOTLIB_OK = False
+    st.warning("Modulo 'matplotlib' mancante. Per visualizzare i radar chart, esegui: pip install matplotlib")
+
+# Import sicuro per radar chart
+try:
+    import matplotlib.pyplot as plt
+    import numpy as np
 except ModuleNotFoundError:
     st.warning("Modulo 'matplotlib' mancante. Per visualizzare i radar chart, esegui: pip install matplotlib")
 tab1, tab2 = st.tabs(["Singolo File", "Multi File"])
@@ -162,29 +171,31 @@ with tab1:
             kpi_visual['Contenuti Duplicati %'] = round((kpi_visual['Pagine Duplicate'] / pagine) * 100, 1) if isinstance(kpi_visual['Pagine Duplicate'].iloc[0], (int, float)) else 'N/D'
             kpi_riepilogo = kpi_visual[['SEO Score', 'Penalità Status Code %', 'Penalità Canonical %', 'Penalità Tag HTML %', 'Penalità Contenuti Duplicati %', 'Penalità CWV %']]
 
-            # Radar chart per il singolo file
-            labels = ['Status Code', 'Canonical', 'Tag HTML', 'Contenuti Duplicati', 'CWV']
-            values = [
-                kpi_riepilogo['Penalità Status Code %'].iloc[0],
-                kpi_riepilogo['Penalità Canonical %'].iloc[0],
-                kpi_riepilogo['Penalità Tag HTML %'].iloc[0],
-                kpi_riepilogo['Penalità Contenuti Duplicati %'].iloc[0],
-                kpi_riepilogo['Penalità CWV %'].iloc[0]
-            ]
-            values = [v if isinstance(v, (int, float)) else 0 for v in values]
-            angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
-            values += values[:1]
-            angles += angles[:1]
+            if MATPLOTLIB_OK:
+                # Radar chart per il singolo file
+                labels = ['Status Code', 'Canonical', 'Tag HTML', 'Contenuti Duplicati', 'CWV']
+                values = [
+                    kpi_riepilogo['Penalità Status Code %'].iloc[0],
+                    kpi_riepilogo['Penalità Canonical %'].iloc[0],
+                    kpi_riepilogo['Penalità Tag HTML %'].iloc[0],
+                    kpi_riepilogo['Penalità Contenuti Duplicati %'].iloc[0],
+                    kpi_riepilogo['Penalità CWV %'].iloc[0]
+                ]
+                values = [v if isinstance(v, (int, float)) else 0 for v in values]
+                angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
+                values += values[:1]
+                angles += angles[:1]
 
-            fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
-            ax.plot(angles, values, 'o-', linewidth=2)
-            ax.fill(angles, values, alpha=0.25)
-            ax.set_yticklabels([])
-            ax.set_xticks(angles[:-1])
-            ax.set_xticklabels(labels)
-            ax.set_title("Penalità SEO Radar Chart")
-
-            st.pyplot(fig)
+                fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
+                ax.plot(angles, values, 'o-', linewidth=2)
+                ax.fill(angles, values, alpha=0.25)
+                ax.set_yticklabels([])
+                ax.set_xticks(angles[:-1])
+                ax.set_xticklabels(labels)
+                ax.set_title("Penalità SEO Radar Chart")
+                st.pyplot(fig)
+            else:
+                st.info("Radar chart non disponibile. Installa matplotlib con: pip install matplotlib")
             kpi_riepilogo['Stato'] = kpi_riepilogo['SEO Score'].apply(lambda x: 'Critico' if x < 50 else ('Medio' if x < 70 else 'Buono'))
             st.dataframe(
                 kpi_riepilogo.style.apply(
@@ -233,22 +244,20 @@ with tab2:
         if output:
             df_totale = pd.concat(report_completo, ignore_index=True)
             st.subheader("Riepilogo Complessivo")
-            import matplotlib.pyplot as plt
-            import numpy as np
+            if MATPLOTLIB_OK:
+                # Radar chart per ogni dominio selezionabile
+                domini_unici = df_riepilogo['Dominio'].tolist()
+                dominio_scelto = st.selectbox("Seleziona un dominio per visualizzare il radar chart", domini_unici)
+                df_dominio = df_riepilogo[df_riepilogo['Dominio'] == dominio_scelto]
 
-            # Radar chart per ogni dominio selezionabile
-            domini_unici = df_riepilogo['Dominio'].tolist()
-            dominio_scelto = st.selectbox("Seleziona un dominio per visualizzare il radar chart", domini_unici)
-            df_dominio = df_riepilogo[df_riepilogo['Dominio'] == dominio_scelto]
-
-            labels = ['Status Code', 'Canonical', 'Tag HTML', 'Contenuti Duplicati', 'CWV']
-            values = [
-                df_dominio['Penalità Status Code %'].iloc[0],
-                df_dominio['Penalità Canonical %'].iloc[0],
-                df_dominio['Penalità Tag HTML %'].iloc[0],
-                df_dominio['Penalità Contenuti Duplicati %'].iloc[0],
-                df_dominio['Penalità CWV %'].iloc[0]
-            ]
+                labels = ['Status Code', 'Canonical', 'Tag HTML', 'Contenuti Duplicati', 'CWV']
+                values = [
+                    df_dominio['Penalità Status Code %'].iloc[0],
+                    df_dominio['Penalità Canonical %'].iloc[0],
+                    df_dominio['Penalità Tag HTML %'].iloc[0],
+                    df_dominio['Penalità Contenuti Duplicati %'].iloc[0],
+                    df_dominio['Penalità CWV %'].iloc[0]
+                ]
 
             values = [v if isinstance(v, (int, float)) else 0 for v in values]
             angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
@@ -262,8 +271,9 @@ with tab2:
             ax.set_xticks(angles[:-1])
             ax.set_xticklabels(labels)
             ax.set_title(f"Radar Chart - {dominio_scelto}")
-
             st.pyplot(fig)
+        else:
+            st.info("Radar chart non disponibile. Installa matplotlib con: pip install matplotlib")
             df_visual = df_totale.copy()
             df_visual['Status Error %'] = round(((df_visual['Pagine 3xx'] + df_visual['Pagine 4xx'] + df_visual['Bloccate da Robots.txt']) / df_visual['Pagine Totali']) * 100, 1)
             df_visual['HTML Error %'] = round(((df_visual['Title Duplicati'] + df_visual['Title Mancanti'] + df_visual['Meta Description Duplicati'] + df_visual['Meta Description Mancanti'] + df_visual['H1 Duplicati'] + df_visual['H1 Mancanti']) / (3 * df_visual['Pagine Totali'])) * 100, 1)
@@ -320,5 +330,5 @@ with tab2:
                 df_riepilogo.to_excel(writer, sheet_name='Riepilogo Score', index=False)
 
             st.download_button("📥 Scarica il report Excel", buffer.getvalue(), file_name="multi_seo_audit.xlsx")
-        else:
-            st.warning("Nessun file valido caricato. Assicurati che ogni file contenga il foglio '1 - HTML' o '1 - All'.")
+    else:
+        st.warning("Nessun file valido caricato. Assicurati che ogni file contenga il foglio '1 - HTML' o '1 - All'.")
