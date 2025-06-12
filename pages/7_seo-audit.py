@@ -16,7 +16,7 @@ def estrai_dominio(df):
 def calcola_score(df, kpi):
     pagine_totali = df.shape[0]
     if pagine_totali == 0:
-        return 0
+        return 0, {}
 
     # Status Code e robots
     penalita_status = (kpi['Pagine 3xx'] + kpi['Pagine 4xx'] + kpi['Bloccate da Robots.txt']) / pagine_totali
@@ -54,6 +54,14 @@ def calcola_score(df, kpi):
     if penalita_cwv:
         cwv_penalita = sum(penalita_cwv) / len(penalita_cwv)
 
+    score_components = {
+        'Penalità Status Code %': round(penalita_status * 100, 1),
+        'Penalità Canonical %': round(canonical_non_self * 100, 1),
+        'Penalità Tag HTML %': round(html_penalita * 100, 1),
+        'Penalità Contenuti Duplicati %': round(penalita_duplicate * 100, 1),
+        'Penalità CWV %': round(cwv_penalita * 100, 1)
+    }
+
     score = 100 * (1 - (
         0.30 * penalita_status +
         0.15 * canonical_non_self +
@@ -61,7 +69,7 @@ def calcola_score(df, kpi):
         0.10 * penalita_duplicate +
         0.20 * cwv_penalita
     ))
-    return round(max(score, 0), 2)
+    return round(max(score, 0), 2), score_components
 
 def estrai_kpi(df):
     df.columns = df.columns.str.strip()
@@ -115,8 +123,9 @@ def estrai_kpi(df):
         **content,
         **cwv
     }
-    score = calcola_score(df, kpi)
+    score, components = calcola_score(df, kpi)
     kpi['SEO Score'] = score
+    kpi.update(components)
     return pd.DataFrame([kpi])
 
 st.title("SEO Audit Tool")
