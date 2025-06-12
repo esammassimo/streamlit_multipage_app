@@ -7,3 +7,4 @@ python-docx
 openpyxl
 chardet
 beautifulsoup4
+matplotlib
