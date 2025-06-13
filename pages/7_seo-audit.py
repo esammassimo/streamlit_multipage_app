@@ -5,13 +5,16 @@ from urllib.parse import urlparse
 import io
 import os
 
-try:
-    import matplotlib.pyplot as plt
-    import numpy as np
-    MATPLOTLIB_OK = True
-except ModuleNotFoundError:
-    MATPLOTLIB_OK = False
-    st.warning("Modulo 'matplotlib' mancante. Per visualizzare i radar chart, esegui: pip install matplotlib")
+def setup_matplotlib():
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+        return True, plt, np
+    except ModuleNotFoundError:
+        st.warning("Modulo 'matplotlib' mancante. Per visualizzare i radar chart, esegui: pip install matplotlib")
+        return False, None, None
+
+MATPLOTLIB_OK, plt, np = setup_matplotlib()
 
 def estrai_dominio(df):
     try:
