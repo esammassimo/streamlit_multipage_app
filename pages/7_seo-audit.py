@@ -18,7 +18,115 @@ MATPLOTLIB_OK, plt, np = setup_matplotlib()
 
 # === FUNZIONI SEO ===
 
-# [funzioni SEO già presenti sopra...]
+def estrai_dominio(df):
+    try:
+        url_sample = df['Address'].dropna().iloc[0]
+        dominio = urlparse(url_sample).netloc.replace('www.', '')
+        return dominio if dominio else None
+    except Exception:
+        return None
+
+def calcola_score(df, kpi):
+    pagine_totali = df.shape[0]
+    if pagine_totali == 0:
+        return 0, {}
+
+    penalita = {}
+
+    penalita['Penalità Status Code %'] = (kpi['Pagine 3xx'] + kpi['Pagine 4xx'] + kpi['Bloccate da Robots.txt']) / pagine_totali
+
+    canonical_non_self = 0
+    if 'Canonical Link Element 1 Resolved' in df.columns:
+        canon_df = df[['Address', 'Canonical Link Element 1 Resolved']].dropna()
+        canonical_non_self = (canon_df['Address'] != canon_df['Canonical Link Element 1 Resolved']).sum() / pagine_totali
+    penalita['Penalità Canonical %'] = canonical_non_self
+
+    penalita['Penalità Tag HTML %'] = (
+        (kpi['Title Duplicati'] + kpi['Title Mancanti'] +
+         kpi['Meta Description Duplicati'] + kpi['Meta Description Mancanti'] +
+         kpi['H1 Duplicati'] + kpi['H1 Mancanti']) / (3 * pagine_totali)
+    )
+
+    penalita['Penalità Contenuti Duplicati %'] = kpi['Pagine Duplicate'] / pagine_totali if isinstance(kpi['Pagine Duplicate'], (int, float)) else 0
+
+    penalita_cwv = []
+    soglie = {'LCP': 2500, 'INP': 200, 'CLS': 0.1, 'FCP': 1800, 'TTFB': 800}
+    for metrica, soglia in soglie.items():
+        if metrica in kpi:
+            val = kpi[metrica]
+            if isinstance(val, (int, float)) and val > 0:
+                if metrica == 'CLS':
+                    penalita_cwv.append(min(1.0, val / soglia))
+                else:
+                    penalita_cwv.append(min(1.0, max(0, (val - soglia) / soglia)))
+    penalita['Penalità CWV %'] = sum(penalita_cwv) / len(penalita_cwv) if penalita_cwv else 0
+
+    score = 100 * (1 - (
+        0.30 * penalita['Penalità Status Code %'] +
+        0.15 * penalita['Penalità Canonical %'] +
+        0.20 * penalita['Penalità Tag HTML %'] +
+        0.10 * penalita['Penalità Contenuti Duplicati %'] +
+        0.20 * penalita['Penalità CWV %']
+    ))
+
+    return round(max(score, 0), 2), {k: round(v * 100, 2) for k, v in penalita.items()}
+
+def estrai_kpi(df):
+    df.columns = df.columns.str.strip()
+    df['Status Code'] = pd.to_numeric(df['Status Code'], errors='coerce')
+
+    status = {
+        'Pagine 2xx': df['Status Code'].between(200, 299).sum(),
+        'Pagine 3xx': df['Status Code'].between(300, 399).sum(),
+        'Pagine 4xx': df['Status Code'].between(400, 499).sum(),
+        'Bloccate da Robots.txt': df['Indexability'].str.contains("Blocked by Robots", na=False).sum(),
+        'Pagine HTML Totali': df.shape[0]
+    }
+
+    def analizza(col):
+        if col not in df.columns:
+            return (0, 0, 0)
+        valid = df[col].dropna()
+        return (
+            len(valid[valid.duplicated(keep=False)].unique()),
+            df[col].isna().sum(),
+            df[col].notna().sum()
+        )
+
+    title = analizza("Title 1")
+    description = analizza("Meta Description 1")
+    h1 = analizza("H1-1")
+
+    html_tag = {
+        'Title Duplicati': title[0], 'Title Mancanti': title[1], 'Totale Title': title[2],
+        'Meta Description Duplicati': description[0], 'Meta Description Mancanti': description[1], 'Totale Meta Description': description[2],
+        'H1 Duplicati': h1[0], 'H1 Mancanti': h1[1], 'Totale H1': h1[2]
+    }
+
+    pagine_duplicate = df['Duplicate Content'].sum() if 'Duplicate Content' in df.columns else 'N/D'
+    immagini_senza_alt = df['Images Missing Alt Text'].sum() if 'Images Missing Alt Text' in df.columns else 'N/D'
+    content = {
+        'Pagine Duplicate': pagine_duplicate,
+        'Immagini senza ALT': immagini_senza_alt,
+        'Pagine Totali': df.shape[0]
+    }
+
+    cwv = {}
+    for metrica in ['LCP', 'INP', 'CLS', 'FCP', 'TTFB']:
+        col = f"{metrica} (ms)"
+        if col in df.columns:
+            cwv[metrica] = round(df[col].mean(), 2)
+
+    kpi = {
+        **status,
+        **html_tag,
+        **content,
+        **cwv
+    }
+    score, penalita = calcola_score(df, kpi)
+    kpi['SEO Score'] = score
+    kpi.update(penalita)
+    return pd.DataFrame([kpi])
 
 # === INTERFACCIA STREAMLIT ===
 
