@@ -153,6 +153,24 @@ with tab1:
             kpi_short = kpi[['SEO Score', 'Penalità Status Code %', 'Penalità Canonical %', 'Penalità Tag HTML %', 'Penalità Contenuti Duplicati %', 'Penalità CWV %']].copy()
             kpi_short['Stato'] = kpi_short['SEO Score'].apply(lambda x: 'Critico' if x < 50 else 'Medio' if x < 70 else 'Buono')
             st.subheader("Sintesi SEO")
+            st.markdown("### Pesi Score SEO")
+            st.dataframe(pd.DataFrame({
+                "Componente": [
+                    "Status Code e Robots",
+                    "Canonical non self-ref",
+                    "HTML Tag duplicati/mancanti",
+                    "Contenuti duplicati",
+                    "Core Web Vitals"
+                ],
+                "Peso (%)": [30, 15, 20, 10, 20],
+                "Risultato": [
+                    kpi_short['Penalità Status Code %'].iloc[0],
+                    kpi_short['Penalità Canonical %'].iloc[0],
+                    kpi_short['Penalità Tag HTML %'].iloc[0],
+                    kpi_short['Penalità Contenuti Duplicati %'].iloc[0],
+                    kpi_short['Penalità CWV %'].iloc[0]
+                ]
+            }))
             st.dataframe(kpi_short)
             if MATPLOTLIB_OK:
                 kpi_riepilogo = kpi[['Penalità Status Code %', 'Penalità Canonical %', 'Penalità Tag HTML %', 'Penalità Contenuti Duplicati %', 'Penalità CWV %']]
@@ -205,7 +223,22 @@ with tab2:
             df_short = df_riepilogo[['Dominio', 'SEO Score', 'Penalità Status Code %', 'Penalità Canonical %', 'Penalità Tag HTML %', 'Penalità Contenuti Duplicati %', 'Penalità CWV %']].copy()
             df_short['Stato'] = df_short['SEO Score'].apply(lambda x: 'Critico' if x < 50 else 'Medio' if x < 70 else 'Buono')
             st.subheader("Sintesi SEO per dominio")
+            st.markdown("### Pesi Score SEO (per ogni dominio)")
+            tabella_pesi = pd.DataFrame({
+                "Componente": [
+                    "Status Code e Robots",
+                    "Canonical non self-ref",
+                    "HTML Tag duplicati/mancanti",
+                    "Contenuti duplicati",
+                    "Core Web Vitals"
+                ],
+                "Peso (%)": [30, 15, 20, 10, 20]
+            })
+            st.dataframe(tabella_pesi)
             st.dataframe(df_short)
+
+            st.markdown("### Confronto Score SEO tra domini")
+            st.bar_chart(df_short.set_index("Dominio")["SEO Score"])
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                 for dominio, group in df_riepilogo.groupby('Dominio'):
