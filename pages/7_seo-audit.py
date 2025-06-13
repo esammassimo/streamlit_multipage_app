@@ -132,8 +132,10 @@ def estrai_kpi(df):
 
 st.title("SEO Audit Tool")
 
+tab1, tab2 = st.tabs(["Singolo File", "Multi File"])
+
 # Tab 1 - Singolo file
-with st.tabs(["Singolo File", "Multi File"])[0]:
+with tab1:
     file = st.file_uploader("Carica un file .xlsx (Screaming Frog)", type="xlsx", key="single")
     if file:
         xls = pd.ExcelFile(file)
@@ -177,7 +179,7 @@ with st.tabs(["Singolo File", "Multi File"])[0]:
             st.warning("Il file non contiene un foglio valido ('1 - HTML' o '1 - All').")
 
 # Tab 2 - Multi File
-with st.tabs(["Singolo File", "Multi File"])[1]:
+with tab2:
     files = st.file_uploader("Carica più file .xlsx (Screaming Frog)", type="xlsx", accept_multiple_files=True, key="multi")
     if files:
         risultati = []
