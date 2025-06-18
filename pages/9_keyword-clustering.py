@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import openai
+from openai import OpenAI
 from io import BytesIO
 
 st.set_page_config(page_title="Keyword Clustering", layout="centered")
@@ -32,17 +33,23 @@ elif input_method == "Incolla testo manualmente":
 labels_input = st.text_input("🏷️ Inserisci le etichette di clustering separate da virgola",
                               placeholder="es. birra artigianale, ricette, marchi")
 
+# Scelta del modello
+model_choice = st.selectbox("🤖 Seleziona il modello OpenAI da utilizzare", ["gpt-4o", "gpt-3.5-turbo"])
+
 if keywords and labels_input and api_key:
     labels = [label.strip() for label in labels_input.split(",") if label.strip()]
 
     results = []
-    openai.api_key = api_key
+    client = OpenAI(api_key=api_key)
+
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
 
     with st.spinner("🔍 Sto classificando le parole chiave..."):
         for keyword in keywords:
             try:
-                response = openai.ChatCompletion.create(
-                    model="gpt-4o",
+                response = client.chat.completions.create(
+                    model=model_choice,
                     messages=[
                         {"role": "system", "content": "Assegna ogni parola chiave alla categoria più pertinente tra quelle fornite."},
                         {"role": "user", "content": f"Assegna la parola chiave '{keyword}' a una delle seguenti categorie: {', '.join(labels)}. Rispondi solo con il nome della categoria più pertinente."}
@@ -50,6 +57,11 @@ if keywords and labels_input and api_key:
                     max_tokens=10
                 )
                 category = response.choices[0].message.content.strip()
+
+                usage = response.usage
+                total_prompt_tokens += usage.prompt_tokens
+                total_completion_tokens += usage.completion_tokens
+
             except Exception as e:
                 category = f"Errore: {e}"
             results.append((keyword, category))
@@ -57,6 +69,8 @@ if keywords and labels_input and api_key:
     output_df = pd.DataFrame(results, columns=["Keyword", "Cluster"])
     st.success("✅ Classificazione completata!")
     st.dataframe(output_df)
+
+    st.markdown(f"**📊 Token utilizzati:** Prompt: `{total_prompt_tokens}`, Completion: `{total_completion_tokens}`, Totale: `{total_prompt_tokens + total_completion_tokens}`")
 
     # Esporta file Excel
     buffer = BytesIO()
