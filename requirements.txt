@@ -8,3 +8,4 @@ openpyxl
 chardet
 beautifulsoup4
 matplotlib
+XlsxWriter
