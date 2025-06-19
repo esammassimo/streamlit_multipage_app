@@ -31,7 +31,7 @@ elif input_method == "Incolla testo manualmente":
         domains = [line.strip() for line in manual_input.splitlines() if line.strip()]
 
 # Metodo di definizione etichette
-label_mode = st.radio("🏷️ Come vuoi fornire le etichette?", ["Inserimento manuale", "Carica file di etichette (txt)"])
+label_mode = st.radio("🏷️ Come vuoi fornire le etichette?", ["Inserimento manuale", "Usa file predefinito category_domain.txt"])
 
 labels = []
 
@@ -41,16 +41,16 @@ if label_mode == "Inserimento manuale":
     if labels_input:
         labels = [label.strip() for label in labels_input.split(",") if label.strip()]
 
-elif label_mode == "Carica file di etichette (txt)":
-    txt_file = st.file_uploader("📄 Carica un file .txt con le etichette (una per riga)", type=["txt"])
-    if txt_file:
-        st.markdown("### 📂 Etichette caricate dal file:")
-        txt_content = txt_file.read().decode("utf-8")
-        labels = [line.strip() for line in txt_content.splitlines() if line.strip()]
+elif label_mode == "Usa file predefinito category_domain.txt":
+    try:
+        with open("category_domain.txt", "r", encoding="utf-8") as f:
+            labels = [line.strip() for line in f.readlines() if line.strip()]
+        st.markdown("### 📂 Etichette caricate da category_domain.txt:")
         st.text("".join(labels[:30]))
         if len(labels) > 30:
             st.text(f"...e altre {len(labels) - 30} categorie")
-        labels = [line.strip() for line in txt_file.read().decode("utf-8").splitlines() if line.strip()]
+    except FileNotFoundError:
+        st.error("❌ Il file 'category_domain.txt' non è stato trovato nella directory dello script.")
 
 # Scelta del modello
 model_choice = st.selectbox("🤖 Seleziona il modello OpenAI da utilizzare", ["gpt-4o", "gpt-3.5-turbo"])
