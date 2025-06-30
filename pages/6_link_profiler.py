@@ -65,6 +65,7 @@ def extract_domain_from_url(url):
 
 # === STREAMLIT APP ===
 st.title("🔎 Link Profiler (Tier, Anchor, Page Level)")
+st.text("I nomi dei file devono essere nomedominio.it.csv e non contenere ulteriori caratteri")
 
 brand_keywords_input = st.text_input("Parole chiave del brand (separate da virgola):")
 brand_keywords = [kw.strip().lower() for kw in brand_keywords_input.split(",") if kw.strip() != ""]
