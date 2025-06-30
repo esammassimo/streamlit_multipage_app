@@ -3,8 +3,6 @@ import pandas as pd
 import chardet
 from urllib.parse import urlparse, unquote
 import re
-import openai
-import time
 import streamlit as st
 import tempfile
 
@@ -65,52 +63,8 @@ def extract_domain_from_url(url):
     except:
         return "UNKNOWN"
 
-# === GPT CLASSIFIER ===
-def gpt_semantic_url_classification(urls, api_key, model="gpt-4", batch_size=10, pause=1.5):
-    from openai import OpenAI
-    client = OpenAI(api_key=api_key)
-    result_map = {}
-
-    def extract_path_description(url):
-        path = urlparse(url).path
-        return " / ".join([unquote(p) for p in path.split("/") if p])
-
-    for i in range(0, len(urls), batch_size):
-        batch = urls[i:i + batch_size]
-        descrizioni = [extract_path_description(url) for url in batch]
-
-        prompt = "Per ciascun percorso URL seguente, assegna una categoria tematica coerente (es. Scarpe > Sandali, Borse, Collezione Sposa, ecc.).\n"
-        prompt += "Rispondi in formato JSON: {\"<descrizione URL>\": \"<categoria>\"}\n\n"
-        for desc in descrizioni:
-            prompt += f"- {desc}\n"
-
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3
-            )
-
-            text = response.choices[0].message.content
-            parsed = eval(text) if text.strip().startswith("{") else {}
-            for url, desc in zip(batch, descrizioni):
-                result_map[url] = parsed.get(desc, "Non classificato")
-
-        except Exception as e:
-            for url in batch:
-                result_map[url] = f"Errore: {e}"
-
-        time.sleep(pause)
-
-    return result_map
-
 # === STREAMLIT APP ===
-st.title("🔎 Link Profiler per Brand")
-
-api_key = st.text_input("Inserisci la tua OpenAI API Key:", type="password")
-if not api_key:
-    st.warning("⚠ Inserisci la tua OpenAI API Key per continuare.")
-    st.stop()
+st.title("🔎 Link Profiler (Tier, Anchor, Page Level)")
 
 brand_keywords_input = st.text_input("Parole chiave del brand (separate da virgola):")
 brand_keywords = [kw.strip().lower() for kw in brand_keywords_input.split(",") if kw.strip() != ""]
@@ -140,10 +94,6 @@ if uploaded_files:
             df["Anchor class"] = df["Anchor"].apply(lambda x: classify_anchor(x, brand_keywords))
             df["URL structure class"] = df["Target URL"].apply(classify_url_structure)
 
-            url_list = df["Target URL"].dropna().unique().tolist()
-            url_category_map = gpt_semantic_url_classification(url_list, api_key)
-            df["URL Category"] = df["Target URL"].apply(lambda x: url_category_map.get(x, "UNKNOWN"))
-
             dfs.append(df)
         except Exception as e:
             st.error(f"❌ Errore durante l'elaborazione del file {uploaded_file.name}: {e}")
@@ -160,7 +110,7 @@ if uploaded_files:
             full_output_path = tmp_output.name
             final_df.to_excel(full_output_path, index=False)
             with open(full_output_path, "rb") as f:
-                st.download_button("📥 Scarica file Excel unificato", f, file_name="classificazione_completa_tutti_brand.xlsx")
+                st.download_button("📥 Scarica file Excel unificato", f, file_name="link_profiler_classificato.xlsx")
 
         st.subheader("📊 Riepiloghi per Dominio")
 
@@ -187,9 +137,3 @@ if uploaded_files:
         structure_summary.loc["TOTALE"] = structure_summary.sum()
         st.markdown("**Page Level per Dominio**")
         st.dataframe(structure_summary)
-
-        # 5. Categoria GPT
-        gpt_summary = final_df.pivot_table(index="Dominio", columns="URL Category", aggfunc="size", fill_value=0)
-        gpt_summary.loc["TOTALE"] = gpt_summary.sum()
-        st.markdown("**Categorie assegnate da GPT**")
-        st.dataframe(gpt_summary)
