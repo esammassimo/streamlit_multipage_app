@@ -3,26 +3,34 @@ import requests
 import openai
 import json
 
-def get_paa_questions(keyword, serper_api_key):
-    url = "https://google.serper.dev/search"
-    headers = {"X-API-KEY": serper_api_key, "Content-Type": "application/json"}
-    payload = json.dumps({"q": keyword, "gl": "it", "hl": "it", "type": "search", "engine": "google"})
-    
-    response = requests.post(url, headers=headers, data=payload)
+def get_paa_questions(keyword, serpapi_api_key):
+    # Endpoint e parametri per SerpAPI
+    url = "https://serpapi.com/search.json"
+    params = {
+        "engine": "google",
+        "q": keyword,
+        "gl": "it",            # Paese: Italia
+        "hl": "it",            # Lingua: Italiano
+        # "google_domain": "google.it",  # Opzionale, dominio Google Italia
+        "api_key": serpapi_api_key
+    }
+    # Esegui la richiesta GET a SerpAPI
+    response = requests.get(url, params=params)
     if response.status_code == 200:
         data = response.json()
-        return [q['question'] for q in data.get("peopleAlsoAsk", [])]
+        # Estrai le domande dal campo related_questions (People Also Ask)
+        return [q["question"] for q in data.get("related_questions", [])]
     else:
-        st.error(f"❌ Error in Serper.dev request: {response.status_code}")
+        st.error(f"❌ Errore nella richiesta SerpAPI: {response.status_code}")
         return []
 
 def generate_answer(question, openai_api_key):
+    # (Funzione invariata - utilizza OpenAI per generare risposta alla domanda)
     client = openai.OpenAI(api_key=openai_api_key)
     prompt = f"""
     Rispondi in modo chiaro e dettagliato alla seguente domanda:
     {question}
     """
-    
     try:
         response = client.chat.completions.create(
             model="gpt-4",
@@ -34,34 +42,34 @@ def generate_answer(question, openai_api_key):
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        st.error(f"❌ Error generating answer: {e}")
+        st.error(f"❌ Errore generazione risposta: {e}")
         return "Nessuna risposta generata."
 
 st.title("🔍 People Also Ask (PAA) Generator")
 
-# API Keys Inputs
-serper_api_key = st.text_input("🔑 Enter your Serper.dev API Key", type="password")
+# Input delle API Key
+serpapi_api_key = st.text_input("🔑 Enter your SerpAPI API Key", type="password")
 oai_api_key = st.text_input("🔑 Enter your OpenAI API Key", type="password")
 
-# Keyword Input
+# Input keyword di ricerca
 keyword = st.text_input("🔎 Enter a keyword to fetch PAA questions")
 
 if st.button("📄 Generate PAA Questions and Answers"):
-    if not serper_api_key or not oai_api_key or not keyword:
-        st.error("⚠️ You must enter both API Keys and a keyword!")
+    if not serpapi_api_key or not oai_api_key or not keyword:
+        st.error("⚠️ Devi inserire entrambe le API Key e una keyword!")
     else:
         st.info(f"Fetching PAA questions for: {keyword}...")
-        paa_questions = get_paa_questions(keyword, serper_api_key)
+        paa_questions = get_paa_questions(keyword, serpapi_api_key)
         
         if not paa_questions:
-            st.warning("⚠️ No PAA questions found.")
+            st.warning("⚠️ Nessuna domanda PAA trovata.")
         else:
             results = {}
             for question in paa_questions:
                 st.write(f"✨ Generating answer for: {question}")
                 results[question] = generate_answer(question, oai_api_key)
             
-            # Display results
+            # Mostra i risultati
             st.subheader("📌 Generated Questions & Answers")
             combined_text = ""
             for q, a in results.items():
@@ -69,5 +77,5 @@ if st.button("📄 Generate PAA Questions and Answers"):
                 st.markdown(f"**A:** {a}")
                 combined_text += f"Domanda: {q}\nRisposta: {a}\n\n"
             
-            # Copy to clipboard button
+            # Pulsante per copiare i risultati
             st.download_button("📋 Copy to Clipboard", combined_text, file_name="paa_results.txt", mime="text/plain")
