@@ -1,11 +1,49 @@
 import streamlit as st
 from openai import OpenAI
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from youtube_transcript_api import YouTubeTranscriptApi as YTA, TranscriptsDisabled, NoTranscriptFound
 import re
 from docx import Document
 import io
 import zipfile
 from datetime import datetime
+
+# ============================
+# Helpers
+# ============================
+
+def fetch_transcript(video_id: str, language_code: str, allow_fallback: bool = True):
+    """Robust transcript fetcher that works with youtube-transcript-api list_transcripts API.
+    - Tries preferred language
+    - If allowed, tries to translate available transcripts to the requested language
+    - Finally, falls back to the first available transcript
+    """
+    transcripts = YTA.list_transcripts(video_id)
+
+    # 1) Try exact language match
+    try:
+        return transcripts.find_transcript([language_code]).fetch()
+    except NoTranscriptFound:
+        if not allow_fallback:
+            raise
+
+    # 2) Try translating any available transcript to the requested language
+    if allow_fallback:
+        for tr in transcripts:
+            if getattr(tr, "is_translatable", False):
+                try:
+                    return tr.translate(language_code).fetch()
+                except Exception:
+                    pass
+
+    # 3) Last resort: return the first available transcript as-is
+    for tr in transcripts:
+        try:
+            return tr.fetch()
+        except Exception:
+            pass
+
+    # If nothing worked
+    raise NoTranscriptFound(f"No transcript could be retrieved for video {video_id}.")
 
 # ============================
 # Helpers
@@ -174,11 +212,11 @@ if st.button("📄 Generate Transcript and Summary", use_container_width=True):
     try:
         # 1) Fetch transcript
         try:
-            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=[language_code])
+            transcript = fetch_transcript(video_id, language_code, allow_fallback=allow_fallback)
         except NoTranscriptFound:
             if allow_fallback:
                 st.warning(f"⚠️ No transcript found in '{language_code}'. Trying other available languages...")
-                transcript = YouTubeTranscriptApi.get_transcript(video_id)
+                transcript = fetch_transcript(video_id, language_code, allow_fallback=True)
             else:
                 raise
         except TranscriptsDisabled:
