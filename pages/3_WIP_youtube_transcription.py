@@ -7,30 +7,31 @@ import io
 import zipfile
 from datetime import datetime
 import time
+import importlib
+import sys
 
-# ====== youtube-transcript-api (import + version/capability detection) ======
+# ============= Tentativo import youtube-transcript-api + introspezione =============
+YTA = None
+TranscriptsDisabled = Exception
+NoTranscriptFound = Exception
+YTA_VERSION = "unknown"
+YTA_FILE = "unknown"
+
 try:
-    from youtube_transcript_api import YouTubeTranscriptApi as YTA  # type: ignore
-    try:
-        from youtube_transcript_api import TranscriptsDisabled, NoTranscriptFound  # type: ignore
-    except Exception:
-        # Fallback: definisci eccezioni se assenti nelle versioni antiche (evita crash)
-        class TranscriptsDisabled(Exception): ...
-        class NoTranscriptFound(Exception): ...
-    try:
-        from youtube_transcript_api import __version__ as YTA_VERSION  # type: ignore
-    except Exception:
-        YTA_VERSION = "unknown"
+    yta_mod = importlib.import_module("youtube_transcript_api")
+    YTA_FILE = getattr(yta_mod, "__file__", "unknown")
+    YTA_VERSION = getattr(yta_mod, "__version__", "unknown")
+    # In alcune versioni l'API sta su youtube_transcript_api.YouTubeTranscriptApi
+    YTA = getattr(yta_mod, "YouTubeTranscriptApi", None)
+    # Eccezioni (se presenti)
+    TranscriptsDisabled = getattr(yta_mod, "TranscriptsDisabled", Exception)
+    NoTranscriptFound = getattr(yta_mod, "NoTranscriptFound", Exception)
 except Exception as e:
-    st.error(f"Impossibile importare youtube-transcript-api: {type(e).__name__}: {e}")
+    st.error(f"❌ Impossibile importare 'youtube_transcript_api': {type(e).__name__}: {e}")
     st.stop()
 
-# ============================
-# Helpers: ID & transcript
-# ============================
-
+# ============= Helper estrazione ID =============
 def extract_video_id(url: str):
-    """Estrae l'ID (11 char) da tutte le varianti comuni di URL YouTube."""
     if not url:
         return None
     try:
@@ -39,32 +40,26 @@ def extract_video_id(url: str):
             qs = parse_qs(p.query)
             if 'v' in qs and len(qs['v'][0]) == 11:
                 return qs['v'][0]
-            m = re.search(r"/shorts/([a-zA-Z0-9_-]{11})", p.path)
-            if m:
-                return m.group(1)
-            m = re.search(r"/embed/([a-zA-Z0-9_-]{11})", p.path)
-            if m:
-                return m.group(1)
-            m = re.search(r"youtu\.be/([a-zA-Z0-9_-]{11})", p.netloc + p.path)
-            if m:
-                return m.group(1)
+            m = re.search(r"/shorts/([A-Za-z0-9_-]{11})", p.path)
+            if m: return m.group(1)
+            m = re.search(r"/embed/([A-Za-z0-9_-]{11})", p.path)
+            if m: return m.group(1)
+            m = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", p.netloc + p.path)
+            if m: return m.group(1)
     except Exception:
         pass
-    # Fallback regex grezza
-    patterns = [
-        r"(?:v=|/v/|&v=|watch\?v=)([a-zA-Z0-9_-]{11})",
-        r"youtu\.be/([a-zA-Z0-9_-]{11})",
-        r"/embed/([a-zA-Z0-9_-]{11})",
-        r"/shorts/([a-zA-Z0-9_-]{11})",
-    ]
-    for p in patterns:
-        m = re.search(p, url)
-        if m:
-            return m.group(1)
+    for pat in [
+        r"(?:v=|/v/|&v=|watch\?v=)([A-Za-z0-9_-]{11})",
+        r"youtu\.be/([A-Za-z0-9_-]{11})",
+        r"/embed/([A-Za-z0-9_-]{11})",
+        r"/shorts/([A-Za-z0-9_-]{11})",
+    ]:
+        m = re.search(pat, url)
+        if m: return m.group(1)
     return None
 
+# ============= Helper retry/backoff =============
 def _with_retry(fn, *args, max_attempts=4, **kwargs):
-    """Retry helper con backoff esponenziale (0.5, 1, 2 secondi) per errori temporanei."""
     delay = 0.5
     for attempt in range(max_attempts):
         try:
@@ -72,103 +67,190 @@ def _with_retry(fn, *args, max_attempts=4, **kwargs):
         except TranscriptsDisabled:
             raise
         except NoTranscriptFound:
-            # errore 'strutturale': lascia gestire al chiamante
+            # errore strutturale, non ha senso ritentare
             raise
-        except Exception as e:
+        except Exception:
             if attempt == max_attempts - 1:
                 raise
             time.sleep(delay)
             delay = min(2.0, delay * 2)
 
-def fetch_transcript_compat(video_id: str, language_code: str, allow_fallback: bool = True):
+# ============= Fallback via yt_dlp (opzionale) =============
+def fetch_transcript_via_ytdlp(video_id: str, language_code: str, allow_fallback: bool):
     """
-    Percorso compatibile con versioni senza list_transcripts:
-    tenta get_transcript con una lista di lingue ordinate per priorità.
+    Prova a ottenere sottotitoli con yt_dlp senza scaricare il video.
+    Restituisce lista di dict [{'text': '...', 'start': ..., 'duration': ...}] in stile youtube-transcript-api.
+    """
+    try:
+        import yt_dlp
+        import requests
+    except Exception:
+        raise NoTranscriptFound("yt_dlp/requests non installati per il fallback.")
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    ydl_opts = {
+        "skip_download": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        # Priorità: sottotitoli nella lingua richiesta, poi auto-generated
+        candidates = []
+
+        def collect(subs_dict, label):
+            # subs_dict: {'en': [{'ext': 'vtt', 'url': '...'}, ...], 'it': [...]}
+            if not subs_dict:
+                return
+            # 1) esatta
+            if language_code in subs_dict:
+                candidates.append((subs_dict[language_code], f"{label}:{language_code}"))
+            # 2) base
+            base = language_code.split("-")[0].lower()
+            if base in subs_dict:
+                candidates.append((subs_dict[base], f"{label}:{base}"))
+            # 3) qualsiasi lingua se allow_fallback
+            if allow_fallback:
+                for lang, entries in subs_dict.items():
+                    candidates.append((entries, f"{label}:{lang}"))
+
+        collect(info.get("subtitles"), "subs")
+        collect(info.get("automatic_captions"), "auto")
+
+        if not candidates:
+            raise NoTranscriptFound("Nessun sottotitolo disponibile via yt_dlp.")
+
+        # prendi il primo candidato e scarica il primo formato disponibile
+        tracks, desc = candidates[0]
+        track = tracks[0]  # tipicamente .vtt
+        srt_url = track.get("url")
+        if not srt_url:
+            raise NoTranscriptFound("URL sottotitoli non disponibile.")
+
+        # scarica il testo VTT e converti a lista tipo transcript_api
+        r = requests.get(srt_url, timeout=20)
+        r.raise_for_status()
+        vtt = r.text
+
+        # parsing VTT minimale: estrai blocchi "HH:MM:SS.mmm --> HH:MM:SS.mmm" + testo
+        # (parsing semplice; per robustezza totale si potrebbe usare 'webvtt' lib)
+        entries = []
+        # separa per doppia newline
+        for block in re.split(r"\n\s*\n", vtt.strip()):
+            lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+            if len(lines) < 2:
+                continue
+            # trova linea tempo
+            time_line = None
+            for ln in lines:
+                if "-->" in ln:
+                    time_line = ln
+                    break
+            if not time_line:
+                continue
+            # parse tempi
+            tm = re.match(r"(?P<start>[\d:.]+)\s*-->\s*(?P<end>[\d:.]+)", time_line)
+            if not tm:
+                continue
+            def to_seconds(s):
+                # 00:01:02.345
+                parts = s.split(":")
+                parts = [float(p.replace(",", ".")) for p in parts]
+                while len(parts) < 3:  # mm:ss -> 0:mm:ss
+                    parts = [0.0] + parts
+                h, m, sec = parts[-3], parts[-2], parts[-1]
+                return h*3600 + m*60 + sec
+            start = to_seconds(tm.group("start"))
+            end = to_seconds(tm.group("end"))
+            duration = max(0.0, end - start)
+            # testo = tutto ciò che non è time_line/indice
+            text_lines = []
+            for ln in lines:
+                if ln == time_line: 
+                    continue
+                # salta indici numerici
+                if re.fullmatch(r"\d+", ln):
+                    continue
+                text_lines.append(ln)
+            text = " ".join(text_lines).strip()
+            if text:
+                entries.append({"text": text, "start": start, "duration": duration})
+        if not entries:
+            raise NoTranscriptFound("Impossibile parsare i sottotitoli VTT via yt_dlp.")
+        return entries
+
+# ============= Fetch transcript – percorso adattivo =============
+def fetch_transcript_any(video_id: str, language_code: str, allow_fallback: bool = True):
+    """
+    Prova in sequenza:
+    1) youtube_transcript_api.list_transcripts (se disponibile)
+    2) youtube_transcript_api.get_transcript (se disponibile)
+    3) Fallback yt_dlp (se disponibile)
     """
     base_lang = language_code.split("-")[0].lower() if language_code else "en"
-    prefer_list = []
-    if language_code:
-        prefer_list.append(language_code)
-    if base_lang and base_lang not in prefer_list:
-        prefer_list.append(base_lang)
+    prefer_list = [lc for lc in [language_code, base_lang] if lc]
 
-    common_langs = ["en", "en-US", "en-GB", "it", "es", "de", "fr", "pt", "pt-BR"]
-    for l in common_langs:
-        if l not in prefer_list:
-            prefer_list.append(l)
+    used_path = None
 
-    # Tenta in ordine: appena trova una trascrizione valida, la ritorna
-    for lang in prefer_list:
+    # 1) Percorso moderno con list_transcripts
+    if YTA and hasattr(YTA, "list_transcripts"):
+        transcripts = _with_retry(getattr(YTA, "list_transcripts"), video_id)
+        # a) lingua preferita
         try:
-            return _with_retry(YTA.get_transcript, video_id, languages=[lang])
-        except NoTranscriptFound:
-            if not allow_fallback and lang != language_code:
-                # se non è consentito fallback, fermati dopo il primo tentativo
-                break
-            continue
-    raise NoTranscriptFound(f"Nessuna trascrizione recuperabile per video {video_id} (compat).")
-
-def fetch_transcript_modern(video_id: str, language_code: str, allow_fallback: bool = True):
-    """
-    Percorso moderno (con list_transcripts disponibile):
-    1) get_transcript con lingua richiesta e base
-    2) list_transcripts: match lingua -> translate (se possibile) -> prima disponibile
-    """
-    base_lang = language_code.split("-")[0].lower() if language_code else "en"
-    prefer_list = []
-    if language_code:
-        prefer_list.append(language_code)
-    if base_lang and base_lang not in prefer_list:
-        prefer_list.append(base_lang)
-
-    # 1) Tentativo diretto
-    try:
-        return _with_retry(YTA.get_transcript, video_id, languages=prefer_list)
-    except NoTranscriptFound:
-        pass
-
-    # 2) list_transcripts path
-    transcripts = _with_retry(YTA.list_transcripts, video_id)
-
-    # 2a) match lingua esatta/base
-    try:
-        return transcripts.find_transcript(prefer_list).fetch()
-    except NoTranscriptFound:
-        if not allow_fallback:
-            raise
-
-    # 2b) traduzione verso lingua richiesta/base (se disponibile)
-    if allow_fallback:
+            tr = transcripts.find_transcript(prefer_list)
+            used_path = f"list_transcripts:match({tr.language_code})"
+            return transcripts.find_transcript(prefer_list).fetch(), used_path
+        except Exception:
+            pass
+        # b) translate
+        if allow_fallback:
+            for tr in transcripts:
+                try:
+                    if getattr(tr, "is_translatable", False):
+                        for tgt in prefer_list:
+                            try:
+                                used_path = f"list_transcripts:translate({tr.language_code}->{tgt})"
+                                return tr.translate(tgt).fetch(), used_path
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+        # c) prima disponibile
         for tr in transcripts:
             try:
-                if getattr(tr, "is_translatable", False):
-                    for tgt in prefer_list:
-                        try:
-                            return tr.translate(tgt).fetch()
-                        except Exception:
-                            continue
+                used_path = f"list_transcripts:first({tr.language_code})"
+                return tr.fetch(), used_path
             except Exception:
                 continue
 
-    # 2c) prima disponibile
-    for tr in transcripts:
-        try:
-            return tr.fetch()
-        except Exception:
-            continue
+    # 2) Percorso classico get_transcript
+    if YTA and hasattr(YTA, "get_transcript"):
+        # prova prefer_list, poi qualche lingua comune se allow_fallback
+        langs = prefer_list[:]
+        if allow_fallback:
+            for extra in ["en", "en-US", "en-GB", "it", "es", "de", "fr", "pt", "pt-BR"]:
+                if extra not in langs:
+                    langs.append(extra)
+        for lc in langs:
+            try:
+                used_path = f"get_transcript({lc})"
+                return _with_retry(getattr(YTA, "get_transcript"), video_id, languages=[lc]), used_path
+            except TranscriptsDisabled:
+                raise
+            except NoTranscriptFound:
+                continue
+            except Exception:
+                continue
 
-    raise NoTranscriptFound(f"Nessuna trascrizione recuperabile per video {video_id}.")
+    # 3) Fallback yt_dlp
+    try:
+        entries = fetch_transcript_via_ytdlp(video_id, language_code, allow_fallback)
+        used_path = "yt_dlp"
+        return entries, used_path
+    except Exception as e:
+        raise NoTranscriptFound(f"Nessun metodo disponibile: {type(e).__name__}: {e}")
 
-def fetch_transcript(video_id: str, language_code: str, allow_fallback: bool = True):
-    """Se list_transcripts esiste usa il percorso moderno, altrimenti quello compat."""
-    if hasattr(YTA, "list_transcripts"):
-        return fetch_transcript_modern(video_id, language_code, allow_fallback)
-    return fetch_transcript_compat(video_id, language_code, allow_fallback)
-
-# ============================
-# Helpers: text & summary
-# ============================
-
+# ============= Text helpers =============
 def clean_transcript_text(text: str) -> str:
     text = re.sub(r"\[(?:Music|Applause|Laughter)\]", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip()
@@ -177,7 +259,6 @@ def clean_transcript_text(text: str) -> str:
 def summarize_text(client: OpenAI, text: str, model: str, temperature: float, min_words: int = 400) -> str:
     MAX_CHARS = 12000
     chunks = [text[i:i + MAX_CHARS] for i in range(0, len(text), MAX_CHARS)]
-
     if len(chunks) == 1:
         prompt = (
             f"Summarize the following transcript, keeping the key points and context. "
@@ -197,8 +278,7 @@ def summarize_text(client: OpenAI, text: str, model: str, temperature: float, mi
         )
         return resp.choices[0].message.content
 
-    # Multi-chunk: riassumi i pezzi e poi sintetizza
-    partial_summaries = []
+    partial = []
     for idx, ch in enumerate(chunks, 1):
         prompt = (
             f"Summarize part {idx} of a longer transcript. Focus on key points, arguments, data, and conclusions. "
@@ -213,13 +293,13 @@ def summarize_text(client: OpenAI, text: str, model: str, temperature: float, mi
             temperature=temperature,
             max_tokens=1200,
         )
-        partial_summaries.append(resp.choices[0].message.content)
+        partial.append(resp.choices[0].message.content)
 
     synthesis_prompt = (
-        f"You are given {len(partial_summaries)} partial summaries from a video transcript. "
+        f"You are given {len(partial)} partial summaries from a video transcript. "
         f"Merge them into a single cohesive summary of at least {min_words} words. "
         "Avoid duplication, keep a logical flow, and highlight the most critical insights."
-        "\n\nPartial summaries:\n" + "\n".join(f"Part {i+1}:\n{ps}" for i, ps in enumerate(partial_summaries))
+        "\n\nPartial summaries:\n" + "\n".join(f"Part {i+1}:\n{ps}" for i, ps in enumerate(partial))
     )
     final_resp = client.chat.completions.create(
         model=model,
@@ -232,10 +312,7 @@ def summarize_text(client: OpenAI, text: str, model: str, temperature: float, mi
     )
     return final_resp.choices[0].message.content
 
-# ============================
-# UI
-# ============================
-
+# ============= UI =============
 st.set_page_config(page_title="YouTube Transcript & Summary Generator", page_icon="🎥", layout="centered")
 st.title("🎥 YouTube Transcript & Summary Generator")
 
@@ -246,7 +323,6 @@ with st.sidebar:
     oai_key = st.text_input("Insert your OpenAI API KEY", type="password", value=st.session_state['oai_api_key'])
     st.session_state['oai_api_key'] = oai_key
 
-    # Modelli (incluso GPT-5)
     model = st.selectbox(
         "Model",
         options=[
@@ -265,25 +341,13 @@ with st.sidebar:
     temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.7, 0.1)
     min_words = st.number_input("Minimum summary length (words)", min_value=150, max_value=2000, value=400, step=50)
 
-st.caption(f"📦 youtube-transcript-api version: {YTA_VERSION} — capability(list_transcripts) = {hasattr(YTA, 'list_transcripts')}")
-if not hasattr(YTA, "list_transcripts"):
-    st.info("ℹ️ Modalità compat: uso di get_transcript con lista di lingue. Per risultati migliori: `pip install --upgrade youtube-transcript-api`.")
+# Diagnostica modulo importato
+st.caption(f"📦 youtube-transcript-api — version: {YTA_VERSION}, file: {YTA_FILE}")
+st.caption(f"🔍 attributes → list_transcripts: {hasattr(YTA, 'list_transcripts') if YTA else False}, get_transcript: {hasattr(YTA, 'get_transcript') if YTA else False}")
 
 youtube_url = st.text_input("📺 Enter YouTube video URL")
 language_code = st.text_input("🌍 Enter language code (default 'en')", value="en")
 allow_fallback = st.checkbox("If not found, try other available languages", value=True)
-
-with st.expander("🧭 How to use"):
-    st.markdown(
-        """
-        1. Enter your OpenAI API key in the sidebar.
-        2. Paste a YouTube video URL.
-        3. Optionally set the transcript language code (e.g., `en`, `it`, `es`).
-        4. Adjust model, creativity, and minimum summary length.
-        5. Click **Generate Transcript and Summary**.
-        6. Download the ZIP with `.txt` transcript and `.docx` summary.
-        """
-    )
 
 if not oai_key:
     st.warning("⚠️ Insert your API KEY in the sidebar to continue.")
@@ -302,36 +366,21 @@ if st.button("📄 Generate Transcript and Summary", use_container_width=True):
         st.stop()
 
     st.caption(f"🎯 Detected Video ID: `{video_id}`")
-
     try:
-        # Transcript (usa percorso moderno o compat a seconda della versione)
-        try:
-            transcript = fetch_transcript(video_id, language_code, allow_fallback=allow_fallback)
-        except NoTranscriptFound:
-            if allow_fallback:
-                st.warning(f"⚠️ No transcript found in '{language_code}'. Trying other languages...")
-                transcript = fetch_transcript(video_id, language_code, allow_fallback=True)
-            else:
-                raise
-        except TranscriptsDisabled:
-            st.error("❌ Transcripts are disabled for this video.")
-            st.stop()
+        entries, used_path = fetch_transcript_any(video_id, language_code, allow_fallback=allow_fallback)
+        st.info(f"✅ Transcript fetched via: **{used_path}**")
 
-        if not transcript:
-            st.error("❌ No transcript available for this video.")
-            st.stop()
-
-        full_text = " ".join([entry.get('text', '') for entry in transcript])
+        # entries → [{'text': '...', 'start': float, 'duration': float}, ...]
+        full_text = " ".join([e.get("text", "") for e in entries])
         full_text = clean_transcript_text(full_text)
-
         if not full_text.strip():
-            st.error("❌ Transcript retrieved but empty. The video may not contain usable captions.")
+            st.error("❌ Transcript retrieved but empty.")
             st.stop()
 
         with st.spinner("🧠 Generating summary with OpenAI..."):
             summary = summarize_text(client, full_text, model=model, temperature=temperature, min_words=int(min_words))
 
-        # Files (TXT + DOCX in ZIP)
+        # Build ZIP (txt + docx)
         transcript_bytes = full_text.encode('utf-8')
         transcript_filename = f"transcript_{video_id}.txt"
 
@@ -362,7 +411,9 @@ if st.button("📄 Generate Transcript and Summary", use_container_width=True):
         with st.expander("👀 Preview summary"):
             st.write(summary)
 
-    except NoTranscriptFound:
-        st.error(f"❌ No transcript found for this video (requested language: '{language_code}').")
+    except TranscriptsDisabled:
+        st.error("❌ Transcripts are disabled for this video.")
+    except NoTranscriptFound as e:
+        st.error(f"❌ No transcript found: {e}")
     except Exception as e:
-        st.error(f"❌ Error during extraction: {type(e).__name__}: {str(e)}")
+        st.error(f"❌ Error during extraction: {type(e).__name__}: {e}")
