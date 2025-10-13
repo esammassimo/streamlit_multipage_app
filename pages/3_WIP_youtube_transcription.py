@@ -8,6 +8,8 @@ import zipfile
 from datetime import datetime
 import time
 import importlib
+import json
+import xml.etree.ElementTree as ET
 
 # ============================
 # Eccezione interna cross-version
@@ -82,12 +84,134 @@ def _with_retry(fn, *args, max_attempts=4, **kwargs):
             delay = min(2.0, delay * 2)
 
 # ============================
-# Fallback via yt_dlp (opzionale ma consigliato)
+# Parsers per sottotitoli in formati diversi
 # ============================
-def fetch_transcript_via_ytdlp(video_id: str, language_code: str, allow_fallback: bool):
+def _parse_time_to_seconds(s: str) -> float:
+    # supporta "HH:MM:SS.mmm" e simili; per json3/srv3 useremo ms direttamente
+    parts = s.split(":")
+    parts = [p.replace(",", ".") for p in parts]
+    while len(parts) < 3:
+        parts = ["0"] + parts
+    h, m, sec = float(parts[-3]), float(parts[-2]), float(parts[-1])
+    return h*3600 + m*60 + sec
+
+def parse_vtt(text: str):
+    """Parsa VTT in entries [{'text','start','duration'}] provando webvtt se disponibile, altrimenti regex fallback."""
+    entries = []
+    try:
+        import webvtt  # webvtt-py
+        # webvtt accetta stringa via tempfile; usiamo BytesIO+from_string in versioni recenti
+        v = webvtt.read_buffer(io.StringIO(text))
+        for cue in v:
+            start = _parse_time_to_seconds(cue.start)
+            end = _parse_time_to_seconds(cue.end)
+            duration = max(0.0, end - start)
+            txt = re.sub(r"\s+", " ", (cue.text or "").strip())
+            if txt:
+                entries.append({"text": txt, "start": start, "duration": duration})
+        if entries:
+            return entries
+    except Exception:
+        pass
+
+    # fallback minimale: blocchi separati da righe vuote
+    for block in re.split(r"\n\s*\n", text.strip()):
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        if len(lines) < 2:
+            continue
+        time_line = next((ln for ln in lines if "-->" in ln), None)
+        if not time_line:
+            continue
+        tm = re.match(r"(?P<start>[\d:.]+)\s*-->\s*(?P<end>[\d:.]+)", time_line)
+        if not tm:
+            continue
+        start = _parse_time_to_seconds(tm.group("start"))
+        end = _parse_time_to_seconds(tm.group("end"))
+        duration = max(0.0, end - start)
+        text_lines = []
+        for ln in lines:
+            if ln == time_line: 
+                continue
+            if re.fullmatch(r"\d+", ln):
+                continue
+            text_lines.append(ln)
+        txt = re.sub(r"\s+", " ", " ".join(text_lines).strip())
+        if txt:
+            entries.append({"text": txt, "start": start, "duration": duration})
+    return entries
+
+def parse_json3(text: str):
+    """Parsa JSON3 (YouTube) in entries."""
+    data = json.loads(text)
+    events = data.get("events", [])
+    entries = []
+    for ev in events:
+        t_start = ev.get("tStartMs")
+        dur = ev.get("dDurationMs", 0)
+        segs = ev.get("segs", [])
+        if t_start is None or not segs:
+            continue
+        txt = " ".join(seg.get("utf8", "") for seg in segs).strip()
+        txt = re.sub(r"\s+", " ", txt)
+        if not txt:
+            continue
+        start = float(t_start) / 1000.0
+        duration = float(dur) / 1000.0 if dur else 0.0
+        entries.append({"text": txt, "start": start, "duration": duration})
+    return entries
+
+def parse_srv3_xml(text: str):
+    """Parsa formato SRV3 XML (automatic captions) → entries."""
+    entries = []
+    root = ET.fromstring(text)
+    # spesso <p t="12345" d="678"> ... <s>word</s> ... </p>
+    for p in root.iter("p"):
+        t = p.attrib.get("t")  # ms
+        d = p.attrib.get("d", "0")
+        if t is None:
+            continue
+        start = float(t) / 1000.0
+        duration = float(d) / 1000.0 if d else 0.0
+        # testo = concatenazione dei nodi <s> o testo diretto
+        parts = []
+        if p.text and p.text.strip():
+            parts.append(p.text.strip())
+        for s in p.iter("s"):
+            if s.text and s.text.strip():
+                parts.append(s.text.strip())
+        txt = re.sub(r"\s+", " ", " ".join(parts).strip())
+        if txt:
+            entries.append({"text": txt, "start": start, "duration": duration})
+    return entries
+
+def parse_ttml_xml(text: str):
+    """Parsa TTML (Timed Text Markup Language) → entries."""
+    entries = []
+    root = ET.fromstring(text)
+    # spesso <p begin="00:00:01.000" end="00:00:02.000">text</p>
+    for p in root.iter():
+        if p.tag.endswith("}p") or p.tag == "p":
+            begin = p.attrib.get("begin")
+            end = p.attrib.get("end")
+            if not begin or not end:
+                continue
+            start = _parse_time_to_seconds(begin)
+            end_s = _parse_time_to_seconds(end)
+            duration = max(0.0, end_s - start)
+            txt = "".join(p.itertext()).strip()
+            txt = re.sub(r"\s+", " ", txt)
+            if txt:
+                entries.append({"text": txt, "start": start, "duration": duration})
+    return entries
+
+# ============================
+# Fallback via yt_dlp (esteso e robusto)
+# ============================
+def fetch_transcript_via_ytdlp(video_id: str, language_code: str, allow_fallback: bool, save_raw_debug: bool = False):
     """
     Ottiene sottotitoli con yt_dlp senza scaricare il video.
-    Ritorna lista di dict [{'text': '...', 'start': float, 'duration': float}].
+    Prova tutte le tracce disponibili (manuali e automatiche) e formati diversi:
+    json3, srv3/xml, ttml/xml, vtt.
     """
     try:
         import yt_dlp
@@ -104,77 +228,90 @@ def fetch_transcript_via_ytdlp(video_id: str, language_code: str, allow_fallback
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
+        # ordina le lingue candidate (esatta, base, poi tutte le altre se fallback)
+        def ordered_langs(subs_dict):
+            langs = []
+            if not subs_dict:
+                return langs
+            exact = []
+            base = []
+            others = []
+            base_code = language_code.split("-")[0].lower()
+            for lang in subs_dict.keys():
+                if lang == language_code:
+                    exact.append(lang)
+                elif lang == base_code:
+                    base.append(lang)
+                else:
+                    others.append(lang)
+            ordered = exact + base + (others if allow_fallback else [])
+            return ordered
+
         candidates = []
 
-        def collect(subs_dict, label):
-            if not subs_dict:
-                return
-            # lingua esatta
-            if language_code in subs_dict:
-                candidates.append((subs_dict[language_code], f"{label}:{language_code}"))
-            # base es. en-US -> en
-            base = language_code.split("-")[0].lower()
-            if base in subs_dict:
-                candidates.append((subs_dict[base], f"{label}:{base}"))
-            # qualsiasi se fallback
-            if allow_fallback:
-                for lang, entries in subs_dict.items():
-                    candidates.append((entries, f"{label}:{lang}"))
+        # manual subtitles
+        subs = info.get("subtitles") or {}
+        for lang in ordered_langs(subs):
+            for track in subs.get(lang, []):
+                candidates.append(("subs", lang, track))
 
-        collect(info.get("subtitles"), "subs")
-        collect(info.get("automatic_captions"), "auto")
+        # automatic captions
+        auto = info.get("automatic_captions") or {}
+        for lang in ordered_langs(auto):
+            for track in auto.get(lang, []):
+                candidates.append(("auto", lang, track))
 
         if not candidates:
             raise NoTranscriptAvailable("Nessun sottotitolo disponibile via yt_dlp.")
 
-        tracks, _desc = candidates[0]
-        track = tracks[0]  # tipicamente .vtt
-        srt_url = track.get("url")
-        if not srt_url:
-            raise NoTranscriptAvailable("URL sottotitoli non disponibile.")
-
-        r = _with_retry(lambda: requests.get(srt_url, timeout=20))
-        vtt = r.text
-
-        # parsing VTT minimale
-        entries = []
-        for block in re.split(r"\n\s*\n", vtt.strip()):
-            lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
-            if len(lines) < 2:
-                continue
-            time_line = next((ln for ln in lines if "-->" in ln), None)
-            if not time_line:
-                continue
-            tm = re.match(r"(?P<start>[\d:.]+)\s*-->\s*(?P<end>[\d:.]+)", time_line)
-            if not tm:
-                continue
-
-            def to_seconds(s):
-                parts = s.split(":")
-                parts = [float(p.replace(",", ".")) for p in parts]
-                while len(parts) < 3:
-                    parts = [0.0] + parts
-                h, m, sec = parts[-3], parts[-2], parts[-1]
-                return h*3600 + m*60 + sec
-
-            start = to_seconds(tm.group("start"))
-            end = to_seconds(tm.group("end"))
-            duration = max(0.0, end - start)
-
-            text_lines = []
-            for ln in lines:
-                if ln == time_line:
+        last_error = None
+        for label, lang, track in candidates:
+            try:
+                ext = (track.get("ext") or "").lower()
+                track_url = track.get("url")
+                if not track_url:
                     continue
-                if re.fullmatch(r"\d+", ln):
-                    continue
-                text_lines.append(ln)
-            text = " ".join(text_lines).strip()
-            if text:
-                entries.append({"text": text, "start": start, "duration": duration})
 
-        if not entries:
-            raise NoTranscriptAvailable("Impossibile parsare i sottotitoli VTT via yt_dlp.")
-        return entries
+                import requests
+                r = _with_retry(lambda: requests.get(track_url, timeout=20))
+                raw = r.text
+
+                # Salva raw se richiesto (debug)
+                if save_raw_debug:
+                    st.download_button(
+                        f"⬇️ Scarica sottotitoli RAW ({label}:{lang}.{ext or 'txt'})",
+                        data=raw.encode("utf-8", errors="ignore"),
+                        file_name=f"{video_id}_{label}_{lang}.{ext or 'txt'}",
+                        mime="text/plain"
+                    )
+
+                entries = []
+                if ext == "json3":
+                    entries = parse_json3(raw)
+                elif ext in ("srv3", "xml"):
+                    # prova SRV3, se fallisce prova TTML
+                    try:
+                        entries = parse_srv3_xml(raw)
+                        if not entries:
+                            entries = parse_ttml_xml(raw)
+                    except Exception:
+                        entries = parse_ttml_xml(raw)
+                elif ext in ("ttml",):
+                    entries = parse_ttml_xml(raw)
+                else:
+                    # Assume VTT di default (vtt, webvtt, ecc.)
+                    entries = parse_vtt(raw)
+
+                if entries:
+                    return entries  # success
+                else:
+                    last_error = f"Traccia {label}:{lang} ({ext}) non parsabile"
+            except Exception as e:
+                last_error = f"{label}:{lang} parsing error ({type(e).__name__}: {e})"
+                continue
+
+        # se nessuna traccia è parsabile
+        raise NoTranscriptAvailable(last_error or "Impossibile parsare qualsiasi traccia sottotitoli via yt_dlp.")
 
 # ============================
 # Fetch transcript – percorsi modern/compat + orchestratore
@@ -207,7 +344,6 @@ def fetch_transcript_modern(video_id: str, language_code: str, allow_fallback: b
         return transcripts.find_transcript(prefer_list).fetch()
     except NoTranscriptFound:
         if not allow_fallback:
-            # non creiamo NoTranscriptFound: usiamo la nostra eccezione
             raise NoTranscriptAvailable("Transcript non disponibile nella lingua richiesta.")
 
     # 2b) traduzione
@@ -232,12 +368,12 @@ def fetch_transcript_modern(video_id: str, language_code: str, allow_fallback: b
 
     raise NoTranscriptAvailable("Nessuna trascrizione recuperabile (modern).")
 
-def fetch_transcript_any(video_id: str, language_code: str, allow_fallback: bool = True):
+def fetch_transcript_any(video_id: str, language_code: str, allow_fallback: bool = True, save_raw_debug: bool = False):
     """
     Ordine tentativi:
     1) list_transcripts (se disponibile)
     2) get_transcript (se disponibile)
-    3) yt_dlp fallback
+    3) yt_dlp fallback (provando tutti i formati)
     Ritorna: (entries, used_path)
     """
     base_lang = language_code.split("-")[0].lower() if language_code else "en"
@@ -263,19 +399,13 @@ def fetch_transcript_any(video_id: str, language_code: str, allow_fallback: bool
                 entries = _with_retry(getattr(YTA, "get_transcript"), video_id, languages=[lc])
                 return entries, f"get_transcript({lc})"
             except (TranscriptsDisabled, NoTranscriptFound):
-                # problemi strutturali → prova lingua successiva
                 continue
             except Exception:
-                # temporaneo → prova lingua successiva comunque
                 continue
 
-    # 3) Fallback yt_dlp
-    try:
-        entries = fetch_transcript_via_ytdlp(video_id, language_code, allow_fallback)
-        return entries, "yt_dlp"
-    except Exception as e:
-        # ultima spiaggia: nessun metodo ha funzionato
-        raise NoTranscriptAvailable(f"Nessun metodo ha restituito una trascrizione: {type(e).__name__}: {e}")
+    # 3) Fallback yt_dlp (robusto)
+    entries = fetch_transcript_via_ytdlp(video_id, language_code, allow_fallback, save_raw_debug=save_raw_debug)
+    return entries, "yt_dlp"
 
 # ============================
 # Helpers: pulizia testo e sommario
@@ -297,7 +427,7 @@ def summarize_text(client: OpenAI, text: str, model: str, temperature: float, mi
             "Rules:\n- Keep it clear and structured (use short paragraphs or bullet points if helpful).\n"
             "- Avoid redundancy and trivial details.\n- Preserve all critical explanations, definitions, and conclusions."
         )
-        resp = OpenAI(api_key=client.api_key).chat.completions.create(
+        resp = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": "You are an expert at synthesizing video transcripts into accurate, readable long summaries."},
@@ -314,7 +444,7 @@ def summarize_text(client: OpenAI, text: str, model: str, temperature: float, mi
             f"Summarize part {idx} of a longer transcript. Focus on key points, arguments, data, and conclusions. "
             f"Length: ~250-350 words.\n\nPart {idx}:\n{ch}"
         )
-        resp = OpenAI(api_key=client.api_key).chat.completions.create(
+        resp = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": "You are an expert note-taker."},
@@ -331,7 +461,7 @@ def summarize_text(client: OpenAI, text: str, model: str, temperature: float, mi
         "Avoid duplication, keep a logical flow, and highlight the most critical insights."
         "\n\nPartial summaries:\n" + "\n".join(f"Part {i+1}:\n{ps}" for i, ps in enumerate(partial_summaries))
     )
-    final_resp = OpenAI(api_key=client.api_key).chat.completions.create(
+    final_resp = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": "You are an expert editor."},
@@ -381,6 +511,8 @@ st.caption(f"🔍 capabilities → list_transcripts: {hasattr(YTA, 'list_transcr
 youtube_url = st.text_input("📺 Enter YouTube video URL")
 language_code = st.text_input("🌍 Enter language code (default 'en')", value="en")
 allow_fallback = st.checkbox("If not found, try other available languages", value=True)
+save_raw_debug = st.checkbox("🐞 Debug: salva sottotitoli raw non parsati", value=False,
+                             help="Mostra un pulsante per scaricare il file grezzo della traccia quando il parser fallisce.")
 
 if not oai_key:
     st.warning("⚠️ Insert your API KEY in the sidebar to continue.")
@@ -401,8 +533,8 @@ if st.button("📄 Generate Transcript and Summary", use_container_width=True):
     st.caption(f"🎯 Detected Video ID: `{video_id}`")
 
     try:
-        # orchestration: modern -> compat -> yt_dlp
-        entries, used_path = fetch_transcript_any(video_id, language_code, allow_fallback=allow_fallback)
+        # orchestration: modern -> compat -> yt_dlp esteso
+        entries, used_path = fetch_transcript_any(video_id, language_code, allow_fallback=allow_fallback, save_raw_debug=save_raw_debug)
         st.info(f"✅ Transcript fetched via: **{used_path}**")
 
         full_text = " ".join([e.get("text", "") for e in entries])

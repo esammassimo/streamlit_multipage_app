@@ -4,6 +4,7 @@ requests
 openai
 youtube-transcript-api
 yt-dlp
+webvtt-py
 python-docx
 openpyxl
 chardet
