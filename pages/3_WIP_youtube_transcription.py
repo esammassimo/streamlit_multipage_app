@@ -2,58 +2,37 @@ import streamlit as st
 from openai import OpenAI
 from youtube_transcript_api import YouTubeTranscriptApi as YTA, TranscriptsDisabled, NoTranscriptFound
 import re
+from urllib.parse import urlparse, parse_qs
 from docx import Document
 import io
 import zipfile
 from datetime import datetime
 
 # ============================
-# Helpers
-# ============================
-
-def fetch_transcript(video_id: str, language_code: str, allow_fallback: bool = True):
-    """Robust transcript fetcher that works with youtube-transcript-api list_transcripts API.
-    - Tries preferred language
-    - If allowed, tries to translate available transcripts to the requested language
-    - Finally, falls back to the first available transcript
-    """
-    transcripts = YTA.list_transcripts(video_id)
-
-    # 1) Try exact language match
-    try:
-        return transcripts.find_transcript([language_code]).fetch()
-    except NoTranscriptFound:
-        if not allow_fallback:
-            raise
-
-    # 2) Try translating any available transcript to the requested language
-    if allow_fallback:
-        for tr in transcripts:
-            if getattr(tr, "is_translatable", False):
-                try:
-                    return tr.translate(language_code).fetch()
-                except Exception:
-                    pass
-
-    # 3) Last resort: return the first available transcript as-is
-    for tr in transcripts:
-        try:
-            return tr.fetch()
-        except Exception:
-            pass
-
-    # If nothing worked
-    raise NoTranscriptFound(f"No transcript could be retrieved for video {video_id}.")
-
-# ============================
-# Helpers
+# Helpers: ID & transcript
 # ============================
 
 def extract_video_id(url: str):
-    """Extract the 11-char YouTube video ID from many URL formats."""
+    """Estrae l'ID (11 char) da tutte le varianti comuni di URL YouTube."""
     if not url:
         return None
-    # Common patterns: v=, youtu.be/, /embed/, /shorts/
+    try:
+        p = urlparse(url)
+        if p.netloc:
+            qs = parse_qs(p.query)
+            if 'v' in qs and len(qs['v'][0]) == 11:
+                return qs['v'][0]
+            m_shorts = re.search(r"/shorts/([a-zA-Z0-9_-]{11})", p.path)
+            if m_shorts:
+                return m_shorts.group(1)
+            m_embed = re.search(r"/embed/([a-zA-Z0-9_-]{11})", p.path)
+            if m_embed:
+                return m_embed.group(1)
+            m_be = re.search(r"youtu\.be/([a-zA-Z0-9_-]{11})", p.netloc + p.path)
+            if m_be:
+                return m_be.group(1)
+    except Exception:
+        pass
     patterns = [
         r"(?:v=|/v/|&v=|watch\?v=)([a-zA-Z0-9_-]{11})",
         r"youtu\.be/([a-zA-Z0-9_-]{11})",
@@ -67,17 +46,68 @@ def extract_video_id(url: str):
     return None
 
 
+def fetch_transcript(video_id: str, language_code: str, allow_fallback: bool = True):
+    """
+    Strategia robusta:
+    1) get_transcript con lingua richiesta e base (es. en-US -> en)
+    2) list_transcripts:
+       - match lingua
+       - se consentito, translate verso la lingua richiesta/base
+       - altrimenti prima disponibile
+    """
+    base_lang = language_code.split("-")[0].lower() if language_code else "en"
+    prefer_list = []
+    if language_code:
+        prefer_list.append(language_code)
+    if base_lang and base_lang not in prefer_list:
+        prefer_list.append(base_lang)
+
+    try:
+        return YTA.get_transcript(video_id, languages=prefer_list)
+    except TranscriptsDisabled:
+        raise
+    except NoTranscriptFound:
+        pass
+    except Exception:
+        pass
+
+    transcripts = YTA.list_transcripts(video_id)
+
+    try:
+        return transcripts.find_transcript(prefer_list).fetch()
+    except NoTranscriptFound:
+        if not allow_fallback:
+            raise
+
+    if allow_fallback:
+        for tr in transcripts:
+            if getattr(tr, "is_translatable", False):
+                for tgt in prefer_list:
+                    try:
+                        return tr.translate(tgt).fetch()
+                    except Exception:
+                        continue
+
+    for tr in transcripts:
+        try:
+            return tr.fetch()
+        except Exception:
+            continue
+
+    raise NoTranscriptFound(f"Nessuna trascrizione recuperabile per video {video_id}.")
+
+
+# ============================
+# Helpers: text & summary
+# ============================
+
 def clean_transcript_text(text: str) -> str:
-    """Basic cleanup for transcript artifacts."""
     text = re.sub(r"\[(?:Music|Applause|Laughter)\]", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
 def summarize_text(client: OpenAI, text: str, model: str, temperature: float, min_words: int = 400) -> str:
-    """Summarize arbitrarily long text by chunking if needed."""
-    # Rough chunking by characters to avoid context limits
-    # Target ~12k chars per chunk; adjust if needed per model
     MAX_CHARS = 12000
     chunks = [text[i:i + MAX_CHARS] for i in range(0, len(text), MAX_CHARS)]
 
@@ -100,7 +130,6 @@ def summarize_text(client: OpenAI, text: str, model: str, temperature: float, mi
         )
         return resp.choices[0].message.content
 
-    # Multi-step: summarize chunks then synthesize
     partial_summaries = []
     for idx, ch in enumerate(chunks, 1):
         prompt = (
@@ -122,7 +151,7 @@ def summarize_text(client: OpenAI, text: str, model: str, temperature: float, mi
         f"You are given {len(partial_summaries)} partial summaries from a video transcript. "
         f"Merge them into a single cohesive summary of at least {min_words} words. "
         "Avoid duplication, keep a logical flow, and highlight the most critical insights."
-        "\n\nPartial summaries:\n" + "\n\n".join(f"Part {i+1}:\n{ps}" for i, ps in enumerate(partial_summaries))
+        "\n\nPartial summaries:\n" + "\n".join(f"Part {i+1}:\n{ps}" for i, ps in enumerate(partial_summaries))
     )
     final_resp = client.chat.completions.create(
         model=model,
@@ -152,18 +181,21 @@ with st.sidebar:
     oai_key = st.text_input("Insert your OpenAI API KEY", type="password", value=st.session_state['oai_api_key'])
     st.session_state['oai_api_key'] = oai_key
 
+    # >>> MODELLI AGGIORNATI (incluso GPT-5) <<<
     model = st.selectbox(
         "Model",
-        # Keep v1-compatible names; user can switch if needed
         options=[
-            "gpt-4o-mini",
+            "gpt-5",            # flagship
+            "gpt-5-chat-latest",
+            "gpt-5-mini",
             "gpt-4o",
-            "gpt-4.1-mini",
+            "gpt-4o-mini",
             "gpt-4.1",
+            "gpt-4.1-mini",
             "gpt-4",
         ],
         index=0,
-        help="Choose an OpenAI model. All listed are compatible with the v1 Python SDK's chat.completions API."
+        help="Scegli un modello compatibile con l'API chat.completions. Per risultati migliori, prova 'gpt-5' o 'gpt-4o'."
     )
     temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.7, 0.1)
     min_words = st.number_input("Minimum summary length (words)", min_value=150, max_value=2000, value=400, step=50)
@@ -173,25 +205,18 @@ youtube_url = st.text_input("📺 Enter YouTube video URL")
 language_code = st.text_input("🌍 Enter language code (default 'en')", value="en")
 allow_fallback = st.checkbox("If not found, try other available languages", value=True)
 
-# --- How to use (English guide) ---
-with st.expander("🧭 How to use (English)"):
+with st.expander("🧭 How to use"):
     st.markdown(
         """
-        1. **Enter your OpenAI API key** in the sidebar (required). You can create one in your OpenAI dashboard.
-        2. **Paste a YouTube video URL** into the input field above.
-        3. Optionally **set the transcript language code** (e.g., `en`, `it`, `es`).
-        4. Adjust **model**, **creativity**, and **minimum summary length** in the sidebar if needed.
-        5. Click **"Generate Transcript and Summary"**.
-        6. When finished, **download the ZIP** containing a `.txt` transcript and a `.docx` summary.
-        
-        **Notes**
-        - If the video has **no transcript** or **transcripts are disabled**, you'll see a clear error.
-        - If the requested language isn't available and fallback is enabled, the app tries other languages.
-        - Very long videos are handled by **chunked summarization** to keep results stable.
+        1. Enter your OpenAI API key in the sidebar.
+        2. Paste a YouTube video URL.
+        3. Optionally set the transcript language code (e.g., `en`, `it`, `es`).
+        4. Adjust model, creativity, and minimum summary length.
+        5. Click **Generate Transcript and Summary**.
+        6. Download the ZIP with `.txt` transcript and `.docx` summary.
         """
     )
 
-# Guard clause for API key
 if not oai_key:
     st.warning("⚠️ Insert your API KEY in the sidebar to continue.")
     st.stop()
@@ -206,11 +231,13 @@ if st.button("📄 Generate Transcript and Summary", use_container_width=True):
 
     video_id = extract_video_id(youtube_url)
     if not video_id:
-        st.error("❌ Invalid YouTube URL. Please try again.")
+        st.error("❌ Invalid YouTube URL: unable to extract a valid video ID.")
         st.stop()
 
+    st.caption(f"🎯 Detected Video ID: `{video_id}`")
+
     try:
-        # 1) Fetch transcript
+        # 1) Transcript
         try:
             transcript = fetch_transcript(video_id, language_code, allow_fallback=allow_fallback)
         except NoTranscriptFound:
@@ -230,16 +257,18 @@ if st.button("📄 Generate Transcript and Summary", use_container_width=True):
         full_text = " ".join([entry.get('text', '') for entry in transcript])
         full_text = clean_transcript_text(full_text)
 
-        # 2) Summarize with OpenAI
-        with st.spinner("Generating summary with OpenAI..."):
+        if not full_text.strip():
+            st.error("❌ Transcript retrieved but empty. The video may not contain usable captions.")
+            st.stop()
+
+        # 2) Summary
+        with st.spinner("🧠 Generating summary with OpenAI..."):
             summary = summarize_text(client, full_text, model=model, temperature=temperature, min_words=int(min_words))
 
-        # 3) Build in-memory files
-        # 3a) Transcript .txt
+        # 3) Files (TXT + DOCX in ZIP)
         transcript_bytes = full_text.encode('utf-8')
         transcript_filename = f"transcript_{video_id}.txt"
 
-        # 3b) Summary .docx (in-memory)
         doc = Document()
         doc.add_heading("Riassunto del Video", level=1)
         doc.add_paragraph(summary)
@@ -248,7 +277,6 @@ if st.button("📄 Generate Transcript and Summary", use_container_width=True):
         docx_buffer.seek(0)
         summary_filename = f"summary_{video_id}.docx"
 
-        # 3c) ZIP both
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr(transcript_filename, transcript_bytes)
@@ -265,11 +293,10 @@ if st.button("📄 Generate Transcript and Summary", use_container_width=True):
             use_container_width=True,
         )
 
-        # Also show a preview
         with st.expander("👀 Preview summary"):
             st.write(summary)
 
     except NoTranscriptFound:
-        st.error(f"❌ No transcript found for this video (language: '{language_code}'). Try enabling fallback or choosing a different language.")
+        st.error(f"❌ No transcript found for this video (requested language: '{language_code}'). Try enabling fallback or choosing a different language.")
     except Exception as e:
-        st.error(f"❌ Error during extraction: {str(e)}")
+        st.error(f"❌ Error during extraction: {type(e).__name__}: {str(e)}")
