@@ -4,114 +4,121 @@ from openai import OpenAI
 from io import BytesIO
 import xlsxwriter
 import time
-from urllib.parse import urlparse
 import re
-
-st.set_page_config(page_title="Domain Clustering", layout="centered")
-st.title("🌐 Domain Clustering con OpenAI")
 
 # ===================== COSTANTI =====================
 MAX_ROWS = 2000  # limite righe analizzabili per volta
 
+# ===================== APP =====================
+st.set_page_config(page_title="Keyword Clustering", layout="centered")
+st.title("🔎 Keyword Clustering con OpenAI")
+
 # ===================== UTILITIES =====================
-def normalize_domain(raw: str) -> str:
+def normalize_keyword(s: str, to_lower: bool = True) -> str:
     """
-    Normalizza una stringa (URL o dominio) al dominio registrabile:
-      - rimuove schema, path, porta
-      - rimuove 'www.'
-      - fallback agli ultimi 2 label (example.co.uk -> example.co.uk)
+    Normalizza una keyword:
+      - rimuove spazi iniziali/finali
+      - comprime spazi multipli interni
+      - opzionale: lowercase
     """
-    if not isinstance(raw, str) or raw.strip() == "":
+    if not isinstance(s, str):
         return ""
-    s = raw.strip()
-    if re.match(r"^[a-zA-Z]+://", s):
-        netloc = urlparse(s).netloc
-    else:
-        netloc = s.split("/")[0]
-    netloc = netloc.split(":")[0]
-    netloc = netloc.lower().strip(".")
-    netloc = re.sub(r"^www\.", "", netloc)
-    parts = [p for p in netloc.split(".") if p]
-    if len(parts) >= 2:
-        return ".".join(parts[-2:])
-    return netloc
+    s = s.strip()
+    s = re.sub(r"\s+", " ", s)
+    if to_lower:
+        s = s.lower()
+    return s
 
 def batch(iterable, size):
     for i in range(0, len(iterable), size):
         yield iterable[i:i+size]
 
 def backoff_sleep(attempt):
+    # esponenziale: 0.5, 1, 2, 4 (cap a 4s)
     time.sleep(min(4, 0.5 * (2 ** attempt)))
 
-# ===================== INPUTS =====================
+# ===================== INPUT =====================
 api_key = st.text_input("🔐 Inserisci la tua OpenAI API Key", type="password")
 st.caption(f"ℹ️ Limite massimo righe analizzabili per esecuzione: {MAX_ROWS:,}")
 
-input_method = st.radio("📥 Scegli il metodo di inserimento dei domini:", ["Carica file Excel", "Incolla testo manualmente"])
+input_method = st.radio("📥 Metodo di inserimento:", ["Carica file Excel", "Incolla testo manualmente"])
 
-domains_raw = []
+raw_keywords = []
 if input_method == "Carica file Excel":
-    uploaded_file = st.file_uploader("📄 Carica un file Excel con i domini (colonna A)", type=["xlsx"])
-    if uploaded_file:
-        df = pd.read_excel(uploaded_file)
+    uploaded = st.file_uploader("📄 Carica un file Excel con le keyword (colonna A)", type=["xlsx"])
+    if uploaded:
+        df = pd.read_excel(uploaded)
         if df.empty or df.shape[1] < 1:
-            st.error("Il file deve contenere almeno una colonna con i domini.")
+            st.error("Il file deve contenere almeno una colonna con le keyword.")
         else:
             col = df.iloc[:, 0].dropna().astype(str).tolist()
-            total_rows = len(col)
-            if total_rows > MAX_ROWS:
-                st.warning(f"⚠️ Hai caricato {total_rows:,} righe. Verranno analizzate solo le prime {MAX_ROWS:,}.")
+            total = len(col)
+            if total > MAX_ROWS:
+                st.warning(f"⚠️ Hai caricato {total:,} righe. Verranno analizzate solo le prime {MAX_ROWS:,}.")
                 col = col[:MAX_ROWS]
-            domains_raw = col
-
+            raw_keywords = col
 else:
-    manual_input = st.text_area("✍️ Incolla i domini o URL, uno per riga")
-    if manual_input:
-        lines = [line.strip() for line in manual_input.splitlines() if line.strip()]
-        total_rows = len(lines)
-        if total_rows > MAX_ROWS:
-            st.warning(f"⚠️ Hai inserito {total_rows:,} righe. Verranno analizzate solo le prime {MAX_ROWS:,}.")
+    manual = st.text_area("✍️ Incolla le keyword, una per riga")
+    if manual:
+        lines = [ln.strip() for ln in manual.splitlines() if ln.strip()]
+        total = len(lines)
+        if total > MAX_ROWS:
+            st.warning(f"⚠️ Hai inserito {total:,} righe. Verranno analizzate solo le prime {MAX_ROWS:,}.")
             lines = lines[:MAX_ROWS]
-        domains_raw = lines
+        raw_keywords = lines
 
-# Normalizzazione + dedup
-domains = [normalize_domain(d) for d in domains_raw]
-domains = [d for d in domains if d]
-domains = sorted(set(domains))
+to_lower = st.checkbox("🔤 Converti a minuscolo (consigliato)", value=True)
 
-# Etichette
-label_mode = st.radio("🏷️ Come vuoi fornire le etichette?", ["Inserimento manuale", "Usa file predefinito category_domain.txt"])
+# Normalizzazione + dedup (manteniamo una mappa per riportare l'originale se serve)
+norm_keywords = [normalize_keyword(k, to_lower=to_lower) for k in raw_keywords]
+norm_keywords = [k for k in norm_keywords if k]  # rimuovi vuoti
+# dedup preservando l'ordine
+seen = set()
+keywords = []
+for k in norm_keywords:
+    if k not in seen:
+        seen.add(k)
+        keywords.append(k)
+
+st.write(f"**Keyword uniche da processare:** {len(keywords)}")
+
+# Etichette (cluster)
+label_mode = st.radio("🏷️ Come vuoi fornire le etichette di cluster?", ["Inserimento manuale", "Usa file predefinito category_keyword.txt"])
 labels = []
 if label_mode == "Inserimento manuale":
     labels_input = st.text_input(
-        "✏️ Inserisci le etichette di clustering separate da virgola",
-        placeholder="es. blog, ecommerce, istituzionale, news"
+        "✏️ Etichette separate da virgola",
+        placeholder="es. informazionale, transazionale, navigazionale, brand, prodotto"
     )
     if labels_input:
-        labels = [label.strip() for label in labels_input.split(",") if label.strip()]
+        labels = [lbl.strip() for lbl in labels_input.split(",") if lbl.strip()]
 else:
     try:
-        with open("category_domain.txt", "r", encoding="utf-8") as f:
-            labels = [line.strip() for line in f.readlines() if line.strip()]
-        st.markdown("### 📂 Etichette caricate da category_domain.txt:")
+        with open("category_keyword.txt", "r", encoding="utf-8") as f:
+            labels = [ln.strip() for ln in f.readlines() if ln.strip()]
+        st.markdown("### 📂 Etichette da category_keyword.txt:")
         st.text("\n".join(labels[:30]))
         if len(labels) > 30:
-            st.text(f"...e altre {len(labels) - 30} categorie")
+            st.text(f"...e altre {len(labels) - 30} etichette")
     except FileNotFoundError:
-        st.error("❌ Il file 'category_domain.txt' non è stato trovato nella directory dello script.")
+        st.error("❌ Il file 'category_keyword.txt' non è stato trovato nella directory dello script.")
 
 # Modello e batch size
-model_choice = st.selectbox("🤖 Seleziona il modello OpenAI da utilizzare", ["gpt-4o", "gpt-3.5-turbo"])
-batch_size = st.slider("📦 Dimensione batch (domini per richiesta)", min_value=5, max_value=200, value=50, step=5)
+model_choice = st.selectbox("🤖 Modello OpenAI", ["gpt-4o", "gpt-3.5-turbo"])
+batch_size = st.slider("📦 Dimensione batch (keyword per richiesta)", min_value=10, max_value=200, value=100, step=10)
 
-# ===================== STIMA TOKEN =====================
-if domains and labels:
+# Campo opzionale per lingua/mercato
+locale_hint = st.text_input("🌍 Contesto lingua/mercato (opzionale)", placeholder="es. it-IT (Italia)")
+
+# ===================== STIMA TOKEN (indicativa) =====================
+if keywords and labels:
     st.markdown("---")
     st.subheader("📈 Stima preliminare dei token (indicativa)")
-    avg_prompt_tokens_per_domain = 10
+    avg_prompt_tokens_per_kw = 10
     labels_tokens = len(" ".join(labels).split()) + 5
-    estimated_prompt = (labels_tokens + avg_prompt_tokens_per_domain) * len(domains)
-    estimated_completion = 4 * len(domains)
+    locale_tokens = len(locale_hint.split()) if locale_hint else 0
+    estimated_prompt = (labels_tokens + locale_tokens + avg_prompt_tokens_per_kw) * len(keywords)
+    estimated_completion = 4 * len(keywords)  # risposta breve (solo etichetta)
     estimated_total = estimated_prompt + estimated_completion
     st.markdown(f"🔢 **Token stimati:** Prompt: `{estimated_prompt}`, Completion: `{estimated_completion}`, Totale: `{estimated_total}`")
     if model_choice == "gpt-4o":
@@ -127,29 +134,33 @@ if domains and labels:
 confirm_run = st.checkbox("✅ Conferma e avvia la classificazione")
 
 # ===================== RUN =====================
-if domains and labels and api_key and confirm_run:
+if keywords and labels and api_key and confirm_run:
     client = OpenAI(api_key=api_key)
     results = []
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
     sys_prompt = (
-        "Sei un assistente di classificazione. Ti verrà passato un elenco di domini "
-        "e una lista di categorie. Per ciascun dominio scegli esattamente UNA categoria "
-        "dall'elenco fornito. Rispondi SOLO con righe 'dominio, categoria' in CSV, nell'ordine dato."
+        "Sei un assistente di classificazione SEO. Riceverai una lista di keyword e una lista di cluster (etichette). "
+        "Per ciascuna keyword scegli esattamente UNA etichetta dall'elenco fornito, in base all'intento e al significato. "
+        "Rispondi SOLO con righe 'keyword, cluster' in CSV, nell'ordine dato. "
+        "Non aggiungere commenti, spiegazioni o righe vuote."
     )
 
-    with st.spinner("🔍 Sto classificando i domini..."):
+    if locale_hint:
+        sys_prompt += f" Considera il contesto linguistico/mercato: {locale_hint}."
+
+    with st.spinner("🔍 Sto classificando le keyword..."):
         st.markdown("---")
         st.markdown("### 🧭 Avanzamento della classificazione")
 
-        for idx, dom_batch in enumerate(batch(domains, batch_size), 1):
-            st.markdown(f"➡️ **Batch {idx}**: {len(dom_batch)} domini")
+        for idx, kw_batch in enumerate(batch(keywords, batch_size), 1):
+            st.markdown(f"➡️ **Batch {idx}**: {len(kw_batch)} keyword")
             user_prompt = (
-                f"Categorie disponibili: {', '.join(labels)}.\n"
-                "Domini da classificare (uno per riga):\n"
-                + "\n".join(dom_batch) +
-                "\n\nRispondi con una riga per dominio nel formato 'dominio, categoria'."
+                f"Etichette disponibili: {', '.join(labels)}.\n"
+                "Keyword da classificare (una per riga):\n"
+                + "\n".join(kw_batch) +
+                "\n\nRispondi con una riga per keyword nel formato 'keyword, cluster'."
             )
 
             max_attempts = 5
@@ -162,7 +173,7 @@ if domains and labels and api_key and confirm_run:
                             {"role": "user", "content": user_prompt},
                         ],
                         temperature=0,
-                        max_tokens=4 * len(dom_batch) + 50,
+                        max_tokens=6 * len(kw_batch) + 100,  # margine sufficiente
                     )
                     content = response.choices[0].message.content.strip()
                     usage = response.usage
@@ -170,37 +181,40 @@ if domains and labels and api_key and confirm_run:
                         total_prompt_tokens += getattr(usage, "prompt_tokens", 0)
                         total_completion_tokens += getattr(usage, "completion_tokens", 0)
 
+                    # parsing CSV "keyword, cluster"
                     lines = [l.strip() for l in content.splitlines() if l.strip()]
                     parsed = []
                     for line in lines:
                         line = line.replace(";", ",")
                         parts = [p.strip() for p in line.split(",")]
                         if len(parts) >= 2:
-                            d = normalize_domain(parts[0])
+                            k = normalize_keyword(parts[0], to_lower=to_lower)
                             c = parts[1]
-                            if d:
-                                parsed.append((d, c))
-                    mapped = {d: c for d, c in parsed}
-                    for d in dom_batch:
-                        results.append((d, mapped.get(d, "Uncategorized")))
+                            if k:
+                                parsed.append((k, c))
+                    mapped = {k: c for k, c in parsed}
+                    for k in kw_batch:
+                        results.append((k, mapped.get(k, "Uncategorized")))
                     break
                 except Exception as e:
                     if attempt < max_attempts - 1:
                         backoff_sleep(attempt)
                         continue
-                    for d in dom_batch:
-                        results.append((d, f"Errore: {e}"))
+                    for k in kw_batch:
+                        results.append((k, f"Errore: {e}"))
 
-    output_df = pd.DataFrame(results, columns=["Dominio", "Cluster"])
-    output_df = output_df.sort_values(["Cluster", "Dominio"]).reset_index(drop=True)
+    output_df = pd.DataFrame(results, columns=["Keyword", "Cluster"])
+    output_df = output_df.sort_values(["Cluster", "Keyword"]).reset_index(drop=True)
 
     st.success("✅ Classificazione completata!")
     st.dataframe(output_df.head(500))
 
     st.markdown(f"**📊 Token utilizzati:** Prompt: `{total_prompt_tokens}`, Completion: `{total_completion_tokens}`, Totale: `{total_prompt_tokens + total_completion_tokens}`")
 
+    # Summary per cluster
     summary_df = output_df.groupby("Cluster").size().reset_index(name="Conteggio").sort_values("Conteggio", ascending=False)
 
+    # Export Excel con due fogli
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
         output_df.to_excel(writer, index=False, sheet_name="Risultati")
@@ -208,6 +222,6 @@ if domains and labels and api_key and confirm_run:
     st.download_button(
         "⬇️ Scarica il file con i cluster",
         data=buffer.getvalue(),
-        file_name="domain_clustering.xlsx",
+        file_name="keyword_clustering.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
