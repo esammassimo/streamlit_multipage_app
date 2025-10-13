@@ -10,6 +10,8 @@ import time
 import importlib
 import json
 import xml.etree.ElementTree as ET
+import math
+import string
 
 # ============================
 # Eccezione interna cross-version
@@ -75,7 +77,6 @@ def _with_retry(fn, *args, max_attempts=4, **kwargs):
         try:
             return fn(*args, **kwargs)
         except (TranscriptsDisabled, NoTranscriptFound, NoTranscriptAvailable):
-            # errori "strutturali": non ritentare
             raise
         except Exception:
             if attempt == max_attempts - 1:
@@ -87,7 +88,6 @@ def _with_retry(fn, *args, max_attempts=4, **kwargs):
 # Parsers per sottotitoli in formati diversi
 # ============================
 def _parse_time_to_seconds(s: str) -> float:
-    # supporta "HH:MM:SS.mmm" e simili; per json3/srv3 useremo ms direttamente
     parts = s.split(":")
     parts = [p.replace(",", ".") for p in parts]
     while len(parts) < 3:
@@ -100,7 +100,6 @@ def parse_vtt(text: str):
     entries = []
     try:
         import webvtt  # webvtt-py
-        # webvtt accetta stringa via tempfile; usiamo BytesIO+from_string in versioni recenti
         v = webvtt.read_buffer(io.StringIO(text))
         for cue in v:
             start = _parse_time_to_seconds(cue.start)
@@ -113,8 +112,7 @@ def parse_vtt(text: str):
             return entries
     except Exception:
         pass
-
-    # fallback minimale: blocchi separati da righe vuote
+    # fallback minimale
     for block in re.split(r"\n\s*\n", text.strip()):
         lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
         if len(lines) < 2:
@@ -141,7 +139,6 @@ def parse_vtt(text: str):
     return entries
 
 def parse_json3(text: str):
-    """Parsa JSON3 (YouTube) in entries."""
     data = json.loads(text)
     events = data.get("events", [])
     entries = []
@@ -161,10 +158,8 @@ def parse_json3(text: str):
     return entries
 
 def parse_srv3_xml(text: str):
-    """Parsa formato SRV3 XML (automatic captions) → entries."""
     entries = []
     root = ET.fromstring(text)
-    # spesso <p t="12345" d="678"> ... <s>word</s> ... </p>
     for p in root.iter("p"):
         t = p.attrib.get("t")  # ms
         d = p.attrib.get("d", "0")
@@ -172,7 +167,6 @@ def parse_srv3_xml(text: str):
             continue
         start = float(t) / 1000.0
         duration = float(d) / 1000.0 if d else 0.0
-        # testo = concatenazione dei nodi <s> o testo diretto
         parts = []
         if p.text and p.text.strip():
             parts.append(p.text.strip())
@@ -185,10 +179,8 @@ def parse_srv3_xml(text: str):
     return entries
 
 def parse_ttml_xml(text: str):
-    """Parsa TTML (Timed Text Markup Language) → entries."""
     entries = []
     root = ET.fromstring(text)
-    # spesso <p begin="00:00:01.000" end="00:00:02.000">text</p>
     for p in root.iter():
         if p.tag.endswith("}p") or p.tag == "p":
             begin = p.attrib.get("begin")
@@ -208,11 +200,7 @@ def parse_ttml_xml(text: str):
 # Fallback via yt_dlp (esteso e robusto)
 # ============================
 def fetch_transcript_via_ytdlp(video_id: str, language_code: str, allow_fallback: bool, save_raw_debug: bool = False):
-    """
-    Ottiene sottotitoli con yt_dlp senza scaricare il video.
-    Prova tutte le tracce disponibili (manuali e automatiche) e formati diversi:
-    json3, srv3/xml, ttml/xml, vtt.
-    """
+    """Prova tutte le tracce (manuali/auto) e formati (json3/srv3/ttml/vtt)."""
     try:
         import yt_dlp
         import requests
@@ -220,22 +208,15 @@ def fetch_transcript_via_ytdlp(video_id: str, language_code: str, allow_fallback
         raise NoTranscriptAvailable("yt_dlp/requests non installati per il fallback.")
 
     url = f"https://www.youtube.com/watch?v={video_id}"
-    ydl_opts = {
-        "skip_download": True,
-        "quiet": True,
-        "no_warnings": True,
-    }
+    ydl_opts = {"skip_download": True, "quiet": True, "no_warnings": True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
-        # ordina le lingue candidate (esatta, base, poi tutte le altre se fallback)
         def ordered_langs(subs_dict):
             langs = []
             if not subs_dict:
                 return langs
-            exact = []
-            base = []
-            others = []
+            exact, base, others = [], [], []
             base_code = language_code.split("-")[0].lower()
             for lang in subs_dict.keys():
                 if lang == language_code:
@@ -244,18 +225,13 @@ def fetch_transcript_via_ytdlp(video_id: str, language_code: str, allow_fallback
                     base.append(lang)
                 else:
                     others.append(lang)
-            ordered = exact + base + (others if allow_fallback else [])
-            return ordered
+            return exact + base + (others if allow_fallback else [])
 
         candidates = []
-
-        # manual subtitles
         subs = info.get("subtitles") or {}
         for lang in ordered_langs(subs):
             for track in subs.get(lang, []):
                 candidates.append(("subs", lang, track))
-
-        # automatic captions
         auto = info.get("automatic_captions") or {}
         for lang in ordered_langs(auto):
             for track in auto.get(lang, []):
@@ -271,12 +247,10 @@ def fetch_transcript_via_ytdlp(video_id: str, language_code: str, allow_fallback
                 track_url = track.get("url")
                 if not track_url:
                     continue
-
                 import requests
                 r = _with_retry(lambda: requests.get(track_url, timeout=20))
                 raw = r.text
 
-                # Salva raw se richiesto (debug)
                 if save_raw_debug:
                     st.download_button(
                         f"⬇️ Scarica sottotitoli RAW ({label}:{lang}.{ext or 'txt'})",
@@ -285,11 +259,9 @@ def fetch_transcript_via_ytdlp(video_id: str, language_code: str, allow_fallback
                         mime="text/plain"
                     )
 
-                entries = []
                 if ext == "json3":
                     entries = parse_json3(raw)
                 elif ext in ("srv3", "xml"):
-                    # prova SRV3, se fallisce prova TTML
                     try:
                         entries = parse_srv3_xml(raw)
                         if not entries:
@@ -299,27 +271,23 @@ def fetch_transcript_via_ytdlp(video_id: str, language_code: str, allow_fallback
                 elif ext in ("ttml",):
                     entries = parse_ttml_xml(raw)
                 else:
-                    # Assume VTT di default (vtt, webvtt, ecc.)
                     entries = parse_vtt(raw)
 
                 if entries:
-                    return entries  # success
+                    return entries
                 else:
                     last_error = f"Traccia {label}:{lang} ({ext}) non parsabile"
             except Exception as e:
                 last_error = f"{label}:{lang} parsing error ({type(e).__name__}: {e})"
                 continue
 
-        # se nessuna traccia è parsabile
         raise NoTranscriptAvailable(last_error or "Impossibile parsare qualsiasi traccia sottotitoli via yt_dlp.")
 
 # ============================
 # Fetch transcript – percorsi modern/compat + orchestratore
 # ============================
 def fetch_transcript_modern(video_id: str, language_code: str, allow_fallback: bool = True):
-    """
-    Percorso moderno (quando esiste list_transcripts). NON istanzia NoTranscriptFound.
-    """
+    """Percorso moderno (quando esiste list_transcripts)."""
     base_lang = language_code.split("-")[0].lower() if language_code else "en"
     prefer_list = []
     if language_code:
@@ -327,7 +295,6 @@ def fetch_transcript_modern(video_id: str, language_code: str, allow_fallback: b
     if base_lang and base_lang not in prefer_list:
         prefer_list.append(base_lang)
 
-    # 1) get_transcript se esiste
     if YTA and hasattr(YTA, "get_transcript"):
         try:
             return _with_retry(getattr(YTA, "get_transcript"), video_id, languages=prefer_list)
@@ -336,17 +303,14 @@ def fetch_transcript_modern(video_id: str, language_code: str, allow_fallback: b
         except Exception:
             pass
 
-    # 2) list_transcripts
     transcripts = _with_retry(getattr(YTA, "list_transcripts"), video_id)
 
-    # 2a) match lingua
     try:
         return transcripts.find_transcript(prefer_list).fetch()
     except NoTranscriptFound:
         if not allow_fallback:
             raise NoTranscriptAvailable("Transcript non disponibile nella lingua richiesta.")
 
-    # 2b) traduzione
     if allow_fallback:
         for tr in transcripts:
             try:
@@ -359,7 +323,6 @@ def fetch_transcript_modern(video_id: str, language_code: str, allow_fallback: b
             except Exception:
                 continue
 
-    # 2c) prima disponibile
     for tr in transcripts:
         try:
             return tr.fetch()
@@ -369,25 +332,17 @@ def fetch_transcript_modern(video_id: str, language_code: str, allow_fallback: b
     raise NoTranscriptAvailable("Nessuna trascrizione recuperabile (modern).")
 
 def fetch_transcript_any(video_id: str, language_code: str, allow_fallback: bool = True, save_raw_debug: bool = False):
-    """
-    Ordine tentativi:
-    1) list_transcripts (se disponibile)
-    2) get_transcript (se disponibile)
-    3) yt_dlp fallback (provando tutti i formati)
-    Ritorna: (entries, used_path)
-    """
+    """1) list_transcripts → 2) get_transcript → 3) yt_dlp."""
     base_lang = language_code.split("-")[0].lower() if language_code else "en"
     prefer_list = [lc for lc in [language_code, base_lang] if lc]
 
-    # 1) list_transcripts path
     if YTA and hasattr(YTA, "list_transcripts"):
         try:
             entries = fetch_transcript_modern(video_id, language_code, allow_fallback)
             return entries, "list_transcripts"
         except (TranscriptsDisabled, NoTranscriptFound, NoTranscriptAvailable):
-            pass  # prova gli altri percorsi
+            pass
 
-    # 2) get_transcript path
     if YTA and hasattr(YTA, "get_transcript"):
         langs = prefer_list[:]
         if allow_fallback:
@@ -403,13 +358,26 @@ def fetch_transcript_any(video_id: str, language_code: str, allow_fallback: bool
             except Exception:
                 continue
 
-    # 3) Fallback yt_dlp (robusto)
     entries = fetch_transcript_via_ytdlp(video_id, language_code, allow_fallback, save_raw_debug=save_raw_debug)
     return entries, "yt_dlp"
 
 # ============================
-# Helpers: pulizia testo e sommario
+# Helpers: capitoli, pulizia, sintesi
 # ============================
+def get_chapters(video_id: str):
+    """Recupera i capitoli via yt_dlp se disponibili."""
+    try:
+        import yt_dlp
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        with yt_dlp.YoutubeDL({"skip_download": True, "quiet": True, "no_warnings": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info.get("chapters") or []   # [{'start_time':sec, 'end_time':sec, 'title':...}, ...]
+    except Exception:
+        return []
+
+def text_by_time_window(entries, start_s, end_s):
+    return " ".join(e["text"] for e in entries if start_s <= e.get("start", 0) < end_s).strip()
+
 def clean_transcript_text(text: str) -> str:
     text = re.sub(r"\[(?:Music|Applause|Laughter)\]", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip()
@@ -418,7 +386,6 @@ def clean_transcript_text(text: str) -> str:
 def summarize_text(client: OpenAI, text: str, model: str, temperature: float, min_words: int = 400) -> str:
     MAX_CHARS = 12000
     chunks = [text[i:i + MAX_CHARS] for i in range(0, len(text), MAX_CHARS)]
-
     if len(chunks) == 1:
         prompt = (
             f"Summarize the following transcript, keeping the key points and context. "
@@ -472,6 +439,68 @@ def summarize_text(client: OpenAI, text: str, model: str, temperature: float, mi
     )
     return final_resp.choices[0].message.content
 
+STOPWORDS = set("""
+a ad ai al allo aiu agli all agl alla alle con col coi da dal dallo dai dagli dalla dalle di del dello dei degli della delle
+in nel nello nei negli nella nelle su sul sullo sui sugli sulla sulle per tra fra il lo la i gli le un uno una
+che chi cui come dove quando perché perche quanto questa questo queste questi quell quello quella quegli quelle
+""".split())
+
+def extractive_summary(text: str, max_sentences: int = 20) -> str:
+    sentences = re.split(r'(?<=[\.\?\!])\s+', text)
+    if len(sentences) <= max_sentences:
+        return text
+    freq = {}
+    translator = str.maketrans("", "", string.punctuation + "“”‘’«»…")
+    for sent in sentences:
+        for w in sent.lower().translate(translator).split():
+            if w in STOPWORDS or len(w) <= 2:
+                continue
+            freq[w] = freq.get(w, 0) + 1
+    if not freq:
+        return " ".join(sentences[:max_sentences])
+    max_f = max(freq.values())
+    scores = []
+    for i, sent in enumerate(sentences):
+        score = 0.0
+        words = sent.lower().translate(translator).split()
+        for w in words:
+            if w in freq:
+                score += freq[w] / max_f
+        if words:
+            score /= math.log2(10 + len(words))
+        scores.append((score, i, sent))
+    top = sorted(scores, key=lambda x: x[0], reverse=True)[:max_sentences]
+    top_sorted = [s for _, _, s in sorted(top, key=lambda x: x[1])]
+    return " ".join(top_sorted)
+
+def summarize_text_safe_mapreduce(client: OpenAI, text: str, model: str, temperature: float, min_words: int) -> str:
+    """Map-Reduce con chunk più piccoli (token-safe)."""
+    MAX_CHARS = 6000
+    chunks = [text[i:i+MAX_CHARS] for i in range(0, len(text), MAX_CHARS)]
+    partials = []
+    for ch in chunks:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a concise note-taker."},
+                {"role": "user", "content": f"Summarize in ~120-160 words:\n\n{ch}"}
+            ],
+            temperature=temperature,
+            max_tokens=300,
+        )
+        partials.append(resp.choices[0].message.content)
+    final = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "You are an expert editor."},
+            {"role": "user", "content": "Merge these notes into a clear summary of at least "
+                                        f"{min_words} words:\n\n" + "\n\n".join(partials)}
+        ],
+        temperature=temperature,
+        max_tokens=1000,
+    )
+    return final.choices[0].message.content
+
 # ============================
 # UI
 # ============================
@@ -511,8 +540,19 @@ st.caption(f"🔍 capabilities → list_transcripts: {hasattr(YTA, 'list_transcr
 youtube_url = st.text_input("📺 Enter YouTube video URL")
 language_code = st.text_input("🌍 Enter language code (default 'en')", value="en")
 allow_fallback = st.checkbox("If not found, try other available languages", value=True)
-save_raw_debug = st.checkbox("🐞 Debug: salva sottotitoli raw non parsati", value=False,
-                             help="Mostra un pulsante per scaricare il file grezzo della traccia quando il parser fallisce.")
+save_raw_debug = st.checkbox("🐞 Debug: salva sottotitoli raw non parsati", value=False)
+
+# Modalità di sintesi
+summary_mode = st.selectbox(
+    "🧠 Summarization mode",
+    [
+        "Standard (auto-chunk)",
+        "Map-Reduce (token-safe)",
+        "Chapter-based Map-Reduce (if available)",
+        "Extractive (no OpenAI)"
+    ],
+    index=0
+)
 
 if not oai_key:
     st.warning("⚠️ Insert your API KEY in the sidebar to continue.")
@@ -533,7 +573,7 @@ if st.button("📄 Generate Transcript and Summary", use_container_width=True):
     st.caption(f"🎯 Detected Video ID: `{video_id}`")
 
     try:
-        # orchestration: modern -> compat -> yt_dlp esteso
+        # 1) Transcript (modern -> compat -> yt_dlp)
         entries, used_path = fetch_transcript_any(video_id, language_code, allow_fallback=allow_fallback, save_raw_debug=save_raw_debug)
         st.info(f"✅ Transcript fetched via: **{used_path}**")
 
@@ -544,13 +584,64 @@ if st.button("📄 Generate Transcript and Summary", use_container_width=True):
             st.error("❌ Transcript retrieved but empty.")
             st.stop()
 
-        with st.spinner("🧠 Generating summary with OpenAI..."):
-            summary = summarize_text(client, full_text, model=model, temperature=temperature, min_words=int(min_words))
+        # Stima token grezza (~4 char/token)
+        approx_tokens = max(1, len(full_text) // 4)
+        st.caption(f"≈ Estimated tokens transcript: ~{approx_tokens:,}")
 
-        # Costruisci ZIP (TXT transcript + DOCX summary)
+        # 2) Sintesi
+        chapters = []
+        with st.spinner("🧠 Generating summary..."):
+            if summary_mode == "Standard (auto-chunk)":
+                summary = summarize_text(client, full_text, model=model, temperature=temperature, min_words=int(min_words))
+
+            elif summary_mode == "Map-Reduce (token-safe)":
+                summary = summarize_text_safe_mapreduce(client, full_text, model, temperature, int(min_words))
+
+            elif summary_mode == "Chapter-based Map-Reduce (if available)":
+                chapters = get_chapters(video_id)
+                if not chapters:
+                    st.warning("Nessun capitolo rilevato. Uso Map-Reduce standard.")
+                    summary = summarize_text_safe_mapreduce(client, full_text, model, temperature, int(min_words))
+                else:
+                    partials = []
+                    for ch in chapters:
+                        ch_text = text_by_time_window(entries, ch["start_time"], ch["end_time"])
+                        if not ch_text.strip():
+                            continue
+                        part = summarize_text(client, ch_text, model=model, temperature=temperature, min_words=150)
+                        partials.append(f"### {ch['title']}\n{part}")
+                    final_prompt = (
+                        "Merge the chapter summaries into a single cohesive summary (400-600 words), "
+                        "keeping logical flow and the most critical insights.\n\n" + "\n\n".join(partials)
+                    )
+                    final_resp = client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": "You are a precise editor."},
+                            {"role": "user", "content": final_prompt},
+                        ],
+                        temperature=temperature,
+                        max_tokens=1200,
+                    )
+                    summary = final_resp.choices[0].message.content
+
+            elif summary_mode == "Extractive (no OpenAI)":
+                summary = extractive_summary(full_text, max_sentences=20)
+
+        # 3) Download: TXT + DOCX + ZIP
         transcript_bytes = full_text.encode('utf-8')
         transcript_filename = f"transcript_{video_id}.txt"
 
+        # Bottone transcript .txt standalone
+        st.download_button(
+            "📝 Download transcript (.txt)",
+            data=transcript_bytes,
+            file_name=transcript_filename,
+            mime="text/plain",
+            use_container_width=True,
+        )
+
+        # DOCX summary + ZIP
         doc = Document()
         doc.add_heading("Riassunto del Video", level=1)
         doc.add_paragraph(summary)
@@ -566,9 +657,8 @@ if st.button("📄 Generate Transcript and Summary", use_container_width=True):
         zip_buffer.seek(0)
         zip_filename = f"youtube_summary_{video_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
 
-        st.success("✅ Transcript and Summary successfully generated!")
         st.download_button(
-            "📥 Download ZIP with Transcript & Summary",
+            "📥 Download ZIP (transcript + summary.docx)",
             data=zip_buffer,
             file_name=zip_filename,
             mime="application/zip",
@@ -577,6 +667,11 @@ if st.button("📄 Generate Transcript and Summary", use_container_width=True):
 
         with st.expander("👀 Preview summary"):
             st.write(summary)
+
+        if chapters:
+            with st.expander("📑 Capitoli rilevati"):
+                for ch in chapters:
+                    st.write(f"- {ch['title']} ({ch['start_time']}s → {ch['end_time']}s)")
 
     except TranscriptsDisabled:
         st.error("❌ Transcripts are disabled for this video.")
