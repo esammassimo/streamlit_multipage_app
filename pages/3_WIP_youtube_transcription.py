@@ -1,12 +1,22 @@
 import streamlit as st
 from openai import OpenAI
-from youtube_transcript_api import YouTubeTranscriptApi as YTA, TranscriptsDisabled, NoTranscriptFound
 import re
 from urllib.parse import urlparse, parse_qs
 from docx import Document
 import io
 import zipfile
 from datetime import datetime
+
+# youtube-transcript-api (version info opzionale)
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi as YTA, TranscriptsDisabled, NoTranscriptFound  # type: ignore
+    try:
+        from youtube_transcript_api import __version__ as YTA_VERSION  # type: ignore
+    except Exception:
+        YTA_VERSION = "unknown"
+except Exception as e:
+    st.error(f"Impossibile importare youtube-transcript-api: {type(e).__name__}: {e}")
+    st.stop()
 
 # ============================
 # Helpers: ID & transcript
@@ -46,14 +56,10 @@ def extract_video_id(url: str):
     return None
 
 
-def fetch_transcript(video_id: str, language_code: str, allow_fallback: bool = True):
+def fetch_transcript_compat(video_id: str, language_code: str, allow_fallback: bool = True):
     """
-    Strategia robusta:
-    1) get_transcript con lingua richiesta e base (es. en-US -> en)
-    2) list_transcripts:
-       - match lingua
-       - se consentito, translate verso la lingua richiesta/base
-       - altrimenti prima disponibile
+    Compatibile con versioni vecchie della libreria che non hanno list_transcripts.
+    Prova get_transcript con una lista di lingue ragionevoli.
     """
     base_lang = language_code.split("-")[0].lower() if language_code else "en"
     prefer_list = []
@@ -62,6 +68,47 @@ def fetch_transcript(video_id: str, language_code: str, allow_fallback: bool = T
     if base_lang and base_lang not in prefer_list:
         prefer_list.append(base_lang)
 
+    # Aggiungi una shortlist comune per aumentare le chance in assenza di list_transcripts
+    common_langs = ["en", "en-US", "en-GB", "it", "es", "de", "fr", "pt", "pt-BR"]
+    for l in common_langs:
+        if l not in prefer_list:
+            prefer_list.append(l)
+
+    for lang in prefer_list:
+        try:
+            return YTA.get_transcript(video_id, languages=[lang])
+        except TranscriptsDisabled:
+            raise
+        except NoTranscriptFound:
+            continue
+        except Exception:
+            continue
+
+    raise NoTranscriptFound(f"Nessuna trascrizione recuperabile per video {video_id} (versione compat).")
+
+
+def fetch_transcript(video_id: str, language_code: str, allow_fallback: bool = True):
+    """
+    Strategia robusta quando 'list_transcripts' è disponibile:
+    1) get_transcript con lingua richiesta e base
+    2) list_transcripts:
+       - match lingua
+       - se consentito, translate verso la lingua richiesta/base
+       - altrimenti prima disponibile
+    Se 'list_transcripts' NON esiste, usa fetch_transcript_compat.
+    """
+    # Se la libreria non espone list_transcripts, usa la compat
+    if not hasattr(YTA, "list_transcripts"):
+        return fetch_transcript_compat(video_id, language_code, allow_fallback)
+
+    base_lang = language_code.split("-")[0].lower() if language_code else "en"
+    prefer_list = []
+    if language_code:
+        prefer_list.append(language_code)
+    if base_lang and base_lang not in prefer_list:
+        prefer_list.append(base_lang)
+
+    # 1) Tentativo diretto con get_transcript
     try:
         return YTA.get_transcript(video_id, languages=prefer_list)
     except TranscriptsDisabled:
@@ -71,14 +118,17 @@ def fetch_transcript(video_id: str, language_code: str, allow_fallback: bool = T
     except Exception:
         pass
 
+    # 2) Tentativo con list_transcripts (solo se disponibile)
     transcripts = YTA.list_transcripts(video_id)
 
+    # 2a) match lingua esatta/base
     try:
         return transcripts.find_transcript(prefer_list).fetch()
     except NoTranscriptFound:
         if not allow_fallback:
             raise
 
+    # 2b) traduzione verso lingua richiesta/base (se disponibile)
     if allow_fallback:
         for tr in transcripts:
             if getattr(tr, "is_translatable", False):
@@ -88,6 +138,7 @@ def fetch_transcript(video_id: str, language_code: str, allow_fallback: bool = T
                     except Exception:
                         continue
 
+    # 2c) prima disponibile
     for tr in transcripts:
         try:
             return tr.fetch()
@@ -172,7 +223,6 @@ def summarize_text(client: OpenAI, text: str, model: str, temperature: float, mi
 st.set_page_config(page_title="YouTube Transcript & Summary Generator", page_icon="🎥", layout="centered")
 st.title("🎥 YouTube Transcript & Summary Generator")
 
-# --- Sidebar: OpenAI settings ---
 with st.sidebar:
     st.subheader("🔐 OpenAI Settings")
     if 'oai_api_key' not in st.session_state:
@@ -181,11 +231,11 @@ with st.sidebar:
     oai_key = st.text_input("Insert your OpenAI API KEY", type="password", value=st.session_state['oai_api_key'])
     st.session_state['oai_api_key'] = oai_key
 
-    # >>> MODELLI AGGIORNATI (incluso GPT-5) <<<
+    # Modelli (incluso GPT-5)
     model = st.selectbox(
         "Model",
         options=[
-            "gpt-5",            # flagship
+            "gpt-5",
             "gpt-5-chat-latest",
             "gpt-5-mini",
             "gpt-4o",
@@ -195,12 +245,16 @@ with st.sidebar:
             "gpt-4",
         ],
         index=0,
-        help="Scegli un modello compatibile con l'API chat.completions. Per risultati migliori, prova 'gpt-5' o 'gpt-4o'."
+        help="Scegli un modello compatibile con l'API chat.completions."
     )
     temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.7, 0.1)
     min_words = st.number_input("Minimum summary length (words)", min_value=150, max_value=2000, value=400, step=50)
 
-# --- Main inputs ---
+# Info versione libreria + capability
+st.caption(f"📦 youtube-transcript-api version: {YTA_VERSION}")
+if not hasattr(YTA, "list_transcripts"):
+    st.warning("ℹ️ La tua versione non supporta `list_transcripts`. Per risultati migliori: `pip install --upgrade youtube-transcript-api`.")
+
 youtube_url = st.text_input("📺 Enter YouTube video URL")
 language_code = st.text_input("🌍 Enter language code (default 'en')", value="en")
 allow_fallback = st.checkbox("If not found, try other available languages", value=True)
@@ -223,7 +277,6 @@ if not oai_key:
 
 client = OpenAI(api_key=oai_key)
 
-# --- Action button ---
 if st.button("📄 Generate Transcript and Summary", use_container_width=True):
     if not youtube_url:
         st.error("⚠️ You must enter the video URL!")
@@ -237,12 +290,12 @@ if st.button("📄 Generate Transcript and Summary", use_container_width=True):
     st.caption(f"🎯 Detected Video ID: `{video_id}`")
 
     try:
-        # 1) Transcript
+        # Transcript con compat shim
         try:
             transcript = fetch_transcript(video_id, language_code, allow_fallback=allow_fallback)
         except NoTranscriptFound:
             if allow_fallback:
-                st.warning(f"⚠️ No transcript found in '{language_code}'. Trying other available languages...")
+                st.warning(f"⚠️ No transcript found in '{language_code}'. Trying other common languages...")
                 transcript = fetch_transcript(video_id, language_code, allow_fallback=True)
             else:
                 raise
@@ -261,11 +314,10 @@ if st.button("📄 Generate Transcript and Summary", use_container_width=True):
             st.error("❌ Transcript retrieved but empty. The video may not contain usable captions.")
             st.stop()
 
-        # 2) Summary
         with st.spinner("🧠 Generating summary with OpenAI..."):
             summary = summarize_text(client, full_text, model=model, temperature=temperature, min_words=int(min_words))
 
-        # 3) Files (TXT + DOCX in ZIP)
+        # Files (TXT + DOCX in ZIP)
         transcript_bytes = full_text.encode('utf-8')
         transcript_filename = f"transcript_{video_id}.txt"
 
@@ -297,6 +349,6 @@ if st.button("📄 Generate Transcript and Summary", use_container_width=True):
             st.write(summary)
 
     except NoTranscriptFound:
-        st.error(f"❌ No transcript found for this video (requested language: '{language_code}'). Try enabling fallback or choosing a different language.")
+        st.error(f"❌ No transcript found for this video (requested language: '{language_code}'). Try upgrading youtube-transcript-api or selecting a different language.")
     except Exception as e:
         st.error(f"❌ Error during extraction: {type(e).__name__}: {str(e)}")
