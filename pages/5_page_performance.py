@@ -6,15 +6,19 @@ import pandas as pd
 st.set_page_config(page_title="Confronto PageSpeed Insights", layout="wide")
 st.title("🚀 Confronto PageSpeed Insights e Core Web Vitals")
 
-# Inserimento della chiave API di Google PageSpeed Insights
+# Step 1: API Key
 st.subheader("Step 1: Inserisci la tua API Key di Google PageSpeed Insights")
 google_api_key = st.text_input("Google API Key", type="password")
 
-# Inserimento degli URL da analizzare
-st.subheader("Step 2: Inserisci gli URL da analizzare")
+# Step 2: Strategia Mobile/Desktop (default Mobile)
+st.subheader("Step 2: Scegli il tipo di analisi")
+strategy = st.radio("Strategia PageSpeed", ["mobile", "desktop"], index=0, horizontal=True)
+
+# Step 3: URL
+st.subheader("Step 3: Inserisci gli URL da analizzare")
 urls = st.text_area("Inserisci gli URL (uno per riga)")
 
-# Funzione per determinare lo stile delle celle
+# ---------- Helpers ----------
 def style_metric(value, good_threshold, needs_improvement_threshold, higher_is_better=False):
     if value == "N/A":
         color = 'white'
@@ -35,7 +39,60 @@ def style_metric(value, good_threshold, needs_improvement_threshold, higher_is_b
                 color = 'lightcoral'
     return f'background-color: {color}'
 
-# Pulsante di avvio analisi
+def style_cwv_status(val):
+    mapping = {
+        "PASS": "lightgreen",
+        "NEEDS IMPROVEMENT": "yellow",
+        "FAIL": "lightcoral",
+        "N/A": "white"
+    }
+    return f"background-color: {mapping.get(val, 'white')}"
+
+def extract_metric_ms(metrics_dict, primary_key, fallback_key=None):
+    """
+    Estrae il percentile in ms da 'metrics' di CrUX.
+    Se non disponibile, prova la chiave di fallback.
+    Ritorna 'N/A' se non trovata.
+    """
+    if primary_key in metrics_dict:
+        return metrics_dict.get(primary_key, {}).get("percentile", "N/A")
+    if fallback_key and fallback_key in metrics_dict:
+        return metrics_dict.get(fallback_key, {}).get("percentile", "N/A")
+    return "N/A"
+
+def status_from_thresholds(val, good_thr, ni_thr, higher_is_better=False):
+    if val == "N/A":
+        return "N/A"
+    try:
+        v = float(val)
+    except Exception:
+        return "N/A"
+    if higher_is_better:
+        if v >= good_thr:
+            return "Good"
+        elif v >= ni_thr:
+            return "Needs Improvement"
+        else:
+            return "Poor"
+    else:
+        if v <= good_thr:
+            return "Good"
+        elif v <= ni_thr:
+            return "Needs Improvement"
+        else:
+            return "Poor"
+
+def cwv_overall(lcp_s, cls_s, inp_s):
+    # Totale: PASS se tutte Good; FAIL se almeno una Poor; altrimenti Needs Improvement; N/A se manca qualcosa
+    if "N/A" in (lcp_s, cls_s, inp_s):
+        return "N/A"
+    if lcp_s == "Good" and cls_s == "Good" and inp_s == "Good":
+        return "PASS"
+    if "Poor" in (lcp_s, cls_s, inp_s):
+        return "FAIL"
+    return "NEEDS IMPROVEMENT"
+
+# ---------- Run ----------
 if st.button("🔍 Analizza le Pagine"):
     url_list = [url.strip() for url in urls.split("\n") if url.strip()]
     
@@ -44,78 +101,93 @@ if st.button("🔍 Analizza le Pagine"):
     elif not google_api_key:
         st.error("⚠️ Inserisci la tua Google API Key.")
     else:
-        st.write("🔄 Estrazione dati PageSpeed Insights in corso...")
-        
+        st.write(f"🔄 Estrazione dati PageSpeed Insights in corso... (Strategia: **{strategy}**)")
         page_data = []
         
         for url in url_list:
             try:
-                # Costruzione URL API
-                api_url = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={url}&key={google_api_key}&strategy=mobile"
-                response = requests.get(api_url)
+                api_url = (
+                    "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+                    f"?url={url}"
+                    f"&key={google_api_key}"
+                    f"&strategy={strategy}"
+                )
+                response = requests.get(api_url, timeout=60)
+                response.raise_for_status()
                 data = response.json()
-                
-                # Estrazione metriche Core Web Vitals
-                metrics = data.get("loadingExperience", {}).get("metrics", {})
-                
-                lcp = metrics.get("LARGEST_CONTENTFUL_PAINT_MS", {}).get("percentile", "N/A")
-                fcp = metrics.get("FIRST_CONTENTFUL_PAINT_MS", {}).get("percentile", "N/A")
-                cls = metrics.get("CUMULATIVE_LAYOUT_SHIFT_SCORE", {}).get("percentile", "N/A")
-                fid = metrics.get("FIRST_INPUT_DELAY_MS", {}).get("percentile", "N/A")
-                ttfb = metrics.get("EXPERIMENTAL_TIME_TO_FIRST_BYTE", {}).get("percentile", "N/A")
-                
-                # Estrazione del Performance Score generale
-                performance_score = data.get("lighthouseResult", {}).get("categories", {}).get("performance", {}).get("score", "N/A")
+
+                # Field data (CrUX)
+                metrics = (data.get("loadingExperience", {}) or {}).get("metrics", {}) or {}
+
+                # Metriche in ms (o N/A)
+                lcp_ms  = extract_metric_ms(metrics, "LARGEST_CONTENTFUL_PAINT_MS")
+                fcp_ms  = extract_metric_ms(metrics, "FIRST_CONTENTFUL_PAINT_MS")
+                cls     = extract_metric_ms(metrics, "CUMULATIVE_LAYOUT_SHIFT_SCORE")
+                inp_ms  = extract_metric_ms(metrics, "INTERACTION_TO_NEXT_PAINT", "EXPERIMENTAL_INTERACTION_TO_NEXT_PAINT")
+                ttfb_ms = extract_metric_ms(metrics, "EXPERIMENTAL_TIME_TO_FIRST_BYTE")
+
+                # Performance Score (0-1 → 0-100)
+                performance_score = (
+                    data.get("lighthouseResult", {})
+                        .get("categories", {})
+                        .get("performance", {})
+                        .get("score", "N/A")
+                )
                 if performance_score != "N/A":
-                    performance_score = performance_score * 100  # Convertiamo il punteggio in scala 0-100
-                
-                # Conversione dei valori in secondi o mantenimento di "N/A"
-                lcp = lcp / 1000 if lcp != "N/A" else lcp
-                fcp = fcp / 1000 if fcp != "N/A" else fcp
-                fid = fid / 1000 if fid != "N/A" else fid
-                ttfb = ttfb / 1000 if ttfb != "N/A" else ttfb
-                
+                    performance_score = performance_score * 100
+
+                # ms → s dove opportuno
+                lcp  = lcp_ms / 1000 if lcp_ms != "N/A" else lcp_ms
+                fcp  = fcp_ms / 1000 if fcp_ms != "N/A" else fcp_ms
+                inp  = inp_ms / 1000 if inp_ms != "N/A" else inp_ms
+                ttfb = ttfb_ms / 1000 if ttfb_ms != "N/A" else ttfb_ms
+                # CLS resta com'è
+
+                # Status per il totale CWV (da metriche numeriche)
+                lcp_status = status_from_thresholds(lcp, 2.5, 4.0)  # <=2.5 Good, <=4 NI, >4 Poor
+                cls_status = status_from_thresholds(cls, 0.1, 0.25) # <=0.1 Good, <=0.25 NI, >0.25 Poor
+                inp_status = status_from_thresholds(inp, 0.2, 0.5)  # <=0.2 Good, <=0.5 NI, >0.5 Poor
+                cwv_status = cwv_overall(lcp_status, cls_status, inp_status)
+
                 page_data.append({
                     "URL": url,
+                    "Strategia": strategy.capitalize(),
                     "LCP (s)": lcp,
-                    "FCP (s)": fcp,
+                    "FCP (s)": fcp,        # non CWV, ma utile
                     "CLS": cls,
-                    "FID (s)": fid,
-                    "TTFB": ttfb,
-                    "Performance Score": performance_score
+                    "INP (s)": inp,
+                    "TTFB (s)": ttfb,
+                    "Performance Score": performance_score,
+                    "CWV Status": cwv_status  # <<< SOLO risultato totale richiesto
                 })
-                
+
             except Exception as e:
                 st.error(f"❌ Errore nell'analisi di {url}: {e}")
-        
-        # Creazione DataFrame con i risultati
+
+        # Tabella
         df = pd.DataFrame(page_data)
-        
-        # Applicazione degli stili condizionali
+
+        # Stili condizionali
         def apply_styles(df):
-            df_styles = df.style.applymap(
-                lambda x: style_metric(x, 2.5, 4.0) if isinstance(x, (int, float)) else '',
-                subset=['LCP (s)']
-            ).applymap(
-                lambda x: style_metric(x, 1.8, 3.0) if isinstance(x, (int, float)) else '',
-                subset=['FCP (s)']
-            ).applymap(
-                lambda x: style_metric(x, 0.1, 0.25) if isinstance(x, (int, float)) else '',
-                subset=['CLS']
-            ).applymap(
-                lambda x: style_metric(x, 0.1, 0.3) if isinstance(x, (int, float)) else '',
-                subset=['FID (s)']
-            ).applymap(
-                lambda x: style_metric(x, 0.1, 0.3) if isinstance(x, (int, float)) else '',
-                subset=['TTFB']
-            ).applymap(
-                lambda x: style_metric(x, 90, 50, higher_is_better=True) if isinstance(x, (int, float)) else '',
-                subset=['Performance Score']
+            df_styles = (
+                df.style
+                # metriche numeriche
+                .applymap(lambda x: style_metric(x, 2.5, 4.0) if isinstance(x, (int, float)) else '', subset=['LCP (s)'])
+                .applymap(lambda x: style_metric(x, 1.8, 3.0) if isinstance(x, (int, float)) else '', subset=['FCP (s)'])
+                .applymap(lambda x: style_metric(x, 0.1, 0.25) if isinstance(x, (int, float)) else '', subset=['CLS'])
+                .applymap(lambda x: style_metric(x, 0.2, 0.5) if isinstance(x, (int, float)) else '', subset=['INP (s)'])
+                .applymap(lambda x: style_metric(x, 0.8, 1.8) if isinstance(x, (int, float)) else '', subset=['TTFB (s)'])
+                .applymap(lambda x: style_metric(x, 90, 50, higher_is_better=True) if isinstance(x, (int, float)) else '', subset=['Performance Score'])
+                # CWV totale (badge)
+                .applymap(style_cwv_status, subset=['CWV Status'])
             )
             return df_styles
-        
-        # Visualizzazione dei risultati
+
         st.write("📊 **Risultati dell'analisi PageSpeed Insights:**")
-        st.dataframe(apply_styles(df))
-        
+        st.dataframe(apply_styles(df), use_container_width=True)
+
+        # (Facoltativo) riepilogo contatori PASS/NI/FAIL
+        counts = df['CWV Status'].value_counts(dropna=False).to_dict()
+        st.caption(f"✅ PASS: {counts.get('PASS', 0)}  •  ⚠️ NEEDS IMPROVEMENT: {counts.get('NEEDS IMPROVEMENT', 0)}  •  ❌ FAIL: {counts.get('FAIL', 0)}  •  N/A: {counts.get('N/A', 0)}")
+
         st.write("✅ Analisi completata con successo! 🚀")
