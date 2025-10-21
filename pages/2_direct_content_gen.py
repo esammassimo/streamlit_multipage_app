@@ -1,42 +1,121 @@
 import streamlit as st
-import openai
 import os
 import tempfile
 from docx import Document
+from openai import OpenAI, BadRequestError
 
+# =========================
 # 📌 Configurazione pagina
+# =========================
 st.set_page_config(page_title="AI Content Generator", layout="wide")
 st.title("📝 AI Content Generator - Articles & Recipes")
 
-# 📌 Inserimento API Key OpenAI
-def get_openai_api_key():
+# =========================
+# ⚙️ Utility & Token Budget
+# =========================
+def approx_tokens(text: str) -> int:
+    """Stima grezza dei token: ~4 caratteri per token."""
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+# Limiti prudenziali della context window per i modelli
+CONTEXT_LIMITS = {
+    "gpt-4": 8192,
+    "gpt-4-0613": 8192,
+    "gpt-4o": 128000,
+    "gpt-4o-mini": 128000,
+}
+
+# Soglia massima caratteri per “Fonte” quando si usa GPT-4 (verrà troncata oltre questa soglia)
+GPT4_SOURCE_MAX_CHARS = 8000
+
+def truncate_source_for_gpt4(source_text: str) -> tuple[str, bool]:
+    """Tronca la fonte se troppo lunga per GPT-4 (solo GPT-4). Ritorna (testo, troncato_bool)."""
+    if not source_text:
+        return source_text, False
+    if len(source_text) > GPT4_SOURCE_MAX_CHARS:
+        truncated = source_text[:GPT4_SOURCE_MAX_CHARS] + "\n\n[Nota: fonte troncata per lunghezza]"
+        return truncated, True
+    return source_text, False
+
+def compute_effective_max_tokens(model: str, system_prompt: str, user_prompt: str, desired_max_tokens: int) -> int:
+    """Calcola un max_tokens che non superi la context window del modello."""
+    ctx_limit = CONTEXT_LIMITS.get(model, 8192)
+    sys_t = approx_tokens(system_prompt)
+    usr_t = approx_tokens(user_prompt)
+    overhead = 200  # margine per token di ruolo e framing
+    max_allowed_completion = max(256, ctx_limit - (sys_t + usr_t + overhead))
+    return max(256, min(desired_max_tokens, max_allowed_completion))
+
+def safe_chat_completion(
+    client: OpenAI,
+    system_prompt: str,
+    user_prompt: str,
+    model: str = "gpt-4o-mini",
+    temperature: float = 0.7,
+    desired_max_tokens: int = 1200
+) -> str:
+    """
+    Invio robusto a Chat Completions con budgeting e fallback:
+    - Adatta max_tokens al budget disponibile.
+    - In caso di BadRequest (p.es. prompt troppo lungo), riprova con token più bassi.
+    """
+    eff_max_tokens = compute_effective_max_tokens(model, system_prompt, user_prompt, desired_max_tokens)
+    attempts = [eff_max_tokens, max(256, eff_max_tokens // 2), 256]
+    last_err = None
+
+    for mt in attempts:
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=temperature,
+                max_tokens=mt,
+            )
+            return resp.choices[0].message.content.strip()
+        except BadRequestError as e:
+            last_err = e
+            # ritenta con un budget più basso
+            continue
+
+    raise RuntimeError(
+        "Il prompt complessivo è troppo lungo per la finestra del modello anche dopo i fallback. "
+        "Riduci la 'Fonte autorevole', il numero minimo di parole o il numero di paragrafi."
+    ) from last_err
+
+# =========================
+# 🔐 API Key + Modello
+# =========================
+def get_openai_client_and_model():
     with st.sidebar:
-        st.subheader("🔐 API Key OpenAI")
+        st.subheader("🔐 OpenAI")
         api_key = st.text_input("Insert your OpenAI API KEY", type="password")
+        model = st.selectbox(
+            "Seleziona il modello",
+            options=["gpt-4o-mini", "gpt-4o", "gpt-4"],
+            index=0,
+            help="Consigliato: gpt-4o-mini (più economico e con ampia context window)."
+        )
         if not api_key:
-            st.warning("⚠️ Insert your API KEY to continue.")
+            st.warning("⚠️ Inserisci la tua API KEY per continuare.")
             st.stop()
-        return api_key
+    client = OpenAI(api_key=api_key)
+    return client, model
 
-openai.api_key = get_openai_api_key()
+client, selected_model = get_openai_client_and_model()
 
-# 📌 Funzione generica per generazione contenuto
-def generate_openai_content(system_prompt, user_prompt, model="gpt-4", temperature=0.7, max_tokens=1500):
-    response = openai.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        temperature=temperature,
-        max_tokens=max_tokens
-    )
-    return response.choices[0].message.content.strip()
-
-# 📌 Creazione Tabs
+# =========================
+# 🧭 Tabs
+# =========================
 tab1, tab2 = st.tabs(["📝 Articles", "🍽 Recipes"])
 
+# =========================
 # 📝 TAB ARTICOLI
+# =========================
 with tab1:
     st.header("📄 Generate Articles")
 
@@ -66,21 +145,46 @@ with tab1:
         if not title or not seo_title or not meta_description or not paragraphs:
             st.error("❌ Please fill out all required fields.")
         else:
+            # Gestione troncamento fonte SOLO per GPT-4
+            truncated_now = False
+            effective_source = source_text
+            if selected_model.startswith("gpt-4") and not selected_model.startswith("gpt-4o"):
+                effective_source, truncated_now = truncate_source_for_gpt4(source_text)
+                if truncated_now:
+                    st.warning(
+                        "✂️ La 'Fonte autorevole' è stata troncata perché troppo lunga per GPT-4. "
+                        "Se vuoi evitare il taglio, usa gpt-4o-mini o gpt-4o."
+                    )
+
             st.success(f"📝 Generating article: {title}...")
+
+            # Calibrazione parole per paragrafo
+            min_words_per_para = max(120, int(min_words // len(paragraphs)))
 
             generated_sections = []
             for p_title, p_desc in paragraphs:
                 prompt = f"""
-                Scrivi un paragrafo con il titolo "{p_title}".
-                Il tono deve essere {tone_of_voice.lower()}.
-                Il contenuto deve sviluppare questa idea: "{p_desc}".
-                Deve contenere almeno {min_words // len(paragraphs)} parole.
-                La fonte seguente può servire da contesto (non citarla): {source_text}
-                """
-                content = generate_openai_content(
-                    "Sei un esperto redattore SEO.", prompt,
-                    temperature=0.7, max_tokens=1800
-                )
+Scrivi un paragrafo con il titolo "{p_title}".
+Il tono deve essere {tone_of_voice.lower()}.
+Il contenuto deve sviluppare questa idea: "{p_desc}".
+Deve contenere almeno {min_words_per_para} parole.
+La fonte seguente può servire da contesto (non citarla): {effective_source}
+                """.strip()
+
+                # Heuristica token: ~1.6 token per parola in IT
+                target_tokens = int(min_words_per_para * 1.6)
+                try:
+                    content = safe_chat_completion(
+                        client=client,
+                        system_prompt="Sei un esperto redattore SEO.",
+                        user_prompt=prompt,
+                        model=selected_model,
+                        temperature=0.7,
+                        desired_max_tokens=min(1100, max(300, target_tokens))
+                    )
+                except Exception as e:
+                    st.error(f"❌ Errore durante la generazione del paragrafo '{p_title}': {e}")
+                    content = ""
                 generated_sections.append((p_title, content))
 
             # 📄 Anteprima del contenuto
@@ -88,7 +192,10 @@ with tab1:
             st.markdown(f"# {title}")
             st.markdown(f"**SEO Title**: {seo_title}\n\n**Meta Description**: {meta_description}")
             for p_title, p_text in generated_sections:
-                st.markdown(f"## {p_title}\n\n{p_text}")
+                if p_text:
+                    st.markdown(f"## {p_title}\n\n{p_text}")
+                else:
+                    st.markdown(f"## {p_title}\n\n*Paragrafo non generato per errore.*")
 
             # 📁 Esporta in Word
             temp_dir = tempfile.mkdtemp()
@@ -102,13 +209,15 @@ with tab1:
 
             for p_title, p_text in generated_sections:
                 doc.add_heading(p_title, level=2)
-                doc.add_paragraph(p_text)
+                doc.add_paragraph(p_text if p_text else "[Non disponibile]")
 
             doc.save(file_path)
             with open(file_path, "rb") as f:
                 st.download_button("📥 Download Article (.docx)", f, file_name=os.path.basename(file_path))
 
+# =========================
 # 🍽 TAB RICETTE
+# =========================
 with tab2:
     st.header("🍽 Generate Recipes")
 
@@ -128,31 +237,61 @@ with tab2:
         else:
             st.success(f"🍽 Generating recipe: {recipe_title}...")
 
+            # Prepariamo i prompt
             intro_prompt = f"""
-            Scrivi una breve introduzione per la ricetta "{recipe_title}".
-            Il tono deve essere {recipe_tone.lower()}.
-            La fonte è solo per contesto (non citarla): {recipe_source}
-            """
+Scrivi una breve introduzione per la ricetta "{recipe_title}".
+Il tono deve essere {recipe_tone.lower()}.
+La fonte è solo per contesto (non citarla): {recipe_source}
+            """.strip()
 
             prep_prompt = f"""
-            Scrivi un paragrafo dettagliato per spiegare come preparare "{recipe_title}".
-            Deve contenere almeno {min_words_recipe} parole.
-            Gli ingredienti sono: {ingredients}
-            Il tono deve essere {recipe_tone.lower()}.
-            {preparation_desc}
-            """
+Scrivi un paragrafo dettagliato per spiegare come preparare "{recipe_title}".
+Deve contenere almeno {min_words_recipe} parole.
+Gli ingredienti sono:
+{ingredients}
 
-            recipe_intro = generate_openai_content("Sei un esperto di cucina.", intro_prompt)
-            recipe_prep = generate_openai_content("Sei un esperto di cucina.", prep_prompt, max_tokens=2500)
+Il tono deve essere {recipe_tone.lower()}.
+{preparation_desc}
+            """.strip()
+
+            # Heuristica token per la parte "Preparazione"
+            target_tokens_recipe = int(min_words_recipe * 1.6)
+
+            try:
+                recipe_intro = safe_chat_completion(
+                    client=client,
+                    system_prompt="Sei un esperto di cucina.",
+                    user_prompt=intro_prompt,
+                    model=selected_model,
+                    temperature=0.7,
+                    desired_max_tokens=500
+                )
+            except Exception as e:
+                st.error(f"❌ Errore durante la generazione dell'introduzione: {e}")
+                recipe_intro = ""
+
+            try:
+                recipe_prep = safe_chat_completion(
+                    client=client,
+                    system_prompt="Sei un esperto di cucina.",
+                    user_prompt=prep_prompt,
+                    model=selected_model,
+                    temperature=0.7,
+                    desired_max_tokens=min(2500, max(400, target_tokens_recipe))
+                )
+            except Exception as e:
+                st.error(f"❌ Errore durante la generazione della preparazione: {e}")
+                recipe_prep = ""
 
             # 📄 Anteprima
             st.subheader("📖 Anteprima Ricetta")
             st.markdown(f"# {recipe_title}")
-            st.markdown(recipe_intro)
+            if recipe_intro:
+                st.markdown(recipe_intro)
             st.markdown("## Ingredienti")
             st.markdown("\n".join([f"- {i}" for i in ingredients.strip().split("\n") if i.strip()]))
             st.markdown("## Preparazione")
-            st.markdown(recipe_prep)
+            st.markdown(recipe_prep if recipe_prep else "*Preparazione non disponibile per errore.*")
 
             # 📁 Word export
             temp_dir = tempfile.mkdtemp()
@@ -161,13 +300,14 @@ with tab2:
             doc = Document()
             doc.add_heading(recipe_title, level=1)
             doc.add_paragraph(f"Tone of Voice: {recipe_tone}")
-            doc.add_paragraph(recipe_intro)
+            if recipe_intro:
+                doc.add_paragraph(recipe_intro)
             doc.add_heading("Ingredienti", level=2)
             for ing in ingredients.strip().split("\n"):
                 if ing.strip():
                     doc.add_paragraph(f"• {ing.strip()}")
             doc.add_heading("Preparazione", level=2)
-            doc.add_paragraph(recipe_prep)
+            doc.add_paragraph(recipe_prep if recipe_prep else "[Non disponibile]")
 
             doc.save(file_path)
             with open(file_path, "rb") as f:
