@@ -11,3 +11,4 @@ chardet
 beautifulsoup4
 matplotlib
 XlsxWriter
+matplotlib

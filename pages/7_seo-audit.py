@@ -1,4 +1,3 @@
-
 # SEO Audit Tool – versione completa (Singolo/Multi File) con benchmark competitivo e pesi off-page
 # Requisiti: streamlit, pandas, openpyxl, matplotlib, numpy
 # Avvio: streamlit run seo_audit_tool.py
