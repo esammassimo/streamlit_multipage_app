@@ -350,7 +350,7 @@ def build_portfolio_score(df_stable: pd.DataFrame) -> dict:
 # =========================
 # UI – Streamlit
 # =========================
-st.set_page_config(page_title=APP_TITLE, page_icon="🕵️", layout="wide")
+st.set_page_config(page_title=APP_TITLE, page_icon="🧭", layout="wide")
 st.title(APP_TITLE)
 
 tab1, tab2 = st.tabs(["Singolo File", "Multi File"])
