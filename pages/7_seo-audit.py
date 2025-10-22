@@ -256,8 +256,8 @@ def build_portfolio_score(df_stable: pd.DataFrame) -> dict:
     return {"Portfolio Score": round(score_port, 2), "Portfolio SE (pt)": round(se, 2), "Portfolio CI95%": (round(score_port - 1.96 * se, 2), round(score_port + 1.96 * se, 2)), "Pesi Usati": dyn_w}
 
 # ============ UI ============
-st.set_page_config(page_title="SEO Audit Tool v3", layout="wide")
-st.title("SEO Audit Tool v3 – contributi pesati")
+st.set_page_config(page_title="SEO Audit Tool", layout="wide")
+st.title("SEO Audit Tool")
 
 tab1, tab2 = st.tabs(["Singolo File", "Multi File"])
 
