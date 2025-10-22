@@ -1,6 +1,6 @@
 
-# SEO Audit Tool – v2 (stabilità input pesi e DR/LV)
-# Avvio: streamlit run seo_audit_tool_v2.py
+# SEO Audit Tool – v3 (contributi pesati per riga nel benchmark)
+# Avvio: streamlit run seo_audit_tool_v3.py
 
 import io
 import os
@@ -22,7 +22,6 @@ MATPLOTLIB_OK, plt = setup_matplotlib()
 
 def estrai_dominio(df: pd.DataFrame):
     try:
-        from urllib.parse import urlparse
         url_sample = df['Address'].dropna().iloc[0]
         dominio = urlparse(url_sample).netloc.replace('www.', '')
         return dominio if dominio else None
@@ -74,6 +73,7 @@ def calcola_score(df: pd.DataFrame, kpi: dict, contenuti_penalty: float | None =
     pagine_totali = df.shape[0]
     if pagine_totali == 0:
         return 0.0, {}
+
     penalita = {}
     penalita['Penalità Status Code %'] = (
         (kpi.get('Pagine 3xx', 0) + kpi.get('Pagine 4xx', 0) + kpi.get('Bloccate da Robots.txt', 0)) / max(pagine_totali, 1)
@@ -92,6 +92,7 @@ def calcola_score(df: pd.DataFrame, kpi: dict, contenuti_penalty: float | None =
     if contenuti_penalty is None:
         contenuti_penalty = 0.0
     penalita['Penalità Contenuti %'] = float(min(1.0, max(0.0, contenuti_penalty)))
+
     penalita_cwv = []
     soglie = {'LCP': 2500, 'INP': 200, 'CLS': 0.1, 'FCP': 1800, 'TTFB': 800}
     for metrica, soglia in soglie.items():
@@ -103,6 +104,7 @@ def calcola_score(df: pd.DataFrame, kpi: dict, contenuti_penalty: float | None =
                 else:
                     penalita_cwv.append(min(1.0, max(0.0, (val - soglia) / soglia)))
     base_cwv_pen = sum(penalita_cwv) / len(penalita_cwv) if penalita_cwv else 0.0
+
     pass_rate = kpi.get('CWV Assessment Pass %', None)
     if isinstance(pass_rate, (int, float)):
         if pass_rate > 60:
@@ -110,6 +112,7 @@ def calcola_score(df: pd.DataFrame, kpi: dict, contenuti_penalty: float | None =
         elif pass_rate > 50:
             base_cwv_pen *= 0.95
     penalita['Penalità CWV %'] = base_cwv_pen
+
     score = 100 * (1 - (
         0.30 * penalita['Penalità Status Code %'] +
         0.15 * penalita['Penalità Canonical %'] +
@@ -130,10 +133,13 @@ def estrai_kpi(df: pd.DataFrame) -> pd.DataFrame:
         'Bloccate da Robots.txt': df.get('Indexability', pd.Series(index=df.index)).astype(str).str.contains("Blocked by Robots", na=False).sum(),
         'Pagine HTML Totali': df.shape[0]
     }
+
     def analizza(col):
-        if col not in df.columns: return (0, 0, 0)
+        if col not in df.columns:
+            return (0, 0, 0)
         valid = df[col].dropna()
         return (len(valid[valid.duplicated(keep=False)].unique()), df[col].isna().sum(), df[col].notna().sum())
+
     title = analizza("Title 1")
     description = analizza("Meta Description 1")
     h1 = analizza("H1-1")
@@ -142,12 +148,14 @@ def estrai_kpi(df: pd.DataFrame) -> pd.DataFrame:
         'Meta Description Duplicati': description[0], 'Meta Description Mancanti': description[1], 'Totale Meta Description': description[2],
         'H1 Duplicati': h1[0], 'H1 Mancanti': h1[1], 'Totale H1': h1[2]
     }
+
     pagine_totali = max(df.shape[0], 1)
     dup_pages = 0
     if 'Title 1' in df.columns:
         vc = df['Title 1'].dropna().value_counts()
         dup_pages = int(vc[vc > 1].sum())
     dup_rate = dup_pages / pagine_totali
+
     thin_rate = 0.0
     if 'Word Count' in df.columns:
         wc = pd.to_numeric(df['Word Count'], errors='coerce')
@@ -156,12 +164,15 @@ def estrai_kpi(df: pd.DataFrame) -> pd.DataFrame:
             media_wc = wc_valid.mean()
             thin_pages = (wc_valid < media_wc).sum()
             thin_rate = thin_pages / len(wc_valid)
+
     contenuti_penalty = (dup_rate + thin_rate) / 2.0
     content = {'Pagine Duplicate (da Title)': dup_pages, 'Thin Content %': round(thin_rate * 100, 2), 'Pagine Totali': pagine_totali}
+
     img_pages_pct = None
     if 'Images Missing Alt Text' in df.columns:
         missing_any = pd.to_numeric(df['Images Missing Alt Text'], errors='coerce').fillna(0) > 0
         img_pages_pct = round((missing_any.sum() / pagine_totali) * 100, 2)
+
     cwv_vals = {
         'FCP': first_present_numeric(df, 'First contentfull Paint Time (ms)', 'FCP (ms)', 'FCP'),
         'LCP': first_present_numeric(df, 'Largest contentfull Paint Time (ms)', 'LCP (ms)', 'LCP'),
@@ -170,15 +181,18 @@ def estrai_kpi(df: pd.DataFrame) -> pd.DataFrame:
         'TTFB': first_present_numeric(df, 'Server Response Times (TTFB) (ms)', 'TTFB (ms)', 'TTFB'),
     }
     cwv = {k: v for k, v in cwv_vals.items() if v is not None}
+
     assessment_pass_pct = None
     if 'Core Web Vitals Assessment' in df.columns:
         assess = df['Core Web Vitals Assessment'].astype(str).str.strip()
         total = len(assess)
         passes = (assess.str.lower() == 'pass').sum()
         assessment_pass_pct = round((passes / total) * 100, 2) if total else None
+
     kpi = {**status, **html_tag, **content, **cwv}
     if assessment_pass_pct is not None: kpi['CWV Assessment Pass %'] = assessment_pass_pct
     if img_pages_pct is not None: kpi['Pagine con Immagini senza ALT %'] = img_pages_pct
+
     score, penalita = calcola_score(df, kpi, contenuti_penalty=contenuti_penalty)
     kpi['SEO Score'] = score
     kpi.update(penalita)
@@ -241,8 +255,9 @@ def build_portfolio_score(df_stable: pd.DataFrame) -> dict:
     se = np.sqrt(var) * 100.0
     return {"Portfolio Score": round(score_port, 2), "Portfolio SE (pt)": round(se, 2), "Portfolio CI95%": (round(score_port - 1.96 * se, 2), round(score_port + 1.96 * se, 2)), "Pesi Usati": dyn_w}
 
-st.set_page_config(page_title="SEO Audit Tool v2", layout="wide")
-st.title("SEO Audit Tool v2 – stabile")
+# ============ UI ============
+st.set_page_config(page_title="SEO Audit Tool v3", layout="wide")
+st.title("SEO Audit Tool v3 – contributi pesati")
 
 tab1, tab2 = st.tabs(["Singolo File", "Multi File"])
 
@@ -255,6 +270,7 @@ with tab1:
         kpi = estrai_kpi(df)
         st.subheader("Riepilogo SEO")
         st.dataframe(kpi, use_container_width=True)
+
         st.subheader("Sintesi SEO")
         pesi_df = pd.DataFrame({
             "Componente": ["Status Code e Robots","Canonical non self-ref","HTML Tag duplicati/mancanti","Contenuti (duplicati da Title + thin)","Core Web Vitals (con bonus Assessment)"],
@@ -268,6 +284,7 @@ with tab1:
             ]
         })
         st.dataframe(pesi_df, use_container_width=True)
+
         cols = st.columns(4)
         cols[0].metric("SEO Score", f"{kpi['SEO Score'].iloc[0]}")
         if 'CWV Assessment Pass %' in kpi.columns:
@@ -276,22 +293,6 @@ with tab1:
             cols[2].metric("Pagine con ≥1 immagine senza ALT", f"{kpi['Pagine con Immagini senza ALT %'].iloc[0]}%")
         if 'TTFB' in kpi.columns:
             cols[3].metric("TTFB medio", f"{kpi['TTFB'].iloc[0]} ms")
-        if MATPLOTLIB_OK:
-            import numpy as _np
-            k = kpi[['Penalità Status Code %','Penalità Canonical %','Penalità Tag HTML %','Penalità Contenuti %','Penalità CWV %']]
-            labels = k.columns.tolist()
-            values = k.iloc[0].tolist()
-            values = [v if isinstance(v, (int, float)) else 0 for v in values]
-            angles = _np.linspace(0, 2*_np.pi, len(labels), endpoint=False).tolist()
-            values += values[:1]; angles += angles[:1]
-            fig, ax = plt.subplots(figsize=(6,6), subplot_kw=dict(polar=True))
-            ax.plot(angles, values, 'o-', linewidth=2); ax.fill(angles, values, alpha=0.25)
-            ax.set_yticklabels([]); ax.set_xticks(angles[:-1]); ax.set_xticklabels(labels)
-            ax.set_title("Penalità SEO Radar Chart"); st.pyplot(fig)
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            kpi.to_excel(writer, sheet_name='SEO Report', index=False)
-        st.download_button("📥 Scarica il report Excel", buffer.getvalue(), file_name="seo_report.xlsx")
 
 with tab2:
     files = st.file_uploader("Carica più file .xlsx (Screaming Frog)", type="xlsx", accept_multiple_files=True, key="multi")
@@ -308,84 +309,117 @@ with tab2:
             df_riepilogo = pd.concat(risultati, ignore_index=True)
             if "Pagine Totali" not in df_riepilogo.columns and "Pagine HTML Totali" in df_riepilogo.columns:
                 df_riepilogo = df_riepilogo.rename(columns={"Pagine HTML Totali": "Pagine Totali"})
+
             st.subheader("Riepilogo SEO per tutti i domini")
             st.dataframe(df_riepilogo, use_container_width=True)
-            df_stable = build_stable_domain_scores(df_riepilogo)
-            st.subheader("Riepilogo SEO STABILE per tutti i domini")
-            st.dataframe(df_stable[['Dominio','Pagine Totali','SEO Score Stabile','Score CI95% Min','Score CI95% Max','Stato Stabile']], use_container_width=True)
-            port = build_portfolio_score(df_stable)
-            st.markdown(f"### Score complessivo portafoglio: **{port['Portfolio Score']}** (IC95% {port['Portfolio CI95%'][0]} – {port['Portfolio CI95%'][1]})")
-            st.caption(f"Pesi componenti usati: {port['Pesi Usati']}")
-            st.markdown("### Confronto Score SEO tra domini")
-            st.bar_chart(df_riepilogo.set_index("Dominio")["SEO Score"])
-            st.subheader("Benchmark competitivo")
+
+            # BENCHMARK con contributi pesati
+            st.subheader("Benchmark competitivo (valori e contributi pesati)")
+
+            # Sidebar pesi default (usati solo se DR/LV incompleti)
             with st.sidebar:
                 st.markdown("### Pesi SCORE (default – normalizzati)")
                 w_indexability = st.slider("Peso INDEXABILITY", 0, 100, 20)
-                w_cwv = st.slider("Peso CWV", 0, 100, 20)
-                w_html = st.slider("Peso HTML TAGS", 0, 100, 20)
-                w_content = st.slider("Peso CONTENT EVALUATION", 0, 100, 20)
-                w_dr = st.slider("Peso DR", 0, 100, 10)
-                w_lv = st.slider("Peso LINK VELOCITY", 0, 100, 10)
+                w_cwv          = st.slider("Peso CWV", 0, 100, 20)
+                w_html         = st.slider("Peso HTML TAGS", 0, 100, 20)
+                w_content      = st.slider("Peso CONTENT EVALUATION", 0, 100, 20)
+                w_dr           = st.slider("Peso DR", 0, 100, 10)
+                w_lv           = st.slider("Peso LINK VELOCITY", 0, 100, 10)
+
             weights_default_raw = {"INDEXABILITY": w_indexability,"CWV": w_cwv,"HTML TAGS": w_html,"CONTENT EVALUATION": w_content,"DR": w_dr,"LINK VELOCITY": w_lv}
             wsum = sum(weights_default_raw.values()) or 1
             weights_default = {k: v / wsum for k, v in weights_default_raw.items()}
+
+            # Form per l’input manuale con submit
             if "manual_ext_df" not in st.session_state:
                 st.session_state.manual_ext_df = pd.DataFrame({"Dominio": df_riepilogo["Dominio"].tolist(), "DR": [None]*len(df_riepilogo), "LINK VELOCITY":[None]*len(df_riepilogo)})
                 st.session_state.offpage_scale = "0-100"
+
             with st.form("offpage_form", clear_on_submit=False):
                 st.markdown("Compila **DR** e **LINK VELOCITY** (se disponi dei dati):")
                 manual_input = st.data_editor(st.session_state.manual_ext_df, use_container_width=True, hide_index=True)
-                scale = st.selectbox("Scala valori DR/LINK VELOCITY", ["0-100","0-1"], index=0, help="Se fornisci valori tra 0 e 1 verranno scalati *100.")
+                scale = st.selectbox("Scala valori DR/LINK VELOCITY", ["0-100","0-1"], index=0, help="Se 0–1 → *100")
                 submitted = st.form_submit_button("Aggiorna benchmark")
             if submitted:
                 st.session_state.manual_ext_df = manual_input.copy()
                 st.session_state.offpage_scale = scale
+
             manual_df = st.session_state.manual_ext_df.copy()
             scale = st.session_state.offpage_scale
+
             def to_num(v):
                 try: return float(v)
                 except Exception: return np.nan
+
             all_offpage_ready = manual_df["DR"].apply(lambda x: np.isfinite(to_num(x))).all() and manual_df["LINK VELOCITY"].apply(lambda x: np.isfinite(to_num(x))).all()
+
+            # Pesi finali
             if all_offpage_ready:
                 weights = {"INDEXABILITY": 0.33,"HTML TAGS": 0.11,"CONTENT EVALUATION": 0.11,"CWV": 0.11,"DR": 0.165,"LINK VELOCITY": 0.165}
                 st.caption("Schema pesi **OFF-PAGE 33%** attivo (DR e Link Velocity compilati per tutti i domini).")
             else:
                 weights = weights_default
                 st.caption("Schema pesi **default** attivo (mancano valori completi di DR/Link Velocity).")
-            _domains = df_riepilogo["Dominio"].tolist()
-            bench = pd.DataFrame(index=["INDEXABILITY","CWV","HTML TAGS","CONTENT EVALUATION","DR","LINK VELOCITY"], columns=[d.upper().replace("WWW.","") for d in _domains], dtype="float")
+
+            rows = ["INDEXABILITY","CWV","HTML TAGS","CONTENT EVALUATION","DR","LINK VELOCITY"]
+            domains = df_riepilogo["Dominio"].tolist()
+            cols = [d.upper().replace("WWW.", "") for d in domains]
+
+            # Build raw values table
+            bench_vals = pd.DataFrame(index=rows, columns=cols, dtype="float")
             manual_map = manual_df.set_index("Dominio").to_dict("index")
-            for dom in _domains:
-                col = dom.upper().replace("WWW.","")
-                row = df_riepilogo.loc[df_riepilogo["Dominio"] == dom].iloc[0]
+
+            for dom_raw, col in zip(domains, cols):
+                row = df_riepilogo.loc[df_riepilogo["Dominio"] == dom_raw].iloc[0]
                 indexability = 100.0 - float(row.get("Penalità Status Code %", 0.0))
                 cwv = float(row.get("CWV Assessment Pass %", 0.0)) if "CWV Assessment Pass %" in df_riepilogo.columns else 0.0
                 html_ok = 100.0 - float(row.get("Penalità Tag HTML %", 0.0))
                 content_ok = 100.0 - float(row.get("Penalità Contenuti %", 0.0))
-                dr_val = to_num(manual_map.get(dom, {}).get("DR"))
-                lv_val = to_num(manual_map.get(dom, {}).get("LINK VELOCITY"))
+                dr_val = to_num(manual_map.get(dom_raw, {}).get("DR"))
+                lv_val = to_num(manual_map.get(dom_raw, {}).get("LINK VELOCITY"))
                 if np.isfinite(dr_val) and scale == "0-1": dr_val *= 100.0
                 if np.isfinite(lv_val) and scale == "0-1": lv_val *= 100.0
                 if np.isfinite(dr_val): dr_val = max(0.0, min(100.0, dr_val))
                 if np.isfinite(lv_val): lv_val = max(0.0, min(100.0, lv_val))
-                bench.loc["INDEXABILITY", col] = round(indexability, 2)
-                bench.loc["CWV", col] = round(cwv, 2)
-                bench.loc["HTML TAGS", col] = round(html_ok, 2)
-                bench.loc["CONTENT EVALUATION", col] = round(content_ok, 2)
-                bench.loc["DR", col] = dr_val if np.isfinite(dr_val) else np.nan
-                bench.loc["LINK VELOCITY", col] = lv_val if np.isfinite(lv_val) else np.nan
-            score = []
-            for col in bench.columns:
-                total = 0.0
-                for r in bench.index:
-                    val = bench.loc[r, col]
-                    if pd.isna(val): val = 0.0
-                    total += float(val) * weights[r]
-                score.append(int(round(total, 0)))
-            bench.loc["SCORE"] = score
-            st.dataframe(bench, use_container_width=True)
-            buf_bench = io.BytesIO()
-            with pd.ExcelWriter(buf_bench, engine="openpyxl") as writer:
-                bench.to_excel(writer, sheet_name="Benchmark", index=True)
-            st.download_button("📥 Scarica tabella benchmark", buf_bench.getvalue(), file_name="benchmark_competitors.xlsx")
+
+                bench_vals.loc["INDEXABILITY", col] = round(indexability, 2)
+                bench_vals.loc["CWV", col] = round(cwv, 2)
+                bench_vals.loc["HTML TAGS", col] = round(html_ok, 2)
+                bench_vals.loc["CONTENT EVALUATION", col] = round(content_ok, 2)
+                bench_vals.loc["DR", col] = dr_val if np.isfinite(dr_val) else np.nan
+                bench_vals.loc["LINK VELOCITY", col] = lv_val if np.isfinite(lv_val) else np.nan
+
+            # Compute weighted contributions per row (value% * weight)
+            bench_pts = bench_vals.copy()
+            for r in rows:
+                w = weights[r]
+                bench_pts.loc[r] = bench_vals.loc[r].astype(float).fillna(0.0) * w
+
+            # SCORE = somma punti per colonna
+            score = bench_pts.sum(axis=0).round(0).astype(int)
+            bench_vals.loc["SCORE"] = score  # keep for reference
+            bench_pts.loc["SCORE"] = score   # identical by definition
+
+            # Build a combined table with MultiIndex columns: (Domain, Value% / Pts)
+            tuples = []
+            for c in cols:
+                tuples.append((c, "Value %"))
+                tuples.append((c, "Pts"))
+            multi_cols = pd.MultiIndex.from_tuples(tuples, names=["Dominio", "Metric"])
+            combined = pd.DataFrame(index=rows + ["SCORE"], columns=multi_cols, dtype="float")
+
+            for c in cols:
+                combined[(c, "Value %")] = bench_vals[c]
+                combined[(c, "Pts")] = bench_pts[c]
+
+            # Render
+            st.dataframe(combined, use_container_width=True)
+            st.caption("Ogni riga mostra sia il **valore (%)** sia il **contributo pesato (Pts)**. La riga **SCORE** è la somma dei contributi sopra.")
+
+            # Export
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                bench_vals.to_excel(writer, sheet_name="Benchmark_Values", index=True)
+                bench_pts.to_excel(writer, sheet_name="Benchmark_WeightedPts", index=True)
+                combined.to_excel(writer, sheet_name="Benchmark_Combined", index=True)
+            st.download_button("📥 Scarica benchmark (valori + contributi)", buffer.getvalue(), file_name="benchmark_with_contributions.xlsx")
