@@ -81,12 +81,14 @@ else:
             lines = lines[:MAX_ROWS]
         domains_raw = lines
 
-# Normalizzazione + dedup
-domains_norm = [normalize_domain(d) for d in domains_raw]
-domains_norm = [d for d in domains_norm if d]  # rimuovi vuoti
-domains = sorted(set(domains_norm))            # dedup + ordina
+# === Normalizzazione mantenendo l'input originale ===
+# pairs: lista di tuple (input_originale, dominio_normalizzato)
+pairs = [(raw, normalize_domain(raw)) for raw in domains_raw]
 
-st.write(f"**Domini unici dopo normalizzazione:** {len(domains)}")
+# domini normalizzati unici (per chiamate al modello)
+unique_norm_domains = sorted(set([n for _, n in pairs if n]))
+
+st.write(f"**Domini unici dopo normalizzazione (usati per la classificazione):** {len(unique_norm_domains)}")
 
 # Metodo di definizione etichette
 label_mode = st.radio("🏷️ Come vuoi fornire le etichette?", ["Inserimento manuale", "Usa file predefinito category_domain.txt"])
@@ -115,13 +117,13 @@ model_choice = st.selectbox("🤖 Seleziona il modello OpenAI da utilizzare", ["
 batch_size = st.slider("📦 Dimensione batch (domini per richiesta)", min_value=5, max_value=200, value=50, step=5)
 
 # ===================== STIMA TOKEN (indicativa) =====================
-if domains and labels:
+if unique_norm_domains and labels:
     st.markdown("---")
     st.subheader("📈 Stima preliminare dei token (indicativa)")
     avg_prompt_tokens_per_domain = 10
     labels_tokens = len(" ".join(labels).split()) + 5
-    estimated_prompt = (labels_tokens + avg_prompt_tokens_per_domain) * len(domains)
-    estimated_completion = 4 * len(domains)  # risposte brevi (solo etichetta)
+    estimated_prompt = (labels_tokens + avg_prompt_tokens_per_domain) * len(unique_norm_domains)
+    estimated_completion = 4 * len(unique_norm_domains)  # risposte brevi (solo etichetta)
     estimated_total = estimated_prompt + estimated_completion
     st.markdown(f"🔢 **Token stimati:** Prompt: `{estimated_prompt}`, Completion: `{estimated_completion}`, Totale: `{estimated_total}`")
     if model_choice == "gpt-4o":
@@ -138,9 +140,8 @@ if domains and labels:
 confirm_run = st.checkbox("✅ Conferma e avvia la classificazione")
 
 # ===================== RUN =====================
-if domains and labels and api_key and confirm_run:
+if unique_norm_domains and labels and api_key and confirm_run:
     client = OpenAI(api_key=api_key)
-    results = []
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
@@ -150,11 +151,13 @@ if domains and labels and api_key and confirm_run:
         "dall'elenco fornito. Rispondi SOLO con righe 'dominio, categoria' in CSV, nell'ordine dato."
     )
 
+    results_map = {}  # mappa dominio_normalizzato -> cluster
+
     with st.spinner("🔍 Sto classificando i domini..."):
         st.markdown("---")
         st.markdown("### 🧭 Avanzamento della classificazione")
 
-        for idx, dom_batch in enumerate(batch(domains, batch_size), 1):
+        for idx, dom_batch in enumerate(batch(unique_norm_domains, batch_size), 1):
             st.markdown(f"➡️ **Batch {idx}**: {len(dom_batch)} domini")
             user_prompt = (
                 f"Categorie disponibili: {', '.join(labels)}.\n"
@@ -187,14 +190,17 @@ if domains and labels and api_key and confirm_run:
                         line = line.replace(";", ",")
                         parts = [p.strip() for p in line.split(",")]
                         if len(parts) >= 2:
-                            d = normalize_domain(parts[0])
+                            d = normalize_domain(parts[0])  # normalizza la chiave di mapping
                             c = parts[1]
                             if d:
                                 parsed.append((d, c))
-                    # Mappa alle richieste; se mancano righe, fallback "Uncategorized"
-                    mapped = {d: c for d, c in parsed}
+                    for d, c in parsed:
+                        results_map[d] = c
+
+                    # fallback per eventuali mancanti in questo batch
                     for d in dom_batch:
-                        results.append((d, mapped.get(d, "Uncategorized")))
+                        if d not in results_map:
+                            results_map[d] = "Uncategorized"
                     break
                 except Exception as e:
                     if attempt < max_attempts - 1:
@@ -202,10 +208,21 @@ if domains and labels and api_key and confirm_run:
                         continue
                     # ultimo tentativo fallito: marca tutto il batch in errore
                     for d in dom_batch:
-                        results.append((d, f"Errore: {e}"))
+                        results_map[d] = f"Errore: {e}"
 
-    output_df = pd.DataFrame(results, columns=["Dominio", "Cluster"])
-    output_df = output_df.sort_values(["Cluster", "Dominio"]).reset_index(drop=True)
+    # Ricostruzione risultati per TUTTE le righe originali (no dedup),
+    # mantenendo l'input esattamente com'è stato fornito
+    results = []
+    for raw, norm in pairs:
+        if norm:
+            cluster = results_map.get(norm, "Uncategorized")
+        else:
+            cluster = "Uncategorized"
+        results.append((raw, norm, cluster))
+
+    output_df = pd.DataFrame(results, columns=["Input", "Dominio", "Cluster"])
+    # Ordinamento per leggibilità nel file finale
+    output_df = output_df.sort_values(["Cluster", "Input"]).reset_index(drop=True)
 
     st.success("✅ Classificazione completata!")
     st.dataframe(output_df.head(500))  # anteprima
