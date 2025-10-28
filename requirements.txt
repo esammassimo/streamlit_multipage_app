@@ -12,3 +12,8 @@ beautifulsoup4
 matplotlib
 XlsxWriter
 matplotlib
+rapidfuzz
+scikit-learn
+urllib3
+gunicorn
+lxml
