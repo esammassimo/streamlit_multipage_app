@@ -19,32 +19,19 @@ def approx_tokens(text: str) -> int:
         return 0
     return max(1, len(text) // 4)
 
-# Limiti prudenziali della context window per i modelli
+# Solo modelli con 128k contesto
 CONTEXT_LIMITS = {
-    "gpt-4": 8192,
-    "gpt-4-0613": 8192,
-    "gpt-4o": 128000,
     "gpt-4o-mini": 128000,
+    "gpt-4o": 128000,
+    "gpt-5": 128000,  # ✅ aggiunto GPT-5
 }
-
-# Soglia massima caratteri per “Fonte” quando si usa GPT-4 (verrà troncata oltre questa soglia)
-GPT4_SOURCE_MAX_CHARS = 8000
-
-def truncate_source_for_gpt4(source_text: str) -> tuple[str, bool]:
-    """Tronca la fonte se troppo lunga per GPT-4 (solo GPT-4). Ritorna (testo, troncato_bool)."""
-    if not source_text:
-        return source_text, False
-    if len(source_text) > GPT4_SOURCE_MAX_CHARS:
-        truncated = source_text[:GPT4_SOURCE_MAX_CHARS] + "\n\n[Nota: fonte troncata per lunghezza]"
-        return truncated, True
-    return source_text, False
 
 def compute_effective_max_tokens(model: str, system_prompt: str, user_prompt: str, desired_max_tokens: int) -> int:
     """Calcola un max_tokens che non superi la context window del modello."""
-    ctx_limit = CONTEXT_LIMITS.get(model, 8192)
+    ctx_limit = CONTEXT_LIMITS.get(model, 128000)
     sys_t = approx_tokens(system_prompt)
     usr_t = approx_tokens(user_prompt)
-    overhead = 200  # margine per token di ruolo e framing
+    overhead = 100  # margine per token di ruolo e framing (ridotto per più spazio alla completion)
     max_allowed_completion = max(256, ctx_limit - (sys_t + usr_t + overhead))
     return max(256, min(desired_max_tokens, max_allowed_completion))
 
@@ -54,18 +41,26 @@ def safe_chat_completion(
     user_prompt: str,
     model: str = "gpt-4o-mini",
     temperature: float = 0.7,
-    desired_max_tokens: int = 1200
+    desired_max_tokens: int = 4000
 ) -> str:
     """
-    Invio robusto a Chat Completions con budgeting e fallback:
+    Invio robusto a Chat Completions con budgeting e retry automatico:
     - Adatta max_tokens al budget disponibile.
-    - In caso di BadRequest (p.es. prompt troppo lungo), riprova con token più bassi.
+    - Se la risposta termina per lunghezza (finish_reason == "length"), rilancia con più token.
+    - Fallback progressivo senza interrompere l'esecuzione dell'app.
     """
     eff_max_tokens = compute_effective_max_tokens(model, system_prompt, user_prompt, desired_max_tokens)
-    attempts = [eff_max_tokens, max(256, eff_max_tokens // 2), 256]
+
+    # Tentativi crescenti: prova, poi raddoppia (entro limiti), poi spingi di più
+    attempt_budgets = [
+        eff_max_tokens,
+        min(eff_max_tokens * 2, 8000),
+        min(eff_max_tokens * 3, 12000),
+    ]
+
     last_err = None
 
-    for mt in attempts:
+    for mt in attempt_budgets:
         try:
             resp = client.chat.completions.create(
                 model=model,
@@ -76,16 +71,49 @@ def safe_chat_completion(
                 temperature=temperature,
                 max_tokens=mt,
             )
-            return resp.choices[0].message.content.strip()
+            content = resp.choices[0].message.content.strip()
+            finish_reason = getattr(resp.choices[0], "finish_reason", "stop") or "stop"
+
+            # Se troncato per lunghezza, passa al prossimo tentativo con più token
+            if finish_reason == "length":
+                continue
+
+            # Heuristica extra: se termina con un taglio sospetto, tenta un giro in più
+            if content and content[-1] in {",", ";", ":"} and mt < 12000:
+                # Prova un nuovo tentativo con più token
+                continue
+
+            return content
+
         except BadRequestError as e:
+            # Prompt troppo lungo o altri errori di validazione -> prova con budget più basso
             last_err = e
-            # ritenta con un budget più basso
+            continue
+        except Exception as e:
+            last_err = e
             continue
 
-    raise RuntimeError(
-        "Il prompt complessivo è troppo lungo per la finestra del modello anche dopo i fallback. "
-        "Riduci la 'Fonte autorevole', il numero minimo di parole o il numero di paragrafi."
-    ) from last_err
+    # Ultimo tentativo "completa" esplicito, rigenerando con istruzione a completare
+    try:
+        resp2 = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": user_prompt
+                              + "\n\nCompleta integralmente senza interromperti, evitando riassunti e senza troncare.",
+                },
+            ],
+            temperature=temperature,
+            max_tokens=min(12000, eff_max_tokens * 3),
+        )
+        return resp2.choices[0].message.content.strip()
+    except Exception as e:
+        raise RuntimeError(
+            "Il prompt complessivo è troppo lungo per la finestra del modello anche dopo i retry. "
+            "Riduci la 'Fonte autorevole', il numero minimo di parole o il numero di paragrafi."
+        ) from (last_err or e)
 
 # =========================
 # 🔐 API Key + Modello
@@ -96,10 +124,17 @@ def get_openai_client_and_model():
         api_key = st.text_input("Insert your OpenAI API KEY", type="password")
         model = st.selectbox(
             "Seleziona il modello",
-            options=["gpt-4o-mini", "gpt-4o", "gpt-4"],
+            options=["gpt-4o-mini", "gpt-4o", "gpt-5"],  # ✅ aggiunto GPT-5
             index=0,
-            help="Consigliato: gpt-4o-mini (più economico e con ampia context window)."
+            help=(
+                "Scegli il modello:\n"
+                "- **gpt-4o-mini** → più economico, ottimo per testi brevi/medi\n"
+                "- **gpt-4o** → bilanciato e veloce\n"
+                "- **gpt-5** → qualità superiore, ideale per testi lunghi"
+            )
         )
+        if model == "gpt-5":
+            st.info("🚀 Stai usando GPT-5: massima qualità e contesto da 128k token.")
         if not api_key:
             st.warning("⚠️ Inserisci la tua API KEY per continuare.")
             st.stop()
@@ -145,17 +180,6 @@ with tab1:
         if not title or not seo_title or not meta_description or not paragraphs:
             st.error("❌ Please fill out all required fields.")
         else:
-            # Gestione troncamento fonte SOLO per GPT-4
-            truncated_now = False
-            effective_source = source_text
-            if selected_model.startswith("gpt-4") and not selected_model.startswith("gpt-4o"):
-                effective_source, truncated_now = truncate_source_for_gpt4(source_text)
-                if truncated_now:
-                    st.warning(
-                        "✂️ La 'Fonte autorevole' è stata troncata perché troppo lunga per GPT-4. "
-                        "Se vuoi evitare il taglio, usa gpt-4o-mini o gpt-4o."
-                    )
-
             st.success(f"📝 Generating article: {title}...")
 
             # Calibrazione parole per paragrafo
@@ -168,7 +192,7 @@ Scrivi un paragrafo con il titolo "{p_title}".
 Il tono deve essere {tone_of_voice.lower()}.
 Il contenuto deve sviluppare questa idea: "{p_desc}".
 Deve contenere almeno {min_words_per_para} parole.
-La fonte seguente può servire da contesto (non citarla): {effective_source}
+La fonte seguente può servire da contesto (non citarla né parafrasarla): {source_text}
                 """.strip()
 
                 # Heuristica token: ~1.6 token per parola in IT
@@ -180,7 +204,7 @@ La fonte seguente può servire da contesto (non citarla): {effective_source}
                         user_prompt=prompt,
                         model=selected_model,
                         temperature=0.7,
-                        desired_max_tokens=min(1100, max(300, target_tokens))
+                        desired_max_tokens=min(6000, max(800, target_tokens))  # ✅ più generoso
                     )
                 except Exception as e:
                     st.error(f"❌ Errore durante la generazione del paragrafo '{p_title}': {e}")
@@ -237,11 +261,10 @@ with tab2:
         else:
             st.success(f"🍽 Generating recipe: {recipe_title}...")
 
-            # Prepariamo i prompt
             intro_prompt = f"""
 Scrivi una breve introduzione per la ricetta "{recipe_title}".
 Il tono deve essere {recipe_tone.lower()}.
-La fonte è solo per contesto (non citarla): {recipe_source}
+La fonte è solo per contesto (non citarla né parafrasarla): {recipe_source}
             """.strip()
 
             prep_prompt = f"""
@@ -264,7 +287,7 @@ Il tono deve essere {recipe_tone.lower()}.
                     user_prompt=intro_prompt,
                     model=selected_model,
                     temperature=0.7,
-                    desired_max_tokens=500
+                    desired_max_tokens=1200  # ✅ budget più comodo
                 )
             except Exception as e:
                 st.error(f"❌ Errore durante la generazione dell'introduzione: {e}")
@@ -277,7 +300,7 @@ Il tono deve essere {recipe_tone.lower()}.
                     user_prompt=prep_prompt,
                     model=selected_model,
                     temperature=0.7,
-                    desired_max_tokens=min(2500, max(400, target_tokens_recipe))
+                    desired_max_tokens=min(8000, max(800, target_tokens_recipe))  # ✅ più generoso
                 )
             except Exception as e:
                 st.error(f"❌ Errore durante la generazione della preparazione: {e}")
