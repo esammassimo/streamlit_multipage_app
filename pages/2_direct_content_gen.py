@@ -22,7 +22,7 @@ def approx_tokens(text: str) -> int:
 CONTEXT_LIMITS = {
     "gpt-4o-mini": 128000,
     "gpt-4o": 128000,
-    "gpt-5": 128000,  # GPT-5 incluso
+    "gpt-5": 128000,
 }
 
 def compute_effective_max_tokens(
@@ -49,13 +49,12 @@ def safe_chat_completion(
 ) -> str:
     """
     Invio robusto a Chat Completions con:
-    - calcolo dinamico max_tokens in base alla context window;
-    - retry automatico se la risposta viene troncata per lunghezza (finish_reason == 'length');
+    - calcolo dinamico max_tokens;
+    - retry automatico se finish_reason == 'length';
     - fallback progressivi senza rompere l'app.
     """
     eff_max_tokens = compute_effective_max_tokens(model, system_prompt, user_prompt, desired_max_tokens)
 
-    # Tentativi con budget crescente
     attempt_budgets = [
         eff_max_tokens,
         min(eff_max_tokens * 2, 8000),
@@ -84,15 +83,15 @@ def safe_chat_completion(
             if finish_reason == "length":
                 continue
 
-            # Heuristica extra: se finisce in modo sospetto e abbiamo ancora margine, riproviamo
+            # Heuristica extra: se finisce male e abbiamo ancora margine, riproviamo
             if content and content[-1] in {",", ";", ":"} and mt < 12000:
                 continue
 
             return content
 
         except BadRequestError as e:
-            # Prompt troppo lungo o errori simili: prova con un budget inferiore
             last_err = e
+            # prompt troppo lungo o simili → si passa al budget successivo (più basso)
             continue
         except Exception as e:
             last_err = e
@@ -123,7 +122,7 @@ def safe_chat_completion(
         ) from (last_err or e)
 
 # =========================
-# 🔐 API Key + Modello
+# 🔐 API Key + Modello (client riusato)
 # =========================
 def get_openai_client_and_model():
     with st.sidebar:
@@ -149,7 +148,12 @@ def get_openai_client_and_model():
             st.warning("⚠️ Inserisci la tua API KEY per continuare.")
             st.stop()
 
-    client = OpenAI(api_key=api_key)
+    # ✅ Riuso del client per evitare troppe connessioni / file aperti
+    if "openai_client" not in st.session_state or st.session_state.get("openai_api_key") != api_key:
+        st.session_state["openai_client"] = OpenAI(api_key=api_key)
+        st.session_state["openai_api_key"] = api_key
+
+    client = st.session_state["openai_client"]
     return client, model
 
 client, selected_model = get_openai_client_and_model()
@@ -209,10 +213,9 @@ with tab1:
         else:
             st.success(f"📝 Generating article: {title}...")
 
-            # Calibrazione parole per paragrafo
             min_words_per_para = max(120, int(min_words // len(paragraphs)))
-
             generated_sections = []
+
             for p_title, p_desc in paragraphs:
                 prompt = f"""
 Scrivi un paragrafo con il titolo "{p_title}".
@@ -235,28 +238,25 @@ La fonte seguente può servire come contesto (non citarla, non copiarla, non par
                         desired_max_tokens=min(6000, max(800, target_tokens)),
                     )
                 except Exception as e:
-                    st.error(
-                        f"❌ Errore durante la generazione del paragrafo '{p_title}': {e}"
-                    )
+                    st.error(f"❌ Errore durante la generazione del paragrafo '{p_title}': {e}")
                     content = ""
 
                 generated_sections.append((p_title, content))
 
-            # 📄 Anteprima del contenuto
+            # 📄 Anteprima
             st.subheader("📖 Anteprima Articolo")
             st.markdown(f"# {title}")
             st.markdown(
                 f"**SEO Title**: {seo_title}\n\n**Meta Description**: {meta_description}"
             )
+
             for p_title, p_text in generated_sections:
                 if p_text:
                     st.markdown(f"## {p_title}\n\n{p_text}")
                 else:
-                    st.markdown(
-                        f"## {p_title}\n\n*Paragrafo non generato per errore.*"
-                    )
+                    st.markdown(f"## {p_title}\n\n*Paragrafo non generato per errore.*")
 
-            # 📁 Esporta in Word (BytesIO, nessun file temporaneo persistente)
+            # 📁 Export Word (BytesIO)
             doc = Document()
             doc.add_heading(title, level=1)
             doc.add_paragraph(f"SEO Title: {seo_title}")
@@ -275,10 +275,7 @@ La fonte seguente può servire come contesto (non citarla, non copiarla, non par
                 "📥 Download Article (.docx)",
                 data=buffer,
                 file_name=f"{title.replace(' ', '_')}.docx",
-                mime=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "wordprocessingml.document"
-                ),
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
 
 # =========================
@@ -324,7 +321,7 @@ with tab2:
             intro_prompt = f"""
 Scrivi una breve introduzione per la ricetta "{recipe_title}".
 Il tono deve essere {recipe_tone.lower()}.
-La fonte è solo per contesto (non citarla, non copiarla, non parafrasarla): 
+La fonte è solo per contesto (non citarla, non copiarla, non parafrasarla direttamente):
 {recipe_source}
             """.strip()
 
@@ -351,9 +348,7 @@ Il tono deve essere {recipe_tone.lower()}.
                     desired_max_tokens=1200,
                 )
             except Exception as e:
-                st.error(
-                    f"❌ Errore durante la generazione dell'introduzione: {e}"
-                )
+                st.error(f"❌ Errore durante la generazione dell'introduzione: {e}")
                 recipe_intro = ""
 
             # Preparazione
@@ -364,14 +359,10 @@ Il tono deve essere {recipe_tone.lower()}.
                     user_prompt=prep_prompt,
                     model=selected_model,
                     temperature=0.7,
-                    desired_max_tokens=min(
-                        8000, max(800, target_tokens_recipe)
-                    ),
+                    desired_max_tokens=min(8000, max(800, target_tokens_recipe)),
                 )
             except Exception as e:
-                st.error(
-                    f"❌ Errore durante la generazione della preparazione: {e}"
-                )
+                st.error(f"❌ Errore durante la generazione della preparazione: {e}")
                 recipe_prep = ""
 
             # 📄 Anteprima
@@ -396,7 +387,7 @@ Il tono deve essere {recipe_tone.lower()}.
                 else "*Preparazione non disponibile per errore.*"
             )
 
-            # 📁 Export Word con BytesIO
+            # 📁 Export Word (BytesIO)
             doc = Document()
             doc.add_heading(recipe_title, level=1)
             doc.add_paragraph(f"Tone of Voice: {recipe_tone}")
@@ -422,8 +413,5 @@ Il tono deve essere {recipe_tone.lower()}.
                 "📥 Download Recipe (.docx)",
                 data=buffer_recipe,
                 file_name=f"{recipe_title.replace(' ', '_')}.docx",
-                mime=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "wordprocessingml.document"
-                ),
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
