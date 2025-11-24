@@ -17,3 +17,4 @@ scikit-learn
 urllib3
 gunicorn
 lxml
+serpapi
