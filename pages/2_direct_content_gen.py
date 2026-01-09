@@ -341,7 +341,7 @@ Il tono deve essere {recipe_tone.lower()}.
             try:
                 recipe_intro = safe_chat_completion(
                     client=client,
-                    system_prompt="Sei un esperto di cucina.",
+                    system_prompt="Sei un esperto di cucina appassionato di temi quali sostenibilità, territorialità e stagionalità degli ingredienti, degli alimenti e dei processi di preparazione.",
                     user_prompt=intro_prompt,
                     model=selected_model,
                     temperature=0.7,
@@ -355,7 +355,7 @@ Il tono deve essere {recipe_tone.lower()}.
             try:
                 recipe_prep = safe_chat_completion(
                     client=client,
-                    system_prompt="Sei un esperto di cucina.",
+                    system_prompt="Sei un esperto di cucina appassionato di temi quali sostenibilità, territorialità e stagionalità degli ingredienti, degli alimenti e dei processi di preparazione.",
                     user_prompt=prep_prompt,
                     model=selected_model,
                     temperature=0.7,
