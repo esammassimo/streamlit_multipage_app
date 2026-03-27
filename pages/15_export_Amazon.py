@@ -1,285 +1,1054 @@
-import time
 import io
+import json
+import time
+from datetime import datetime
+
 import pandas as pd
+import requests
 import streamlit as st
-from serpapi import GoogleSearch
 
-# ==========================
-# FUNZIONI DI BACKEND
-# ==========================
+API_URL = "https://serpapi.com/search.json"
 
-def fetch_youtube_results(query, api_key, hl="it", gl="it"):
-    """
-    Chiama SerpAPI (engine youtube) e restituisce l'array dei risultati video (se presente).
-    """
-    params = {
-        "engine": "youtube",
-        "search_query": query,   # per youtube engine si usa spesso search_query
-        "api_key": api_key,
-        "hl": hl,
-        "gl": gl,
-        "no_cache": False
+
+# =========================================================
+# CONFIG
+# =========================================================
+STANDARD_FIELDS = [
+    "title",
+    "brand",
+    "short_description",
+    "long_description",
+    "bullet_points",
+    "main_image",
+    "price",
+    "old_price",
+    "currency",
+    "availability",
+    "merchant",
+    "seller",
+    "offer",
+    "buybox",
+    "rating",
+    "reviews_count",
+    "amazon_url",
+]
+
+MARKETPLACES = [
+    "amazon.it",
+    "amazon.de",
+    "amazon.fr",
+    "amazon.es",
+    "amazon.co.uk",
+    "amazon.com",
+]
+
+FIELD_LABELS = {
+    "title": "Titolo",
+    "brand": "Brand",
+    "short_description": "Descrizione breve",
+    "long_description": "Descrizione lunga",
+    "bullet_points": "Bullet point",
+    "main_image": "Immagine principale",
+    "price": "Prezzo",
+    "old_price": "Prezzo barrato",
+    "currency": "Valuta",
+    "availability": "Disponibilità",
+    "merchant": "Merchant",
+    "seller": "Seller",
+    "offer": "Offerta / coupon",
+    "buybox": "Buy Box",
+    "rating": "Rating",
+    "reviews_count": "Numero recensioni",
+    "amazon_url": "URL Amazon",
+}
+
+
+# =========================================================
+# SESSION STATE
+# =========================================================
+def init_session_state():
+    defaults = {
+        "serpapi_key": "",
+        "uploaded_file_name": None,
+        "input_df": None,
+        "sheet_names": [],
+        "selected_sheet": None,
+        "asin_column": None,
+        "asin_list": [],
+        "amazon_domain": "amazon.it",
+        "delay_seconds": 1.0,
+        "deduplicate_asins": True,
+        "show_logs": True,
+        "save_raw_json": False,
+        "show_image_preview": True,
+        "selected_fields": STANDARD_FIELDS.copy(),
+        "results_df": None,
+        "raw_results": [],
+        "run_completed": False,
     }
-    search = GoogleSearch(params)
-    results = search.get_dict()
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-    # SerpAPI può usare chiavi diverse a seconda del response schema:
-    # - video_results
-    # - organic_results
-    # - results
-    return (
-        results.get("video_results")
-        or results.get("organic_results")
-        or results.get("results")
-        or []
+
+# =========================================================
+# HELPER GENERICI
+# =========================================================
+def safe_str(value):
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def get_nested(data, *keys, default=None):
+    current = data
+    for key in keys:
+        if isinstance(current, dict):
+            current = current.get(key, default)
+        else:
+            return default
+    return current
+
+
+def first_non_empty(values, default=""):
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, list) and len(value) > 0:
+            return value
+        if isinstance(value, dict) and len(value) > 0:
+            return value
+    return default
+
+
+def normalize_asin(value):
+    asin = safe_str(value).upper()
+    asin = asin.replace(" ", "")
+    return asin
+
+
+def list_to_pipe_text(items):
+    if not items:
+        return ""
+    cleaned = []
+    for item in items:
+        if isinstance(item, dict):
+            text = first_non_empty(
+                [
+                    item.get("text"),
+                    item.get("title"),
+                    item.get("name"),
+                    item.get("value"),
+                ],
+                default="",
+            )
+            if text:
+                cleaned.append(safe_str(text))
+        else:
+            text = safe_str(item)
+            if text:
+                cleaned.append(text)
+    return " | ".join(cleaned)
+
+
+def number_from_any(value):
+    if value is None or value == "":
+        return ""
+    if isinstance(value, (int, float)):
+        return value
+    text = safe_str(value).replace(",", ".")
+    filtered = "".join(ch for ch in text if ch.isdigit() or ch == ".")
+    if filtered.count(".") > 1:
+        first_dot = filtered.find(".")
+        filtered = filtered[: first_dot + 1] + filtered[first_dot + 1 :].replace(".", "")
+    try:
+        return float(filtered)
+    except Exception:
+        return safe_str(value)
+
+
+def json_dumps_safe(data):
+    try:
+        return json.dumps(data, ensure_ascii=False)
+    except Exception:
+        return ""
+
+
+# =========================================================
+# INPUT FILE
+# =========================================================
+def load_input_file(uploaded_file):
+    """
+    Restituisce:
+    - df preview / default
+    - sheet_names (solo per Excel)
+    - file_type ('csv' o 'xlsx')
+    """
+    file_name = uploaded_file.name.lower()
+    file_bytes = uploaded_file.getvalue()
+
+    if file_name.endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(file_bytes))
+        return df, [], "csv"
+
+    if file_name.endswith(".xlsx"):
+        xls = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
+        first_sheet = xls.sheet_names[0]
+        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=first_sheet, engine="openpyxl")
+        return df, xls.sheet_names, "xlsx"
+
+    raise ValueError("Formato file non supportato. Usa CSV o XLSX.")
+
+
+def read_dataframe_from_uploaded_file(uploaded_file, selected_sheet=None):
+    file_name = uploaded_file.name.lower()
+    file_bytes = uploaded_file.getvalue()
+
+    if file_name.endswith(".csv"):
+        return pd.read_csv(io.BytesIO(file_bytes))
+
+    if file_name.endswith(".xlsx"):
+        if not selected_sheet:
+            raise ValueError("Seleziona un foglio Excel.")
+        return pd.read_excel(io.BytesIO(file_bytes), sheet_name=selected_sheet, engine="openpyxl")
+
+    raise ValueError("Formato file non supportato. Usa CSV o XLSX.")
+
+
+def extract_asins_from_df(df, asin_column, deduplicate=True):
+    if asin_column not in df.columns:
+        raise ValueError(f"La colonna '{asin_column}' non esiste nel file.")
+
+    raw_values = df[asin_column].dropna().tolist()
+    cleaned = [normalize_asin(v) for v in raw_values]
+    cleaned = [x for x in cleaned if x]
+
+    duplicates_removed = 0
+    if deduplicate:
+        original_count = len(cleaned)
+        cleaned = list(dict.fromkeys(cleaned))
+        duplicates_removed = original_count - len(cleaned)
+
+    return cleaned, duplicates_removed
+
+
+# =========================================================
+# SERPAPI
+# =========================================================
+def get_amazon_product_data(asin, api_key, amazon_domain="amazon.it"):
+    params = {
+        "engine": "amazon_product",
+        "api_key": api_key,
+        "amazon_domain": amazon_domain,
+        "asin": asin,
+        "output": "json",
+    }
+
+    response = requests.get(API_URL, params=params, timeout=60)
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Errore API per ASIN {asin} - HTTP {response.status_code}: {response.text[:300]}"
+        )
+
+    data = response.json()
+
+    if "error" in data:
+        raise RuntimeError(f"Errore API per ASIN {asin}: {data['error']}")
+
+    return data
+
+
+def parse_price_info(product_results, root_data):
+    candidate_prices = [
+        get_nested(product_results, "buybox_winner", "price", "value"),
+        get_nested(product_results, "buybox_winner", "price", "raw"),
+        get_nested(product_results, "buybox_winner", "price"),
+        get_nested(product_results, "featured_offer", "price", "value"),
+        get_nested(product_results, "featured_offer", "price"),
+        get_nested(product_results, "price", "value"),
+        get_nested(product_results, "price"),
+        get_nested(root_data, "price", "value"),
+        get_nested(root_data, "price"),
+    ]
+
+    price = first_non_empty(candidate_prices, default="")
+
+    old_price_candidates = [
+        get_nested(product_results, "buybox_winner", "old_price", "value"),
+        get_nested(product_results, "buybox_winner", "old_price"),
+        get_nested(product_results, "featured_offer", "old_price", "value"),
+        get_nested(product_results, "featured_offer", "old_price"),
+        get_nested(product_results, "old_price", "value"),
+        get_nested(product_results, "old_price"),
+    ]
+    old_price = first_non_empty(old_price_candidates, default="")
+
+    currency_candidates = [
+        get_nested(product_results, "buybox_winner", "price", "currency"),
+        get_nested(product_results, "featured_offer", "price", "currency"),
+        get_nested(product_results, "price", "currency"),
+        get_nested(root_data, "price", "currency"),
+    ]
+    currency = first_non_empty(currency_candidates, default="")
+
+    prices_list = first_non_empty(
+        [
+            get_nested(product_results, "prices"),
+            get_nested(root_data, "prices"),
+        ],
+        default=[],
+    )
+    if not price and isinstance(prices_list, list) and prices_list:
+        first_price_item = prices_list[0]
+        if isinstance(first_price_item, dict):
+            price = first_non_empty(
+                [
+                    first_price_item.get("value"),
+                    first_price_item.get("price"),
+                    first_price_item.get("raw"),
+                    first_price_item.get("text"),
+                ],
+                default="",
+            )
+            if not old_price:
+                old_price = first_non_empty(
+                    [
+                        first_price_item.get("old_price"),
+                        get_nested(first_price_item, "old_price", "value"),
+                    ],
+                    default="",
+                )
+            if not currency:
+                currency = first_non_empty(
+                    [
+                        first_price_item.get("currency"),
+                        get_nested(first_price_item, "price", "currency"),
+                    ],
+                    default="",
+                )
+
+    return price, old_price, currency
+
+
+def parse_bullets(product_results, root_data):
+    bullets = first_non_empty(
+        [
+            get_nested(product_results, "feature_bullets"),
+            get_nested(product_results, "features"),
+            get_nested(product_results, "about_this_item"),
+            get_nested(root_data, "feature_bullets"),
+        ],
+        default=[],
+    )
+
+    if isinstance(bullets, list):
+        return list_to_pipe_text(bullets)
+
+    if isinstance(bullets, str):
+        return bullets.strip()
+
+    return ""
+
+
+def parse_short_description(product_results, root_data):
+    short_desc = first_non_empty(
+        [
+            get_nested(product_results, "short_description"),
+            get_nested(product_results, "subtitle"),
+            get_nested(root_data, "short_description"),
+        ],
+        default="",
+    )
+
+    if short_desc:
+        return safe_str(short_desc)
+
+    bullet_text = parse_bullets(product_results, root_data)
+    if bullet_text:
+        first_bullet = bullet_text.split(" | ")[0]
+        return first_bullet.strip()
+
+    return ""
+
+
+def parse_long_description(product_results, root_data):
+    long_desc = first_non_empty(
+        [
+            get_nested(product_results, "description"),
+            get_nested(product_results, "product_description"),
+            get_nested(root_data, "description"),
+            get_nested(root_data, "product_description"),
+        ],
+        default="",
+    )
+
+    if isinstance(long_desc, list):
+        return list_to_pipe_text(long_desc)
+
+    if isinstance(long_desc, dict):
+        return list_to_pipe_text(long_desc.values())
+
+    return safe_str(long_desc)
+
+
+def parse_main_image(product_results, root_data):
+    image = first_non_empty(
+        [
+            get_nested(product_results, "main_image"),
+            get_nested(product_results, "thumbnail"),
+            get_nested(product_results, "images", 0),
+            get_nested(root_data, "main_image"),
+            get_nested(root_data, "images", 0),
+        ],
+        default="",
+    )
+
+    if isinstance(image, dict):
+        return first_non_empty(
+            [
+                image.get("link"),
+                image.get("image"),
+                image.get("url"),
+                image.get("thumbnail"),
+            ],
+            default="",
+        )
+
+    return safe_str(image)
+
+
+def parse_availability(product_results, root_data):
+    return safe_str(
+        first_non_empty(
+            [
+                get_nested(product_results, "availability", "status"),
+                get_nested(product_results, "availability"),
+                get_nested(product_results, "stock"),
+                get_nested(root_data, "availability"),
+            ],
+            default="",
+        )
     )
 
 
-def read_keywords_from_excel(file_obj, column_name="Keyword"):
-    """
-    Legge le parole chiave dal file Excel nella colonna specificata.
-    file_obj può essere sia un path che un file caricato da Streamlit.
-    """
-    df_keywords = pd.read_excel(file_obj, usecols=[column_name])
-    keywords = df_keywords[column_name].dropna().astype(str).tolist()
-    return keywords
+def parse_merchant_and_seller(product_results, root_data):
+    merchant = first_non_empty(
+        [
+            get_nested(product_results, "buybox_winner", "merchant_info"),
+            get_nested(product_results, "buybox_winner", "merchant"),
+            get_nested(product_results, "featured_offer", "merchant_info"),
+            get_nested(product_results, "featured_offer", "merchant"),
+            get_nested(product_results, "merchant_info"),
+            get_nested(product_results, "merchant"),
+        ],
+        default="",
+    )
+
+    seller = first_non_empty(
+        [
+            get_nested(product_results, "buybox_winner", "seller", "name"),
+            get_nested(product_results, "buybox_winner", "seller"),
+            get_nested(product_results, "featured_offer", "seller", "name"),
+            get_nested(product_results, "featured_offer", "seller"),
+            get_nested(product_results, "seller", "name"),
+            get_nested(product_results, "seller"),
+            get_nested(root_data, "seller", "name"),
+            get_nested(root_data, "seller"),
+        ],
+        default="",
+    )
+
+    if isinstance(merchant, dict):
+        merchant = first_non_empty(
+            [merchant.get("name"), merchant.get("text"), merchant.get("value")],
+            default="",
+        )
+
+    if isinstance(seller, dict):
+        seller = first_non_empty(
+            [seller.get("name"), seller.get("text"), seller.get("value")],
+            default="",
+        )
+
+    return safe_str(merchant), safe_str(seller)
 
 
-def scrape_youtube_to_dataframe(keywords, api_key, sleep_seconds=1.0, hl="it", gl="it", max_results_per_keyword=None):
-    """
-    Esegue la ricerca YouTube per una lista di keyword e restituisce un DataFrame.
-    max_results_per_keyword: se None prende tutti quelli restituiti da SerpAPI, altrimenti limita.
-    """
-    data = []
+def parse_offer(product_results, root_data):
+    promo = first_non_empty(
+        [
+            get_nested(product_results, "coupon"),
+            get_nested(product_results, "coupons"),
+            get_nested(product_results, "promotions"),
+            get_nested(product_results, "special_offers"),
+            get_nested(root_data, "coupon"),
+            get_nested(root_data, "promotions"),
+        ],
+        default="",
+    )
+
+    if isinstance(promo, list):
+        return list_to_pipe_text(promo)
+    if isinstance(promo, dict):
+        return list_to_pipe_text(promo.values())
+
+    return safe_str(promo)
+
+
+def parse_buybox(product_results, root_data):
+    has_buybox = any(
+        [
+            bool(get_nested(product_results, "buybox_winner")),
+            bool(get_nested(product_results, "featured_offer")),
+            bool(get_nested(product_results, "buybox")),
+            bool(get_nested(root_data, "buybox_winner")),
+        ]
+    )
+    return "Yes" if has_buybox else "No"
+
+
+def parse_rating_and_reviews(product_results, root_data):
+    rating = first_non_empty(
+        [
+            get_nested(product_results, "rating"),
+            get_nested(root_data, "rating"),
+        ],
+        default="",
+    )
+
+    reviews_count = first_non_empty(
+        [
+            get_nested(product_results, "reviews"),
+            get_nested(product_results, "reviews_count"),
+            get_nested(product_results, "ratings_total"),
+            get_nested(root_data, "reviews"),
+            get_nested(root_data, "reviews_count"),
+        ],
+        default="",
+    )
+
+    return rating, reviews_count
+
+
+def parse_brand(product_results, root_data):
+    brand = first_non_empty(
+        [
+            get_nested(product_results, "brand"),
+            get_nested(product_results, "manufacturer"),
+            get_nested(root_data, "brand"),
+            get_nested(root_data, "manufacturer"),
+        ],
+        default="",
+    )
+
+    if isinstance(brand, dict):
+        brand = first_non_empty(
+            [brand.get("name"), brand.get("text"), brand.get("value")],
+            default="",
+        )
+
+    return safe_str(brand)
+
+
+def parse_amazon_url(root_data, asin, amazon_domain):
+    url = first_non_empty(
+        [
+            get_nested(root_data, "search_metadata", "amazon_product_url"),
+            get_nested(root_data, "product_results", "link"),
+            get_nested(root_data, "product_results", "url"),
+            get_nested(root_data, "link"),
+        ],
+        default="",
+    )
+
+    if url:
+        return safe_str(url)
+
+    return f"https://{amazon_domain}/dp/{asin}"
+
+
+def parse_product_data(data, asin, amazon_domain="amazon.it", selected_fields=None, save_raw_json=False):
+    selected_fields = selected_fields or STANDARD_FIELDS
+    product_results = data.get("product_results", data)
+
+    row = {
+        "ASIN": asin,
+        "Marketplace": amazon_domain,
+        "Status": "OK",
+        "Error": "",
+        "Extraction Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    title = safe_str(
+        first_non_empty(
+            [
+                get_nested(product_results, "title"),
+                get_nested(data, "title"),
+            ],
+            default="",
+        )
+    )
+    brand = parse_brand(product_results, data)
+    short_description = parse_short_description(product_results, data)
+    long_description = parse_long_description(product_results, data)
+    bullet_points = parse_bullets(product_results, data)
+    main_image = parse_main_image(product_results, data)
+    price, old_price, currency = parse_price_info(product_results, data)
+    availability = parse_availability(product_results, data)
+    merchant, seller = parse_merchant_and_seller(product_results, data)
+    offer = parse_offer(product_results, data)
+    buybox = parse_buybox(product_results, data)
+    rating, reviews_count = parse_rating_and_reviews(product_results, data)
+    amazon_url = parse_amazon_url(data, asin, amazon_domain)
+
+    field_values = {
+        "title": title,
+        "brand": brand,
+        "short_description": short_description,
+        "long_description": long_description,
+        "bullet_points": bullet_points,
+        "main_image": main_image,
+        "price": price,
+        "old_price": old_price,
+        "currency": currency,
+        "availability": availability,
+        "merchant": merchant,
+        "seller": seller,
+        "offer": offer,
+        "buybox": buybox,
+        "rating": rating,
+        "reviews_count": reviews_count,
+        "amazon_url": amazon_url,
+    }
+
+    for field in selected_fields:
+        row[FIELD_LABELS[field]] = field_values.get(field, "")
+
+    if save_raw_json:
+        row["Raw JSON"] = json_dumps_safe(data)
+
+    return row
+
+
+def process_asin_list(
+    asins,
+    api_key,
+    amazon_domain,
+    selected_fields,
+    delay_seconds=1.0,
+    show_logs=True,
+    save_raw_json=False,
+):
+    rows = []
+    raw_results = []
 
     progress_bar = st.progress(0)
-    status_text = st.empty()
-    total = len(keywords)
+    status_placeholder = st.empty()
+    log_placeholder = st.empty()
 
-    for idx, keyword in enumerate(keywords, start=1):
-        status_text.write(f"🔍 Ricerca YouTube per: **{keyword}** ({idx}/{total})")
+    total = len(asins)
+    log_lines = []
+
+    for idx, asin in enumerate(asins, start=1):
+        status_placeholder.write(f"🔍 Elaboro ASIN **{asin}** ({idx}/{total})")
 
         try:
-            results = fetch_youtube_results(keyword, api_key=api_key, hl=hl, gl=gl)
+            data = get_amazon_product_data(
+                asin=asin,
+                api_key=api_key,
+                amazon_domain=amazon_domain,
+            )
+            row = parse_product_data(
+                data=data,
+                asin=asin,
+                amazon_domain=amazon_domain,
+                selected_fields=selected_fields,
+                save_raw_json=save_raw_json,
+            )
+            rows.append(row)
 
-            if results:
-                if max_results_per_keyword is not None:
-                    results = results[:max_results_per_keyword]
+            if save_raw_json:
+                raw_results.append({"asin": asin, "data": data})
 
-                for pos, item in enumerate(results, start=1):
-                    # Parsing robusto (chiavi comuni in SerpAPI YouTube)
-                    title = item.get("title", "")
-                    link = item.get("link", "") or item.get("video_link", "")
-                    video_id = item.get("video_id", "") or item.get("id", "")
+            if show_logs:
+                log_lines.append(f"✅ {asin} - OK")
 
-                    channel = (
-                        item.get("channel", "")
-                        or item.get("author", "")
-                        or (item.get("channel", {}) or {}).get("name", "")
-                        or (item.get("author", {}) or {}).get("name", "")
-                    )
+        except Exception as exc:
+            error_message = safe_str(exc)
+            error_row = {
+                "ASIN": asin,
+                "Marketplace": amazon_domain,
+                "Status": "ERROR",
+                "Error": error_message,
+                "Extraction Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
 
-                    views = item.get("views", "") or item.get("view_count", "")
-                    published_date = item.get("published_date", "") or item.get("published_time", "")
-                    duration = item.get("duration", "") or item.get("length", "")
+            for field in selected_fields:
+                error_row[FIELD_LABELS[field]] = ""
 
-                    description = item.get("description", "") or item.get("snippet", "")
+            if save_raw_json:
+                error_row["Raw JSON"] = ""
 
-                    thumbnail = ""
-                    thumbs = item.get("thumbnails") or item.get("thumbnail") or item.get("thumbnail_url")
-                    if isinstance(thumbs, list) and len(thumbs) > 0:
-                        thumbnail = thumbs[0].get("url", "") if isinstance(thumbs[0], dict) else str(thumbs[0])
-                    elif isinstance(thumbs, dict):
-                        thumbnail = thumbs.get("url", "")
-                    elif isinstance(thumbs, str):
-                        thumbnail = thumbs
+            rows.append(error_row)
 
-                    data.append({
-                        "keyword": keyword,
-                        "position": item.get("position", pos),
-                        "title": title,
-                        "link": link,
-                        "video_id": video_id,
-                        "channel": channel,
-                        "views": views,
-                        "published_date": published_date,
-                        "duration": duration,
-                        "description": description,
-                        "thumbnail": thumbnail
-                    })
-
-                st.write(f"✅ {len(results)} risultati trovati per **{keyword}**.")
-            else:
-                st.write(f"⚠️ Nessun risultato trovato per **{keyword}**.")
-
-        except Exception as e:
-            st.error(f"❌ Errore durante la ricerca per '{keyword}': {e}")
+            if show_logs:
+                log_lines.append(f"❌ {asin} - {error_message}")
 
         progress_bar.progress(idx / total)
-        time.sleep(sleep_seconds)
 
-    status_text.write("✅ Elaborazione completata.")
-    df_results = pd.DataFrame(data)
-    return df_results
+        if show_logs:
+            log_placeholder.text("\n".join(log_lines[-15:]))
+
+        if delay_seconds > 0 and idx < total:
+            time.sleep(delay_seconds)
+
+    status_placeholder.write("✅ Estrazione completata.")
+    df = pd.DataFrame(rows)
+    return df, raw_results
 
 
-def dataframe_to_excel_bytes(df, sheet_name="YouTube_Search"):
-    """
-    Converte un DataFrame in un file Excel in memoria (BytesIO) pronto per il download.
-    """
+# =========================================================
+# EXPORT
+# =========================================================
+def dataframe_to_csv_bytes(df):
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
+def dataframe_to_excel_bytes(df, sheet_name="Amazon_ASIN"):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
+
+        workbook = writer.book
+        worksheet = writer.sheets[sheet_name]
+
+        header_format = workbook.add_format({"bold": True, "text_wrap": True})
+        wrap_format = workbook.add_format({"text_wrap": True, "valign": "top"})
+
+        for col_num, value in enumerate(df.columns.values):
+            worksheet.write(0, col_num, value, header_format)
+            max_len = max(
+                len(str(value)),
+                df.iloc[:, col_num].astype(str).map(len).max() if not df.empty else 10,
+            )
+            worksheet.set_column(col_num, col_num, min(max(max_len + 2, 15), 50), wrap_format)
+
+        worksheet.freeze_panes(1, 0)
+
     output.seek(0)
     return output
 
 
-# ==========================
-# PAGINE DELL'APP
-# ==========================
+# =========================================================
+# UI FASES
+# =========================================================
+def render_phase_1_api_config():
+    st.header("Fase 1 · Configurazione API")
 
-def page_config():
-    st.title("🔑 Configurazione API SerpAPI (YouTube Search)")
-
-    st.write(
-        """
-        Inserisci la tua **API key di SerpAPI**.  
-        Verrà usata per le richieste al motore **YouTube**.
-        """
-    )
-
-    api_key = st.text_input(
-        "SerpAPI API Key",
-        type="password",
-        value=st.session_state.get("yt_api_key", "")
-    )
-
-    if api_key:
-        st.session_state["yt_api_key"] = api_key
-        st.success("API key salvata in sessione.")
-    else:
-        st.info("Inserisci la tua API key per iniziare.")
-
-
-def page_scraping():
-    st.title("📥 Upload file & Scraping YouTube Search Results")
-
-    api_key = st.session_state.get("yt_api_key")
-    if not api_key:
-        st.warning("⚠️ Prima imposta la tua SerpAPI API key nella pagina **Configurazione**.")
-        return
-
-    st.write(
-        """
-        Carica un file Excel con la colonna **Keyword**  
-        che contiene le query per cui vuoi estrarre i **risultati di ricerca YouTube**.
-        """
-    )
-
-    uploaded_file = st.file_uploader("Carica file Excel (.xlsx)", type=["xlsx"])
-
-    if uploaded_file is not None:
-        column_name = st.text_input("Nome colonna che contiene le keyword", value="Keyword")
-
-        sleep_seconds = st.slider(
-            "Delay tra le richieste (sec) – per sicurezza verso i limiti API",
-            min_value=0.0,
-            max_value=5.0,
-            value=1.0,
-            step=0.5
+    with st.container(border=True):
+        st.write("Inserisci la tua **SerpAPI API Key** per abilitare l’estrazione.")
+        api_key = st.text_input(
+            "SerpAPI API Key",
+            type="password",
+            value=st.session_state.get("serpapi_key", ""),
+            help="La chiave viene salvata nella sessione Streamlit.",
         )
 
-        max_results = st.number_input(
-            "Max risultati per keyword (0 = tutti quelli restituiti da SerpAPI)",
-            min_value=0,
-            max_value=100,
-            value=0,
-            step=5
+        if st.button("Salva configurazione API", use_container_width=True):
+            st.session_state["serpapi_key"] = api_key.strip()
+            if st.session_state["serpapi_key"]:
+                st.success("API key salvata in sessione.")
+            else:
+                st.warning("Inserisci una API key valida.")
+
+        if st.session_state.get("serpapi_key"):
+            st.success("Configurazione API disponibile.")
+        else:
+            st.info("Configura la API key per proseguire.")
+
+
+def render_phase_2_upload_input():
+    st.header("Fase 2 · Upload input file")
+
+    with st.container(border=True):
+        uploaded_file = st.file_uploader(
+            "Carica un file CSV o XLSX con gli ASIN",
+            type=["csv", "xlsx"],
         )
-        max_results_per_keyword = None if max_results == 0 else int(max_results)
 
-        hl = st.text_input("hl (lingua interfaccia)", value="it")
-        gl = st.text_input("gl (paese)", value="it")
+        if uploaded_file is None:
+            st.info("Carica un file per vedere anteprima e selezionare la colonna ASIN.")
+            return
 
-        if st.button("🚀 Avvia scraping YouTube"):
+        try:
+            preview_df, sheet_names, file_type = load_input_file(uploaded_file)
+            st.session_state["uploaded_file_name"] = uploaded_file.name
+            st.session_state["sheet_names"] = sheet_names
+
+            if file_type == "xlsx":
+                selected_sheet = st.selectbox(
+                    "Seleziona il foglio Excel",
+                    options=sheet_names,
+                    index=0,
+                )
+                st.session_state["selected_sheet"] = selected_sheet
+                preview_df = read_dataframe_from_uploaded_file(uploaded_file, selected_sheet=selected_sheet)
+            else:
+                st.session_state["selected_sheet"] = None
+
+            st.session_state["input_df"] = preview_df
+
+            st.write("Anteprima file:")
+            st.dataframe(preview_df.head(20), use_container_width=True)
+
+            asin_column = st.selectbox(
+                "Seleziona la colonna contenente gli ASIN",
+                options=list(preview_df.columns),
+                index=0 if len(preview_df.columns) > 0 else None,
+            )
+            st.session_state["asin_column"] = asin_column
+
+            deduplicate = st.checkbox(
+                "Rimuovi ASIN duplicati",
+                value=st.session_state.get("deduplicate_asins", True),
+            )
+            st.session_state["deduplicate_asins"] = deduplicate
+
+            asins, duplicates_removed = extract_asins_from_df(
+                preview_df,
+                asin_column=asin_column,
+                deduplicate=deduplicate,
+            )
+            st.session_state["asin_list"] = asins
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("ASIN validi", len(asins))
+            col2.metric("Duplicati rimossi", duplicates_removed)
+            col3.metric("File", st.session_state["uploaded_file_name"])
+
+            if asins:
+                st.write("Prime 20 occorrenze ASIN pulite:")
+                st.code("\n".join(asins[:20]))
+            else:
+                st.warning("Nessun ASIN valido trovato nella colonna selezionata.")
+
+        except Exception as exc:
+            st.error(f"Errore nella lettura del file: {exc}")
+
+
+def render_phase_3_extraction_params():
+    st.header("Fase 3 · Parametri di estrazione")
+
+    with st.container(border=True):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            amazon_domain = st.selectbox(
+                "Marketplace Amazon",
+                options=MARKETPLACES,
+                index=MARKETPLACES.index(st.session_state.get("amazon_domain", "amazon.it")),
+            )
+            st.session_state["amazon_domain"] = amazon_domain
+
+            delay_seconds = st.slider(
+                "Delay tra le richieste (secondi)",
+                min_value=0.0,
+                max_value=5.0,
+                value=float(st.session_state.get("delay_seconds", 1.0)),
+                step=0.5,
+            )
+            st.session_state["delay_seconds"] = delay_seconds
+
+        with col2:
+            st.session_state["show_logs"] = st.checkbox(
+                "Mostra log dettagliato",
+                value=st.session_state.get("show_logs", True),
+            )
+            st.session_state["save_raw_json"] = st.checkbox(
+                "Salva risposta JSON grezza nel file finale",
+                value=st.session_state.get("save_raw_json", False),
+            )
+            st.session_state["show_image_preview"] = st.checkbox(
+                "Mostra anteprima immagini nei risultati",
+                value=st.session_state.get("show_image_preview", True),
+            )
+
+        st.subheader("Campi da estrarre")
+
+        default_fields = st.session_state.get("selected_fields", STANDARD_FIELDS.copy())
+        selected_fields = []
+
+        cols = st.columns(3)
+        for idx, field in enumerate(STANDARD_FIELDS):
+            with cols[idx % 3]:
+                checked = st.checkbox(
+                    FIELD_LABELS[field],
+                    value=field in default_fields,
+                    key=f"field_{field}",
+                )
+                if checked:
+                    selected_fields.append(field)
+
+        if st.button("Seleziona tutti i campi standard"):
+            st.session_state["selected_fields"] = STANDARD_FIELDS.copy()
+            st.rerun()
+
+        st.session_state["selected_fields"] = selected_fields
+
+        if not selected_fields:
+            st.warning("Seleziona almeno un campo da estrarre.")
+        else:
+            st.success(f"Campi selezionati: {len(selected_fields)}")
+
+
+def render_phase_4_extraction():
+    st.header("Fase 4 · Estrazione e preparazione file")
+
+    with st.container(border=True):
+        api_key = st.session_state.get("serpapi_key", "").strip()
+        input_df = st.session_state.get("input_df")
+        asins = st.session_state.get("asin_list", [])
+        selected_fields = st.session_state.get("selected_fields", [])
+        amazon_domain = st.session_state.get("amazon_domain", "amazon.it")
+        delay_seconds = st.session_state.get("delay_seconds", 1.0)
+        show_logs = st.session_state.get("show_logs", True)
+        save_raw_json = st.session_state.get("save_raw_json", False)
+
+        checks = {
+            "API key configurata": bool(api_key),
+            "File caricato": input_df is not None,
+            "ASIN disponibili": len(asins) > 0,
+            "Campi selezionati": len(selected_fields) > 0,
+        }
+
+        for label, ok in checks.items():
+            if ok:
+                st.success(label)
+            else:
+                st.error(label)
+
+        if st.button("🚀 Avvia estrazione", use_container_width=True):
+            if not all(checks.values()):
+                st.warning("Completa prima tutte le fasi precedenti.")
+                return
+
             try:
-                keywords = read_keywords_from_excel(uploaded_file, column_name=column_name)
-                if not keywords:
-                    st.warning("Nessuna keyword trovata nella colonna indicata.")
-                    return
-
-                st.write(f"Trovate **{len(keywords)}** keyword. Inizio elaborazione…")
-
-                df_results = scrape_youtube_to_dataframe(
-                    keywords=keywords,
+                results_df, raw_results = process_asin_list(
+                    asins=asins,
                     api_key=api_key,
-                    sleep_seconds=sleep_seconds,
-                    hl=hl,
-                    gl=gl,
-                    max_results_per_keyword=max_results_per_keyword
+                    amazon_domain=amazon_domain,
+                    selected_fields=selected_fields,
+                    delay_seconds=delay_seconds,
+                    show_logs=show_logs,
+                    save_raw_json=save_raw_json,
                 )
 
-                st.session_state["youtube_df"] = df_results
+                st.session_state["results_df"] = results_df
+                st.session_state["raw_results"] = raw_results
+                st.session_state["run_completed"] = True
 
-                st.success("Scraping completato. Vai alla pagina **Risultati** per esportare l'Excel.")
-                if not df_results.empty:
-                    st.dataframe(df_results.head())
-                else:
-                    st.info("Nessun risultato trovato per le keyword fornite.")
-            except Exception as e:
-                st.error(f"Errore durante lo scraping: {e}")
-    else:
-        st.info("Carica un file Excel per procedere.")
+                ok_count = int((results_df["Status"] == "OK").sum()) if "Status" in results_df.columns else 0
+                err_count = int((results_df["Status"] == "ERROR").sum()) if "Status" in results_df.columns else 0
 
+                st.success(f"Estrazione completata. OK: {ok_count} · ERROR: {err_count}")
+                st.dataframe(results_df.head(20), use_container_width=True)
 
-def page_results():
-    st.title("📊 Risultati & Download YouTube Search")
-
-    df = st.session_state.get("youtube_df")
-
-    if df is None:
-        st.info("Nessun risultato disponibile. Esegui prima lo scraping nella pagina **Upload & Scraping**.")
-        return
-
-    st.write("Anteprima risultati:")
-    st.dataframe(df)
-
-    default_filename = "YouTube_search_export.xlsx"
-    filename = st.text_input("Nome file di output", value=default_filename)
-
-    excel_bytes = dataframe_to_excel_bytes(df, sheet_name="YouTube_Search")
-
-    st.download_button(
-        label="💾 Scarica Excel con risultati YouTube",
-        data=excel_bytes,
-        file_name=filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+            except Exception as exc:
+                st.error(f"Errore durante l’estrazione: {exc}")
 
 
-# ==========================
-# MAIN: NAVIGAZIONE MULTIPAGINA
-# ==========================
+def render_phase_5_download():
+    st.header("Fase 5 · Preparazione file e download")
 
+    with st.container(border=True):
+        df = st.session_state.get("results_df")
+
+        if df is None or df.empty:
+            st.info("Nessun file pronto. Esegui prima la fase di estrazione.")
+            return
+
+        st.write("Anteprima risultati finali:")
+        st.dataframe(df, use_container_width=True)
+
+        show_image_preview = st.session_state.get("show_image_preview", True)
+        if show_image_preview and "Immagine principale" in df.columns:
+            image_rows = df[df["Immagine principale"].astype(str).str.startswith("http", na=False)].head(12)
+            if not image_rows.empty:
+                st.subheader("Anteprima immagini")
+                cols = st.columns(4)
+                for idx, (_, row) in enumerate(image_rows.iterrows()):
+                    with cols[idx % 4]:
+                        st.image(row["Immagine principale"], caption=row.get("ASIN", ""), use_container_width=True)
+
+        base_name = st.text_input("Nome base file output", value="amazon_asin_export")
+
+        csv_bytes = dataframe_to_csv_bytes(df)
+        xlsx_bytes = dataframe_to_excel_bytes(df, sheet_name="Amazon_ASIN")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.download_button(
+                label="⬇️ Scarica CSV",
+                data=csv_bytes,
+                file_name=f"{base_name}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+        with col2:
+            st.download_button(
+                label="⬇️ Scarica XLSX",
+                data=xlsx_bytes,
+                file_name=f"{base_name}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+
+# =========================================================
+# MAIN
+# =========================================================
 def main():
     st.set_page_config(
-        page_title="YouTube Search Scraper - SerpAPI",
-        page_icon="📺",
-        layout="wide"
+        page_title="Amazon ASIN Extractor",
+        page_icon="🛒",
+        layout="wide",
     )
 
-    st.sidebar.title("Navigazione")
-    page = st.sidebar.radio(
-        "Vai a:",
-        ("1. Configurazione API", "2. Upload & Scraping", "3. Risultati")
+    init_session_state()
+
+    st.title("🛒 Amazon ASIN Extractor · SerpAPI")
+    st.write(
+        """
+        Tool Streamlit per estrarre dati prodotto Amazon da una lista di ASIN
+        usando **SerpAPI**, con workflow verticale in 5 fasi e output finale
+        in **CSV** e **XLSX**.
+        """
     )
 
-    if page.startswith("1"):
-        page_config()
-    elif page.startswith("2"):
-        page_scraping()
-    elif page.startswith("3"):
-        page_results()
+    st.sidebar.title("Stato sessione")
+    st.sidebar.write(f"API key configurata: {'Sì' if st.session_state.get('serpapi_key') else 'No'}")
+    st.sidebar.write(f"ASIN caricati: {len(st.session_state.get('asin_list', []))}")
+    st.sidebar.write(f"Risultati disponibili: {'Sì' if st.session_state.get('results_df') is not None else 'No'}")
+
+    render_phase_1_api_config()
+    st.divider()
+
+    render_phase_2_upload_input()
+    st.divider()
+
+    render_phase_3_extraction_params()
+    st.divider()
+
+    render_phase_4_extraction()
+    st.divider()
+
+    render_phase_5_download()
 
 
 if __name__ == "__main__":
