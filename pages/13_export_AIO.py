@@ -35,7 +35,7 @@ def read_keywords_from_excel(file_obj, column_name="Keyword"):
     return keywords
 
 
-def scrape_ai_overviews_to_dataframe(keywords, api_key, sleep_seconds=1.0):
+def scrape_ai_overviews_to_dataframe(keywords, api_key, sleep_seconds=1.0, hl="it", gl="it"):
     """
     Esegue la ricerca AI Overview per una lista di keyword e restituisce un DataFrame.
     """
@@ -49,7 +49,13 @@ def scrape_ai_overviews_to_dataframe(keywords, api_key, sleep_seconds=1.0):
         status_text.write(f"🔍 Ricerca per: **{keyword}** ({idx}/{total})")
 
         try:
-            ai_overview = fetch_ai_overview(keyword, api_key=api_key)
+            ai_overview = fetch_ai_overview(
+                keyword,
+                api_key=api_key,
+                hl=hl,
+                gl=gl
+            )
+
             if ai_overview and "references" in ai_overview:
                 references = ai_overview["references"]
                 for ref_idx, ref in enumerate(references, start=1):
@@ -59,7 +65,9 @@ def scrape_ai_overviews_to_dataframe(keywords, api_key, sleep_seconds=1.0):
                         "link": ref.get("link", ""),
                         "snippet": ref.get("snippet", ""),
                         "source": ref.get("source", ""),
-                        "index": ref_idx
+                        "index": ref_idx,
+                        "language": hl,
+                        "country": gl
                     })
                 st.write(f"✅ {len(references)} riferimenti trovati per **{keyword}**.")
             else:
@@ -88,6 +96,35 @@ def dataframe_to_excel_bytes(df, sheet_name="AI_Overview"):
 
 
 # ==========================
+# SUPPORTO CONFIGURAZIONE
+# ==========================
+
+def get_language_options():
+    return {
+        "Italiano": "it",
+        "English": "en",
+        "Español": "es",
+        "Français": "fr",
+        "Deutsch": "de",
+        "Português": "pt",
+        "Nederlands": "nl"
+    }
+
+
+def get_country_options():
+    return {
+        "Italia": "it",
+        "Stati Uniti": "us",
+        "Regno Unito": "uk",
+        "Spagna": "es",
+        "Francia": "fr",
+        "Germania": "de",
+        "Portogallo": "pt",
+        "Paesi Bassi": "nl"
+    }
+
+
+# ==========================
 # PAGINE DELL'APP
 # ==========================
 
@@ -113,6 +150,53 @@ def page_config():
     else:
         st.info("Inserisci la tua API key per iniziare.")
 
+    st.markdown("---")
+    st.subheader("Impostazioni lingua / country")
+
+    use_custom_locale = st.checkbox(
+        "Usa lingua e country personalizzati",
+        value=st.session_state.get("use_custom_locale", False)
+    )
+    st.session_state["use_custom_locale"] = use_custom_locale
+
+    language_options = get_language_options()
+    country_options = get_country_options()
+
+    if use_custom_locale:
+        current_hl = st.session_state.get("hl", "it")
+        current_gl = st.session_state.get("gl", "it")
+
+        language_values = list(language_options.values())
+        country_values = list(country_options.values())
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            selected_language_label = st.selectbox(
+                "Lingua risultati (hl)",
+                options=list(language_options.keys()),
+                index=language_values.index(current_hl) if current_hl in language_values else 0
+            )
+
+        with col2:
+            selected_country_label = st.selectbox(
+                "Country Google (gl)",
+                options=list(country_options.keys()),
+                index=country_values.index(current_gl) if current_gl in country_values else 0
+            )
+
+        st.session_state["hl"] = language_options[selected_language_label]
+        st.session_state["gl"] = country_options[selected_country_label]
+
+        st.info(
+            f"Configurazione attiva: lingua = **{st.session_state['hl']}**, "
+            f"country = **{st.session_state['gl']}**"
+        )
+    else:
+        st.session_state["hl"] = "it"
+        st.session_state["gl"] = "it"
+        st.info("Configurazione standard attiva: lingua = **it**, country = **it**")
+
 
 def page_scraping():
     st.title("📥 Upload file & Scraping AI Overview")
@@ -122,17 +206,23 @@ def page_scraping():
         st.warning("⚠️ Prima imposta la tua SerpAPI API key nella pagina **Configurazione**.")
         return
 
+    hl = st.session_state.get("hl", "it")
+    gl = st.session_state.get("gl", "it")
+
     st.write(
-        """
+        f"""
         Carica un file Excel con la colonna **Keyword**  
         che contiene le query per cui vuoi estrarre gli **AI Overview references**.
+
+        **Configurazione attuale**
+        - Lingua (`hl`): **{hl}**
+        - Country (`gl`): **{gl}**
         """
     )
 
     uploaded_file = st.file_uploader("Carica file Excel (.xlsx)", type=["xlsx"])
 
     if uploaded_file is not None:
-        # Eventuale nome colonna personalizzabile (default "Keyword")
         column_name = st.text_input("Nome colonna che contiene le keyword", value="Keyword")
 
         sleep_seconds = st.slider(
@@ -155,7 +245,9 @@ def page_scraping():
                 df_results = scrape_ai_overviews_to_dataframe(
                     keywords=keywords,
                     api_key=api_key,
-                    sleep_seconds=sleep_seconds
+                    sleep_seconds=sleep_seconds,
+                    hl=hl,
+                    gl=gl
                 )
 
                 st.session_state["ai_overview_df"] = df_results
@@ -165,6 +257,8 @@ def page_scraping():
                     st.dataframe(df_results.head())
                 else:
                     st.info("Nessun riferimento trovato per le keyword fornite.")
+            except ValueError as e:
+                st.error(f"Errore nel file Excel o nel nome colonna: {e}")
             except Exception as e:
                 st.error(f"Errore durante lo scraping: {e}")
     else:
@@ -206,6 +300,14 @@ def main():
         page_icon="🤖",
         layout="wide"
     )
+
+    # valori di default sessione
+    if "hl" not in st.session_state:
+        st.session_state["hl"] = "it"
+    if "gl" not in st.session_state:
+        st.session_state["gl"] = "it"
+    if "use_custom_locale" not in st.session_state:
+        st.session_state["use_custom_locale"] = False
 
     st.sidebar.title("Navigazione")
     page = st.sidebar.radio(
