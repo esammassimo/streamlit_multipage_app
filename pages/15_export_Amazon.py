@@ -341,9 +341,11 @@ def parse_price_info(product_results, root_data):
 def parse_bullets(product_results, root_data):
     bullets = first_non_empty(
         [
+            get_nested(product_results, "about_item"),       # chiave reale SerpAPI amazon_product
             get_nested(product_results, "feature_bullets"),
-            get_nested(product_results, "features"),
             get_nested(product_results, "about_this_item"),
+            get_nested(product_results, "features"),
+            get_nested(root_data, "about_item"),
             get_nested(root_data, "feature_bullets"),
         ],
         default=[],
@@ -363,9 +365,7 @@ def parse_short_description(product_results, root_data):
         [
             get_nested(product_results, "short_description"),
             get_nested(product_results, "subtitle"),
-            get_nested(product_results, "byline_info"),  # campo alternativo SerpAPI
             get_nested(root_data, "short_description"),
-            get_nested(root_data, "byline_info"),
         ],
         default="",
     )
@@ -373,15 +373,33 @@ def parse_short_description(product_results, root_data):
     if short_desc:
         return safe_str(short_desc)
 
+    # Fallback: primo elemento di about_item come descrizione breve
+    about_item = first_non_empty(
+        [
+            get_nested(product_results, "about_item"),
+            get_nested(root_data, "about_item"),
+        ],
+        default=[],
+    )
+    if isinstance(about_item, list) and about_item:
+        first_item = about_item[0]
+        if isinstance(first_item, dict):
+            text = first_non_empty([first_item.get("text"), first_item.get("item")], default="")
+            if text:
+                return safe_str(text)
+        elif isinstance(first_item, str) and first_item.strip():
+            return first_item.strip()
+
+    # Fallback finale: primo bullet point
     bullet_text = parse_bullets(product_results, root_data)
     if bullet_text:
-        first_bullet = bullet_text.split(" | ")[0]
-        return first_bullet.strip()
+        return bullet_text.split(" | ")[0].strip()
 
     return ""
 
 
 def parse_long_description(product_results, root_data):
+    # Prova prima i campi semplici
     long_desc = first_non_empty(
         [
             get_nested(product_results, "description"),
@@ -392,7 +410,26 @@ def parse_long_description(product_results, root_data):
         default="",
     )
 
+    # product_description da SerpAPI è una lista di blocchi con features[].text
     if isinstance(long_desc, list):
+        texts = []
+        for block in long_desc:
+            if not isinstance(block, dict):
+                continue
+            features = block.get("features")
+            if isinstance(features, list):
+                for feat in features:
+                    if isinstance(feat, dict):
+                        text = feat.get("text", "")
+                        if text and isinstance(text, str) and text.strip():
+                            texts.append(text.strip())
+            # blocchi senza features ma con testo diretto
+            title = block.get("title", "")
+            if title and isinstance(title, str) and title.strip() and not features:
+                texts.append(title.strip())
+        if texts:
+            return " | ".join(texts)
+        # fallback generico
         return list_to_pipe_text(long_desc)
 
     if isinstance(long_desc, dict):
