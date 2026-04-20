@@ -140,9 +140,12 @@ def list_to_pipe_text(items):
             text = first_non_empty(
                 [
                     item.get("text"),
+                    item.get("item"),   # chiave usata da SerpAPI per feature_bullets
                     item.get("title"),
                     item.get("name"),
                     item.get("value"),
+                    # fallback: primo valore stringa non vuoto del dict
+                    next((v for v in item.values() if isinstance(v, str) and v.strip()), None),
                 ],
                 default="",
             )
@@ -360,7 +363,9 @@ def parse_short_description(product_results, root_data):
         [
             get_nested(product_results, "short_description"),
             get_nested(product_results, "subtitle"),
+            get_nested(product_results, "byline_info"),  # campo alternativo SerpAPI
             get_nested(root_data, "short_description"),
+            get_nested(root_data, "byline_info"),
         ],
         default="",
     )
