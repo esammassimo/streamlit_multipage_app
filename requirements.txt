@@ -18,3 +18,4 @@ urllib3
 gunicorn
 lxml
 google-search-results
+anthropic
