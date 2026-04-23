@@ -851,7 +851,8 @@ if df_raw is not None:
             try:
                 text    = call_openai(client, sys_prompt, build_user_prompt(row, target_words, system_prompt, settore_globale), model)
                 doc_buf = create_word_doc(row, text)
-                generated_docs[f"{row_idx+1:02d}_articolo.docx"] = doc_buf
+                safe    = re.sub(r"[^\w\-_]", "_", str(title))[:60]
+                generated_docs[f"{row_idx+1:02d}_{safe}.docx"] = doc_buf
             except Exception as e:
                 errors.append(f"Riga {row_idx+1} \u2013 {title}: {e}")
 
