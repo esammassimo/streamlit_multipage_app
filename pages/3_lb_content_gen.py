@@ -405,10 +405,12 @@ with st.expander("⚙️ Modello, prompt e linee guida", expanded=True):
     )
     settore_globale = st.text_input(
         "Settore",
-        value="",
+        value=st.session_state.get("settore_globale", ""),
         placeholder="Es: skincare e beauty, finanza personale, mobilità urbana…",
         label_visibility="collapsed",
     )
+    if settore_globale:
+        st.session_state["settore_globale"] = settore_globale
 
     st.markdown("---")
 
@@ -585,8 +587,30 @@ if df_raw is not None:
         dati_articolo += f"- Titolo (H1): {title}\n"
         dati_articolo += f"- Argomento / Brief: {descrizione}\n" if descrizione.strip() else ""
         dati_articolo += f"- Ancora da inserire: {anchor_text}\n" if anchor_text.strip() else ""
+        # Tipologia: tradotta in istruzione operativa
+        TIPOLOGIA_ISTRUZIONI = {
+            "contenuto generico":   "Scrivi un articolo informativo e accessibile, adatto a un pubblico generalista.",
+            "contenuto verticale":  "Scrivi un articolo specialistico con terminologia tecnica appropriata, rivolto a lettori esperti del settore.",
+            "contenuto locale":     "Scrivi un articolo con forte connotazione geografica, con riferimenti locali concreti e informazioni pratiche per chi si trova in quella zona.",
+            "listicle":             "Struttura il contenuto come un articolo numerato o a lista tematica, con sezioni ben distinte e titoli evocativi.",
+            "how to":               "Scrivi una guida pratica step-by-step, con istruzioni chiare e progressive.",
+            "evergreen":            "Scrivi un contenuto senza riferimenti temporali, valido nel tempo, con focus su informazioni stabili e ricercate.",
+            "comparativa":          "Struttura il testo come un confronto ragionato tra opzioni, soluzioni o approcci diversi.",
+            "approfondimento":      "Scrivi un testo analitico e dettagliato, con focus sulla comprensione profonda del tema.",
+        }
         if tipologia.strip():
-            dati_articolo += f"- Tipologia: {tipologia}\n"
+            tip_key = tipologia.strip().lower()
+            tip_istruzione = TIPOLOGIA_ISTRUZIONI.get(tip_key, "")
+            if not tip_istruzione:
+                # Fallback: match parziale
+                for k, v in TIPOLOGIA_ISTRUZIONI.items():
+                    if k in tip_key or tip_key in k:
+                        tip_istruzione = v
+                        break
+            if tip_istruzione:
+                dati_articolo += f"- Formato richiesto: {tip_istruzione}\n"
+            else:
+                dati_articolo += f"- Tipologia: {tipologia}\n"
         if extra_lines:
             dati_articolo += "- Altri dati:\n" + "\n".join(extra_lines) + "\n"
 
@@ -815,6 +839,56 @@ if df_raw is not None:
     # ─────────────────────────────────────────────
     st.subheader("5. Genera i contenuti")
 
+    # ── Preview prompt ────────────────────────────────────────────────
+    if selected and df_raw is not None:
+        with st.expander("🔍 Anteprima prompt — riga selezionata", expanded=False):
+            preview_idx = st.selectbox(
+                "Articolo da visualizzare",
+                options=selected,
+                format_func=lambda i: f"{i+1}. {edited_df.iloc[i].get('titolo', '')[:70]}",
+                key="preview_select",
+            )
+            preview_row    = edited_df.iloc[preview_idx]
+            preview_sys    = build_system_prompt(guidelines_text)
+            preview_user   = build_user_prompt(preview_row, target_words, system_prompt, settore_globale)
+            col_ps, col_pu = st.columns(2)
+            with col_ps:
+                st.markdown("**System prompt**")
+                st.text_area("sys", preview_sys, height=200, label_visibility="collapsed", key="prev_sys", disabled=True)
+            with col_pu:
+                st.markdown("**User prompt**")
+                st.text_area("usr", preview_user, height=200, label_visibility="collapsed", key="prev_usr", disabled=True)
+            total_chars = len(preview_sys) + len(preview_user)
+            est_tokens  = total_chars // 4
+            st.caption(f"Stima token prompt: ~{est_tokens:,} · {total_chars:,} caratteri")
+
+    # ── Stima costo batch ─────────────────────────────────────────────
+    COST_PER_1K = {
+        "gpt-5.4":       (0.005, 0.020),
+        "gpt-5.4-mini":  (0.001, 0.004),
+        "gpt-5.4-nano":  (0.0005, 0.002),
+        "gpt-5.2":       (0.004, 0.016),
+        "gpt-5":         (0.004, 0.016),
+        "o3":            (0.010, 0.040),
+        "o4-mini":       (0.002, 0.008),
+        "gpt-4.1":       (0.002, 0.008),
+        "gpt-4.1-mini":  (0.0004, 0.0016),
+        "gpt-4.1-nano":  (0.0001, 0.0004),
+        "gpt-4o":        (0.0025, 0.010),
+        "gpt-4o-mini":   (0.00015, 0.0006),
+        "gpt-4-turbo":   (0.010, 0.030),
+    }
+    if selected and model in COST_PER_1K:
+        in_cost, out_cost = COST_PER_1K[model]
+        # Stima: ~800 token in, ~1000 token out per articolo
+        est_in  = 800  * len(selected) / 1000
+        est_out = 1000 * len(selected) / 1000
+        est_total = est_in * in_cost + est_out * out_cost
+        st.caption(
+            f"💰 Costo stimato batch: **${est_total:.3f}** "
+            f"({len(selected)} articoli × modello `{model}`) — stima indicativa"
+        )
+
     col_btn, col_info = st.columns([2, 5])
     with col_btn:
         generate_btn = st.button(
@@ -849,10 +923,25 @@ if df_raw is not None:
             status.info(f"⏳ Generando: **{title}**")
 
             try:
-                text    = call_openai(client, sys_prompt, build_user_prompt(row, target_words, system_prompt, settore_globale), model)
+                user_p = build_user_prompt(row, target_words, system_prompt, settore_globale)
+                text   = call_openai(client, sys_prompt, user_p, model)
+                # Controllo lunghezza — se sotto 80% della soglia, chiede espansione
+                word_count = len(text.split())
+                if word_count < target_words * 0.80:
+                    status.warning(f"⚠️ {title[:40]}… ({word_count} parole, sotto soglia) — espansione in corso…")
+                    expand_p = (
+                        f"Il testo seguente è troppo breve ({word_count} parole su {target_words} richieste). "
+                        f"Espandilo fino ad almeno {target_words} parole aggiungendo dettagli, "
+                        "esempi e approfondimenti coerenti con il contenuto esistente. "
+                        "Non alterare il titolo, la struttura dei paragrafi o il link già inserito.\n\n"
+                        + text
+                    )
+                    text = call_openai(client, sys_prompt, expand_p, model)
                 doc_buf = create_word_doc(row, text)
                 safe    = re.sub(r"[^\w\-_]", "_", str(title))[:60]
-                generated_docs[f"{row_idx+1:02d}_{safe}.docx"] = doc_buf
+                wc_final = len(text.split())
+                fname_key = f"{row_idx+1:02d}_{safe}.docx"
+                generated_docs[fname_key] = (doc_buf, wc_final)
             except Exception as e:
                 errors.append(f"Riga {row_idx+1} \u2013 {title}: {e}")
 
@@ -863,12 +952,18 @@ if df_raw is not None:
             st.error("Errori durante la generazione:\n" + "\n".join(errors))
 
         if generated_docs:
+            wc_info = {k: wc for k, (_, wc) in generated_docs.items()}
+            low_wc  = {k: wc for k, wc in wc_info.items() if wc < target_words}
             st.success(f"✅ {len(generated_docs)} articoli generati con successo!")
+            if low_wc:
+                st.warning("Articoli ancora sotto soglia dopo espansione: " +
+                    ", ".join(f"{k} ({v} parole)" for k, v in low_wc.items()))
 
             st.subheader("6. Download")
 
             if len(generated_docs) == 1:
-                fname, buf = next(iter(generated_docs.items()))
+                fname, (buf, _wc) = next(iter(generated_docs.items()))
+                st.caption(f"📝 {wc_info.get(fname, '?')} parole")
                 st.download_button(
                     label=f"📄 Scarica {fname}",
                     data=buf,
@@ -878,7 +973,7 @@ if df_raw is not None:
             else:
                 zip_buf = BytesIO()
                 with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for fname, buf in generated_docs.items():
+                    for fname, (buf, _wc) in generated_docs.items():
                         zf.writestr(fname, buf.read())
                 zip_buf.seek(0)
 
@@ -892,9 +987,10 @@ if df_raw is not None:
 
                 st.write("Oppure scarica i file singolarmente:")
                 dl_cols = st.columns(min(len(generated_docs), 3))
-                for j, (fname, buf) in enumerate(generated_docs.items()):
+                for j, (fname, (buf, _wc)) in enumerate(generated_docs.items()):
                     buf.seek(0)
                     with dl_cols[j % 3]:
+                        st.caption(f"📝 {wc_info.get(fname, '?')} parole")
                         st.download_button(
                             label=f"📄 {fname[:40]}",
                             data=buf,
