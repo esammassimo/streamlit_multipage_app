@@ -1065,21 +1065,70 @@ with st.sidebar:
 st.markdown(f"# 📊 SEO/SEA Analysis — {cliente}")
 st.divider()
 
-# ── STEP 1-3: Upload ──────────────────────────────────────────
-col_u1, col_u2, col_u3 = st.columns([1, 1, 1])
+# ── UPLOAD FILE ───────────────────────────────────────────────
+st.markdown("### 📂 Carica i file")
+st.caption("I file obbligatori sono ADS PRIMA e ADS DOPO. Gli altri arricchiscono l'analisi.")
 
-with col_u1:
-    st.markdown("**1 · Google Ads PRIMA**")
-    file_prima = st.file_uploader("Export keyword report periodo precedente", type=["xlsx", "xls", "csv"], key="ads_prima")
+row1_c1, row1_c2 = st.columns(2)
+row2_c1, row2_c2 = st.columns(2)
 
-with col_u2:
-    st.markdown("**2 · Google Ads DOPO**")
-    file_dopo = st.file_uploader("Export keyword report periodo corrente", type=["xlsx", "xls", "csv"], key="ads_dopo")
+with row1_c1:
+    st.markdown("**1 · Google Ads PRIMA** ✱")
+    file_prima = st.file_uploader(
+        "Export keyword report periodo precedente",
+        type=["xlsx", "xls", "csv"], key="ads_prima",
+        help="Sheet 'Keyword' dell'export Google Ads. Obbligatorio."
+    )
 
-with col_u3:
+with row1_c2:
+    st.markdown("**2 · Google Ads DOPO** ✱")
+    file_dopo = st.file_uploader(
+        "Export keyword report periodo corrente",
+        type=["xlsx", "xls", "csv"], key="ads_dopo",
+        help="Sheet 'Keyword' dell'export Google Ads. Obbligatorio."
+    )
+
+with row2_c1:
     st.markdown("**3 · Search Console** *(opzionale)*")
-    file_gsc = st.file_uploader("Export GSC con posizioni organiche", type=["xlsx", "xls", "csv"], key="gsc")
+    file_gsc = st.file_uploader(
+        "Export GSC con posizioni organiche per keyword",
+        type=["xlsx", "xls", "csv"], key="gsc",
+        help="Abilita la colonna Posizione Organica e il tab URL & Title Check."
+    )
 
+with row2_c2:
+    st.markdown("**4 · Classificazione Keyword** *(opzionale)*")
+    file_classif = st.file_uploader(
+        "Prima colonna: keyword · Colonne successive: Brand/NoBrand, Cluster, Territorio…",
+        type=["xlsx", "xls", "csv"], key="classif",
+        help="Arricchisce le keyword con etichette di classificazione. Abilita soglie QS separate per Brand/No-Brand."
+    )
+
+st.caption("✱ obbligatorio")
+st.divider()
+
+# ── CONFIGURAZIONE SOGLIE QS ──────────────────────────────────
+st.markdown("### ⚙️ Soglie Quality Score")
+st.caption(
+    "Imposta le soglie minime di QS per Brand e No-Brand. "
+    "Le keyword con QS inferiore alla soglia saranno segnalate come critiche. "
+    "Se carichi un file di classificazione con colonna Brand/NoBrand, "
+    "le soglie verranno applicate per riga in base alla classificazione."
+)
+
+_qs_c1, _qs_c2 = st.columns(2)
+with _qs_c1:
+    qs_thr_brand = st.slider(
+        "QS minimo Brand",
+        min_value=1, max_value=10, value=7, step=1,
+        help="Keyword Brand con QS inferiore a questa soglia → segnalate come critiche (KO)."
+    )
+with _qs_c2:
+    qs_thr_nobrand = st.slider(
+        "QS minimo No-Brand",
+        min_value=1, max_value=10, value=6, step=1,
+        help="Keyword No-Brand con QS inferiore a questa soglia → segnalate come critiche (KO)."
+    )
 st.divider()
 
 # ── PROCESS ──────────────────────────────────────────────────
@@ -1097,11 +1146,10 @@ if file_prima and file_dopo:
             df_dopo  = join_with_gsc(df_dopo,  df_gsc)
             df_sf = parse_screaming_frog(file_sf) if file_sf else None
 
-        # Default variabili classificazione — sovrascritte più avanti se file caricato
+        # Default variabili classificazione — sovrascritte se file caricato
         brand_col_detected = None
         brand_flag_values  = set()
-        qs_thr_brand       = 7
-        qs_thr_nobrand     = 6
+        # qs_thr_brand e qs_thr_nobrand definiti dagli slider sopra
 
         # Avviso automatico se colonne chiave mancano nel DOPO
         missing_key = [c for c in ["quality_score", "cost", "impressions", "clicks"]
@@ -1426,32 +1474,14 @@ if file_prima and file_dopo:
                         if not has_sf_data:
                             st.caption("💡 Carica un export Screaming Frog nella sidebar per vedere i title e il check keyword/title.")
 
-        # ── CLASSIFICAZIONE KEYWORD (arricchimento opzionale) ────
+        # ── CLASSIFICAZIONE KEYWORD ────────────────────────────
         st.divider()
-        st.markdown("### 🏷️ Arricchimento: Classificazione Keyword *(opzionale)*")
-
-        cl1, cl2 = st.columns([2, 3])
-        with cl1:
-            file_classif = st.file_uploader(
-                "File classificazione keyword",
-                type=["xlsx", "xls", "csv"],
-                key="classif",
-                help="Prima colonna: keyword. Colonne successive: etichette dinamiche (Brand/NoBrand, Cluster, Territorio, ecc.)."
-            )
-        with cl2:
-            st.caption(
-                "**Formato atteso** — prima colonna `keyword`, poi una o più colonne di classificazione:\n\n"
-                "| keyword | Brand/NoBrand | Cluster | Territorio |\n"
-                "|---|---|---|---|\n"
-                "| vitamina c | No-Brand | Sieri | Nazionale |\n\n"
-                "Solo le keyword ADS che corrispondono esattamente vengono arricchite. "
-                "Le keyword senza match restano con le etichette vuote."
-            )
+        st.markdown("### 🏷️ Classificazione Keyword")
 
         df_classif = None
         classif_extra_cols = []
-        brand_col_detected = None   # nome colonna brand nel df dopo il join
-        brand_flag_values  = set()  # valori considerati "brand" (lowercase)
+        brand_col_detected = None
+        brand_flag_values  = set()
 
         if file_classif:
             try:
@@ -1491,35 +1521,11 @@ if file_prima and file_dopo:
             except Exception as ce:
                 st.error(f"❌ Errore nel file classificazione: {ce}")
 
-        # ── Soglie QS — appaiono dopo la classificazione ──────
-        st.divider()
-        if brand_col_detected and brand_flag_values:
-            st.markdown("**Soglia QS critico per Brand / No-Brand**")
-            _qc1, _qc2 = st.columns(2)
-            with _qc1:
-                qs_thr_brand = st.slider(
-                    "Brand — QS ≤", min_value=1, max_value=9, value=7, step=1,
-                    help="Keyword Brand con QS ≤ questa soglia → critiche"
-                )
-            with _qc2:
-                qs_thr_nobrand = st.slider(
-                    "No-Brand — QS ≤", min_value=1, max_value=9, value=6, step=1,
-                    help="Keyword No-Brand con QS ≤ questa soglia → critiche"
-                )
-            # Ricalcola check_qs sui df con le soglie aggiornate
-            df_dopo  = classify_qs_flag(df_dopo,  qs_thr_brand, qs_thr_nobrand,
-                                        brand_col_detected, brand_flag_values)
-            df_prima = classify_qs_flag(df_prima, qs_thr_brand, qs_thr_nobrand,
-                                        brand_col_detected, brand_flag_values)
-        else:
-            st.markdown("**Soglia QS critico**")
-            qs_thr_nobrand = st.slider(
-                "QS ≤", min_value=1, max_value=9, value=6, step=1,
-                help="Keyword con QS ≤ questa soglia → critiche. Carica un file di classificazione per soglie Brand/No-Brand separate."
-            )
-            qs_thr_brand = qs_thr_nobrand
-            df_dopo  = classify_qs_flag(df_dopo,  qs_thr_brand, qs_thr_nobrand)
-            df_prima = classify_qs_flag(df_prima, qs_thr_brand, qs_thr_nobrand)
+        # ── Ricalcola check_qs con soglie e colonna brand rilevata ──
+        df_dopo  = classify_qs_flag(df_dopo,  qs_thr_brand, qs_thr_nobrand,
+                                    brand_col_detected, brand_flag_values)
+        df_prima = classify_qs_flag(df_prima, qs_thr_brand, qs_thr_nobrand,
+                                    brand_col_detected, brand_flag_values)
 
         # ── DOWNLOAD ──────────────────────────────────────────
         st.divider()
