@@ -1156,6 +1156,7 @@ if file_prima and file_dopo:
         # Default variabili classificazione — sovrascritte se file caricato
         brand_col_detected = None
         brand_flag_values  = set()
+        classif_extra_cols = []  # sovrascritta se file classificazione caricato
         # qs_thr_brand e qs_thr_nobrand definiti dagli slider sopra
 
         # Avviso automatico se colonne chiave mancano nel DOPO
