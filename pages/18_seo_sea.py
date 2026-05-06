@@ -1143,15 +1143,14 @@ if file_prima and file_dopo:
     try:
         with st.spinner("Parsing file Google Ads..."):
             df_prima = parse_ads_file(file_prima)
-            df_prima = classify_qs_flag(df_prima)
-
-            df_dopo = parse_ads_file(file_dopo)
-            df_dopo = classify_qs_flag(df_dopo)
+            df_dopo  = parse_ads_file(file_dopo)
 
             df_gsc = parse_gsc_file(file_gsc) if file_gsc else None
             df_prima = join_with_gsc(df_prima, df_gsc)
             df_dopo  = join_with_gsc(df_dopo,  df_gsc)
             df_sf = parse_screaming_frog(file_sf) if file_sf else None
+            # NOTA: classify_qs_flag viene chiamata DOPO il join classificazione
+            # così check_qs usa le soglie Brand/NoBrand corrette
 
         # Default variabili classificazione — sovrascritte se file caricato
         brand_col_detected = None
