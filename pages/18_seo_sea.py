@@ -625,10 +625,12 @@ def qs_stats(df):
 def active_stats(df):
     impr_col = df["impressions"].fillna(0) if "impressions" in df.columns else pd.Series(0, index=df.index)
     active = df[impr_col > 0]
-    if "brand_nobrand" in df.columns:
-        brand = active[active["brand_nobrand"].str.lower().str.contains("brand", na=False)
-                       & ~active["brand_nobrand"].str.lower().str.contains("no", na=False)]
-        nobrand = active[active["brand_nobrand"].str.lower().str.contains("no", na=False)]
+    # Preferisce INTERNAL_BRAND_COL (da classificazione), fallback su brand_nobrand nativo
+    _bcol = INTERNAL_BRAND_COL if INTERNAL_BRAND_COL in df.columns else             ("brand_nobrand" if "brand_nobrand" in df.columns else None)
+    if _bcol:
+        brand = active[active[_bcol].str.lower().str.contains("brand", na=False)
+                       & ~active[_bcol].str.lower().str.contains("no", na=False)]
+        nobrand = active[active[_bcol].str.lower().str.contains("no", na=False)]
     else:
         camp = active.get("campaign", pd.Series("", index=active.index)).fillna("")
         brand = active[camp.str.lower().str.contains("brand", na=False)]
@@ -664,8 +666,6 @@ C_WHITE = "FFFFFF"; C_GRAY  = "F5F5F5"
 OUTPUT_COLS = [
     ("keyword_status",    "Stato KW"),
     ("keyword",           "Search Keyword"),
-    ("brand_nobrand",     "Brand / No-Brand"),
-    ("territorio",        "Territorio"),
     ("match_type",        "Match Type"),
     ("campaign",          "Campaign"),
     ("ad_group",          "Ad Group"),
@@ -730,6 +730,9 @@ def build_ads_sheet(wb, df, name, periodo, color, classif_cols=None):
     # Colonne classificazione inserite dopo keyword e match_type (prime 2 di OUTPUT_COLS)
     EXTRA_COLS = [(c, c) for c in classif_cols if c in df.columns]
     # Costruisci lista colonne finale: fissi fino a match_type, poi classif, poi il resto
+    # FIXED_FIRST: colonne statiche prima delle etichette classificazione
+    # (keyword_status, keyword, match_type)
+    # brand_nobrand e territorio NON sono in OUTPUT_COLS: vengono solo dal file classificazione
     FIXED_FIRST = [item for item in OUTPUT_COLS if item[0] in ("keyword_status", "keyword", "match_type")]
     FIXED_REST  = [item for item in OUTPUT_COLS if item[0] not in ("keyword_status", "keyword", "match_type")]
     ALL_COLS = FIXED_FIRST + EXTRA_COLS + FIXED_REST
@@ -862,10 +865,14 @@ def build_critiche_sheet(wb, df_d, p_dopo, qs_thr_brand=6.0, qs_thr_nobrand=6.0,
         mask = (qs_col <= qs_thr_nobrand) & (cost_col > 0) & qs_col.notna()
     df_c = df_d[mask].sort_values("cost", ascending=False) if "cost" in df_d.columns else df_d[mask]
     thr_label = f"Brand ≤{int(qs_thr_brand)} / No-Brand ≤{int(qs_thr_nobrand)}" if brand_col else f"≤{int(qs_thr_nobrand)}"
-    headers = ["Keyword", "Match Type", "Brand/No-Brand", "QS", "Check QS",
+    # Usa INTERNAL_BRAND_COL se presente (da file classificazione), altrimenti brand_nobrand nativo
+    brand_col_out = INTERNAL_BRAND_COL if INTERNAL_BRAND_COL in df_c.columns else "brand_nobrand"
+    cat_col_out   = INTERNAL_CATEGORIA_COL if INTERNAL_CATEGORIA_COL in df_c.columns else None
+    extra_headers = ([brand_col_out] if brand_col_out in df_c.columns else []) +                     ([cat_col_out]   if cat_col_out and cat_col_out in df_c.columns else [])
+    headers = ["Keyword", "Match Type"] + extra_headers + ["QS", "Check QS",
                "Exp. CTR", "Landing Page Exp.", "Ad Relevance", "Pos. GSC", "Cost", "IS"]
-    cols = ["keyword", "match_type", "brand_nobrand", "quality_score", "check_qs",
-            "exp_ctr", "landing_page_exp", "ad_relevance", "pos_organica", "cost", "search_impr_share"]
+    cols = ["keyword", "match_type"] +            ([brand_col_out] if brand_col_out in df_c.columns else []) +            ([cat_col_out]   if cat_col_out and cat_col_out in df_c.columns else []) +            ["quality_score", "check_qs", "exp_ctr", "landing_page_exp",
+            "ad_relevance", "pos_organica", "cost", "search_impr_share"]
 
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
     c = ws.cell(row=1, column=1)
@@ -1227,11 +1234,15 @@ if file_prima and file_dopo:
             tab5 = None
 
         # Colonne da mostrare in UI (subset leggibile)
-        DISPLAY_COLS = [c for c in ["keyword", "match_type", "brand_nobrand", "territorio",
-                                     "quality_score", "check_qs", "pos_organica",
-                                     "impressions", "clicks", "ctr", "cost",
-                                     "search_impr_share", "campaign"]
-                        if c in df_dopo.columns or c in df_prima.columns]
+        # Colonne UI: usa nomi interni standard; brand e categoria da classificazione
+        _all_classif_cols = classif_extra_cols  # già rinominate a INTERNAL_BRAND_COL / INTERNAL_CATEGORIA_COL
+        DISPLAY_COLS = [c for c in (
+            ["keyword", "match_type"] +
+            _all_classif_cols +
+            ["quality_score", "check_qs", "pos_organica",
+             "impressions", "clicks", "ctr", "cost",
+             "search_impr_share", "campaign"]
+        ) if c in df_dopo.columns or c in df_prima.columns]
 
         def style_df(df_raw, cols):
             df_show = df_raw[[c for c in cols if c in df_raw.columns]].copy()
@@ -1248,8 +1259,10 @@ if file_prima and file_dopo:
                 df_show["pos_organica"] = df_show["pos_organica"].apply(
                     lambda x: f"{float(x):.1f}" if pd.notna(x) and x != "" else "—")
             col_labels = {
-                "keyword": "Keyword", "match_type": "Match Type", "brand_nobrand": "Brand",
-                "territorio": "Territorio", "quality_score": "QS", "check_qs": "✓",
+                "keyword": "Keyword", "match_type": "Match Type",
+                INTERNAL_BRAND_COL: "Brand/NoBrand", INTERNAL_CATEGORIA_COL: "Categoria",
+                "brand_nobrand": "Brand", "territorio": "Territorio",
+                "quality_score": "QS", "check_qs": "✓",
                 "pos_organica": "Pos. GSC", "impressions": "Impr.", "clicks": "Clicks",
                 "ctr": "CTR", "cost": "Cost", "search_impr_share": "IS",
                 "campaign": "Campaign",
@@ -1363,6 +1376,7 @@ if file_prima and file_dopo:
         with tab4:
             qs_col   = pd.to_numeric(df_dopo.get("quality_score", pd.Series(dtype=float)), errors="coerce")
             cost_col = df_dopo.get("cost", pd.Series(0.0, index=df_dopo.index)).fillna(0)
+            # brand_col_detected punta già a INTERNAL_BRAND_COL se da classificazione
             if brand_col_detected and brand_col_detected in df_dopo.columns and brand_flag_values:
                 def _crit_ui(row):
                     val = str(row.get(brand_col_detected, "")).strip().lower()
@@ -1381,10 +1395,13 @@ if file_prima and file_dopo:
                 st.success(f"✓ Nessuna keyword critica trovata (soglia QS {thr_label}) e costo > 0")
             else:
                 st.warning(f"⚠️ {len(df_crit)} keyword critiche (QS {thr_label}) con spesa registrata")
-                crit_cols = [c for c in ["keyword", "match_type", "quality_score", "check_qs",
-                                          "exp_ctr", "landing_page_exp", "ad_relevance",
-                                          "pos_organica", "cost", "brand_nobrand", "campaign"]
-                             if c in df_crit.columns]
+                crit_cols = [c for c in (
+                    ["keyword", "match_type"] +
+                    ([brand_col_detected] if brand_col_detected and brand_col_detected in df_crit.columns else []) +
+                    ([INTERNAL_CATEGORIA_COL] if INTERNAL_CATEGORIA_COL in df_crit.columns else []) +
+                    ["quality_score", "check_qs", "exp_ctr", "landing_page_exp",
+                     "ad_relevance", "pos_organica", "cost", "campaign"]
+                ) if c in df_crit.columns]
                 st.dataframe(style_df(df_crit, crit_cols), use_container_width=True, height=380)
 
         # ── TAB 5: URL & TITLE CHECK ──────────────────────────
