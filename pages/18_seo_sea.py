@@ -1195,6 +1195,7 @@ if _can_run and st.session_state.get("_run"):
                 st.session_state["_df_prima"]           = df_prima
                 st.session_state["_df_dopo"]            = df_dopo
                 st.session_state["_df_sf"]              = df_sf
+                st.session_state["_df_gsc"]             = df_gsc
                 st.session_state["_brand_col"]          = brand_col_detected
                 st.session_state["_brand_flag_values"]  = brand_flag_values
                 st.session_state["_classif_extra_cols"] = classif_extra_cols
@@ -1202,6 +1203,7 @@ if _can_run and st.session_state.get("_run"):
             df_prima           = st.session_state["_df_prima"]
             df_dopo            = st.session_state["_df_dopo"]
             df_sf              = st.session_state.get("_df_sf")
+            df_gsc             = st.session_state.get("_df_gsc")
             brand_col_detected = st.session_state["_brand_col"]
             brand_flag_values  = st.session_state["_brand_flag_values"]
             classif_extra_cols = st.session_state["_classif_extra_cols"]
