@@ -988,11 +988,258 @@ def build_tabelle_sheet(wb, df_p, df_d, p_prima, p_dopo):
     ws.freeze_panes = "A2"
 
 
+
+
+def _brand_mask(series, brand_flag_values):
+    """
+    True se il valore della colonna Brand/NoBrand corrisponde a un valore brand.
+    Normalizza rimuovendo trattini e spazi prima del confronto esatto.
+    """
+    def _norm(v):
+        return str(v).strip().lower().replace("-", "").replace(" ", "")
+    norm_flags = {_norm(v) for v in (brand_flag_values or set())}
+    if not norm_flags:
+        return pd.Series(False, index=series.index)
+    return series.fillna("").apply(lambda v: _norm(v) in norm_flags)
+
+
+def build_tabelle_report_sheet(wb, df_d, df_p, p_dopo, p_prima,
+                                brand_col, brand_flag_values, cat_col):
+    """
+    Aggiunge la sheet 'TABELLE REPORT' con:
+    - Tabella 1: aggregazione Brand / No-Brand / Totale
+      (solo se brand_col e brand_flag_values disponibili)
+    - Tabella 2: aggregazione per Cluster × Brand / No-Brand
+      (solo se cat_col disponibile)
+    Metriche: Nr. Kw, Avg. QS, %Pos (GSC), Avg. CPC
+    Robusta a file senza GSC, senza classificazione, senza CPC.
+    """
+    ws = wb.create_sheet(title="TABELLE REPORT")
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+    def _safe_col(df, col):
+        """Ritorna la colonna se esiste, altrimenti una Series vuota."""
+        if col in df.columns:
+            return df[col]
+        return pd.Series(dtype=float, index=df.index)
+
+    def _metrics(sub):
+        if sub is None or len(sub) == 0:
+            return {"Nr. Kw": 0, "Avg. QS": None, "%Pos": None, "Avg. CPC": None}
+        qs  = pd.to_numeric(_safe_col(sub, "quality_score"), errors="coerce").dropna()
+        cpc = pd.to_numeric(_safe_col(sub, "avg_cpc"),       errors="coerce").dropna()
+        pos = pd.to_numeric(_safe_col(sub, "pos_organica"),  errors="coerce")
+        has_pos = pos.notna() & (pos > 0)
+        return {
+            "Nr. Kw":   len(sub),
+            "Avg. QS":  round(float(qs.mean()),  2) if len(qs)  else None,
+            "%Pos":     round(float(has_pos.mean()), 4) if len(sub) and "pos_organica" in sub.columns else None,
+            "Avg. CPC": round(float(cpc.mean()), 4) if len(cpc) else None,
+        }
+
+    def _delta(md, mp):
+        result = {}
+        for k in md:
+            try:
+                if md[k] is None or mp[k] is None:
+                    result[k] = None
+                else:
+                    result[k] = round(float(md[k]) - float(mp[k]), 4)
+            except (TypeError, ValueError):
+                result[k] = None
+        return result
+
+    METRICS = ["Nr. Kw", "Avg. QS", "%Pos", "Avg. CPC"]
+
+    # ── Stili ────────────────────────────────────────────────────────────────
+    C_TITLE    = "1F3864"
+    C_HDR_GRP  = "2E5FAB"
+    C_HDR_COL  = "4472C4"
+    C_BRAND    = "D6E4F7"
+    C_NOBRAND  = "EAF4E8"
+    C_TOTAL    = "F2F2F2"
+    C_CLUSTER  = "FFF2CC"
+    C_DELTA_POS = "C6EFCE"
+    C_DELTA_NEG = "FFC7CE"
+
+    def _fill(color):
+        return PatternFill("solid", fgColor=color)
+
+    def _font(bold=False, color="000000", size=9):
+        return Font(name="Arial", bold=bold, color=color, size=size)
+
+    def _border():
+        s = Side(style="thin", color="BFBFBF")
+        return Border(left=s, right=s, top=s, bottom=s)
+
+    def _align(h="center", v="center"):
+        return Alignment(horizontal=h, vertical=v, wrap_text=True)
+
+    def _write(ws, r, c, val, bold=False, fill_color=None, fmt=None,
+               color="000000", align_h="center"):
+        cell = ws.cell(row=r, column=c, value=val)
+        cell.font = _font(bold=bold, color=color)
+        cell.alignment = _align(h=align_h)
+        cell.border = _border()
+        if fill_color:
+            cell.fill = _fill(fill_color)
+        if fmt:
+            cell.number_format = fmt
+        return cell
+
+    def _write_metric(ws, r, c, val, metric_name, is_delta=False):
+        """Scrive un valore con formato corretto. None → cella vuota con trattino."""
+        if val is None:
+            _write(ws, r, c, "—")
+            return
+
+        fmt = None
+        if metric_name == "%Pos":
+            fmt = "0.0%"
+        elif metric_name == "Avg. QS":
+            fmt = "0.00"
+        elif metric_name == "Avg. CPC":
+            fmt = '€#,##0.0000'
+        elif metric_name == "Nr. Kw":
+            fmt = "0"
+
+        fill_color = None
+        color = "000000"
+        if is_delta and isinstance(val, (int, float)) and val != 0:
+            positive_is_good = metric_name in ("Nr. Kw", "%Pos", "Avg. QS")
+            good = (val > 0 and positive_is_good) or (val < 0 and not positive_is_good)
+            fill_color = C_DELTA_POS if good else C_DELTA_NEG
+            color = "276221" if good else "9C0006"
+
+        _write(ws, r, c, val, fmt=fmt, fill_color=fill_color, color=color)
+
+    # ── Colonne: 1=Label, poi DOPO×4, PRIMA×4, Δ×4 → totale 13 ─────────────
+    N_METRICS = len(METRICS)
+    TOTAL_COLS = 1 + N_METRICS * 3  # 13
+
+    def _write_group_header(ws, row, label, start_col, span, color):
+        ws.merge_cells(start_row=row, start_column=start_col,
+                       end_row=row, end_column=start_col + span - 1)
+        c = ws.cell(row=row, column=start_col, value=label)
+        c.fill = _fill(color)
+        c.font = _font(bold=True, color="FFFFFF")
+        c.alignment = _align()
+        c.border = _border()
+
+    def _write_title(ws, row, title, n_cols):
+        ws.merge_cells(start_row=row, start_column=1,
+                       end_row=row, end_column=n_cols)
+        c = ws.cell(row=row, column=1, value=title)
+        c.fill = _fill(C_TITLE)
+        c.font = _font(bold=True, color="FFFFFF", size=10)
+        c.alignment = _align(h="left")
+        c.border = _border()
+        ws.row_dimensions[row].height = 18
+
+    def _write_header_rows(ws, row):
+        """Scrive le due righe di header (gruppi DOPO/PRIMA/Δ + metriche)."""
+        _write_group_header(ws, row,   "DOPO",  2,              N_METRICS, C_HDR_GRP)
+        _write_group_header(ws, row,   "PRIMA", 2 + N_METRICS,  N_METRICS, C_HDR_GRP)
+        _write_group_header(ws, row,   "Δ",     2 + N_METRICS*2, N_METRICS, C_HEADER_DARK
+                            if "C_HEADER_DARK" in dir() else "1F3864")
+        ws.row_dimensions[row].height = 16
+        for i, m in enumerate(METRICS * 3):
+            col = 2 + i
+            _write(ws, row + 1, col, m, bold=True, fill_color=C_HDR_COL,
+                   color="FFFFFF")
+        ws.row_dimensions[row + 1].height = 28
+
+    def _write_row(ws, row, label, md, mp, fill_color=None, bold=False, indent=False):
+        label_str = ("    " if indent else "") + label
+        _write(ws, row, 1, label_str, bold=bold, fill_color=fill_color, align_h="left")
+        dd = _delta(md, mp)
+        for i, m in enumerate(METRICS):
+            _write_metric(ws, row, 2 + i,            md[m], m)
+            _write_metric(ws, row, 2 + N_METRICS + i, mp[m], m)
+            _write_metric(ws, row, 2 + N_METRICS*2 + i, dd[m], m, is_delta=True)
+        if fill_color:
+            for col in range(1, TOTAL_COLS + 1):
+                ws.cell(row=row, column=col).fill = _fill(fill_color)
+        ws.row_dimensions[row].height = 16
+
+    # ── Calcola maschere brand/nobrand ───────────────────────────────────────
+    has_brand = bool(brand_col and brand_flag_values and brand_col in df_d.columns)
+
+    def _split(df, col, flags):
+        if col and col in df.columns and flags:
+            mask_b = _brand_mask(df[col], flags)
+        else:
+            mask_b = pd.Series(False, index=df.index)
+        return df[mask_b], df[~mask_b]
+
+    # ── Scrivi: imposta larghezze colonne ─────────────────────────────────────
+    ws.column_dimensions["A"].width = 22
+    for i in range(1, TOTAL_COLS):
+        ws.column_dimensions[get_column_letter(i + 1)].width = 11
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TABELLA 1 — Brand / No-Brand / Totale
+    # ══════════════════════════════════════════════════════════════════════════
+    r = 1
+    _write_title(ws, r, "▌ Brand / No-Brand", TOTAL_COLS); r += 1
+    _write(ws, r, 1, "", bold=True, fill_color=C_HDR_GRP, color="FFFFFF"); r_hdr = r
+    _write_header_rows(ws, r); r += 2
+
+    if has_brand:
+        bd, bnb = _split(df_d, brand_col, brand_flag_values)
+        bp, bnbp = _split(df_p, brand_col, brand_flag_values)
+        _write_row(ws, r, "Brand",    _metrics(bd),   _metrics(bp),   C_BRAND,   bold=True); r += 1
+        _write_row(ws, r, "No-Brand", _metrics(bnb),  _metrics(bnbp), C_NOBRAND, bold=True); r += 1
+    else:
+        # Nessun file classificazione — nota informativa
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=TOTAL_COLS)
+        ws.cell(row=r, column=1).value = "ℹ Carica un file di classificazione con colonna Brand/NoBrand per il dettaglio."
+        ws.cell(row=r, column=1).font = Font(name="Arial", size=9, italic=True, color="6B7280")
+        r += 1
+    _write_row(ws, r, "Totale", _metrics(df_d), _metrics(df_p), C_TOTAL, bold=True); r += 1
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TABELLA 2 — Cluster × Brand / No-Brand
+    # ══════════════════════════════════════════════════════════════════════════
+    r += 1
+    has_cat = bool(cat_col and cat_col in df_d.columns)
+
+    if has_cat:
+        _write_title(ws, r, "▌ Per Cluster", TOTAL_COLS); r += 1
+        _write(ws, r, 1, "", bold=True, fill_color=C_HDR_GRP, color="FFFFFF")
+        _write_header_rows(ws, r); r += 2
+
+        cats_d = df_d[cat_col].dropna().unique()
+        cats_p = df_p[cat_col].dropna().unique() if cat_col in df_p.columns else []
+        all_cats = sorted(set(list(cats_d) + list(cats_p)), key=str)
+
+        for cat in all_cats:
+            sub_d = df_d[df_d[cat_col] == cat] if cat_col in df_d.columns else df_d.iloc[0:0]
+            sub_p = df_p[df_p[cat_col] == cat] if cat_col in df_p.columns else df_p.iloc[0:0]
+            _write_row(ws, r, str(cat), _metrics(sub_d), _metrics(sub_p),
+                       C_CLUSTER, bold=True); r += 1
+            if has_brand:
+                bd2, bnb2 = _split(sub_d, brand_col, brand_flag_values)
+                bp2, bnbp2 = _split(sub_p, brand_col, brand_flag_values)
+                if len(bd2) or len(bp2):
+                    _write_row(ws, r, "Brand",    _metrics(bd2),  _metrics(bp2),  indent=True); r += 1
+                if len(bnb2) or len(bnbp2):
+                    _write_row(ws, r, "No-Brand", _metrics(bnb2), _metrics(bnbp2), indent=True); r += 1
+
+        _write_row(ws, r, "Totale", _metrics(df_d), _metrics(df_p), C_TOTAL, bold=True); r += 1
+    else:
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=TOTAL_COLS)
+        ws.cell(row=r, column=1).value = "ℹ Carica un file di classificazione con colonna Categoria/Cluster/Territorio per il dettaglio per cluster."
+        ws.cell(row=r, column=1).font = Font(name="Arial", size=9, italic=True, color="6B7280")
+
 def generate_excel(df_p, df_d, p_prima, p_dopo, qs_thr_brand=6, qs_thr_nobrand=6, classif_cols=None, brand_col=None, brand_values=None) -> bytes:
     wb = Workbook()
     wb.remove(wb.active)
     classif_cols = classif_cols or []
     build_tabelle_sheet(wb, df_p, df_d, p_prima, p_dopo)
+    cat_col_excel = next((c for c in classif_cols if c == INTERNAL_CATEGORIA_COL), None)
+    build_tabelle_report_sheet(wb, df_d, df_p, p_dopo, p_prima,
+                               brand_col, brand_values or set(), cat_col_excel)
     build_ads_sheet(wb, df_d, f"Kw {p_dopo} (DOPO)",  p_dopo,  C_HEADER_MID, classif_cols)
     build_ads_sheet(wb, df_p, f"Kw {p_prima} (PRIMA)", p_prima, "5B9BD5",     classif_cols)
     build_top10_sheet(wb, df_p, df_d, p_prima, p_dopo)
