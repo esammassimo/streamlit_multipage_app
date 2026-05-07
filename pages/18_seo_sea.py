@@ -602,7 +602,7 @@ def classify_qs_flag(df: pd.DataFrame, qs_brand=7, qs_nobrand=7,
         def _check(row):
             qs = row["quality_score"]
             val = str(row.get(brand_col, "")).strip().lower()
-            is_brand = any(bv in val for bv in brand_values)
+            is_brand = val in brand_values  # match ESATTO sul valore normalizzato
             thr = qs_brand if is_brand else qs_nobrand
             return check_qs(qs, thr)
         df["check_qs"] = df.apply(_check, axis=1)
@@ -850,21 +850,18 @@ def build_top10_sheet(wb, df_p, df_d, p_prima, p_dopo):
 
 def build_critiche_sheet(wb, df_d, p_dopo, qs_thr_brand=6.0, qs_thr_nobrand=6.0,
                          brand_col=None, brand_values=None):
+    """
+    Usa check_qs già calcolato da classify_qs_flag (con soglie brand/nobrand corrette).
+    Filtra solo le KW con check_qs == "KO" e costo > 0.
+    La logica di soglia non viene ricalcolata qui — è già nel df.
+    """
     ws = wb.create_sheet(title="Keyword critiche")
-    qs_col  = pd.to_numeric(df_d.get("quality_score", pd.Series(dtype=float)), errors="coerce")
     cost_col = df_d.get("cost", pd.Series(0.0, index=df_d.index)).fillna(0)
-    if brand_col and brand_col in df_d.columns and brand_values:
-        def _is_crit(row):
-            val = str(row.get(brand_col, "")).strip().lower()
-            is_brand = any(bv in val for bv in brand_values)
-            thr = qs_thr_brand if is_brand else qs_thr_nobrand
-            qs = pd.to_numeric(row.get("quality_score"), errors="coerce")
-            return (not pd.isna(qs)) and float(qs) <= thr and float(row.get("cost") or 0) > 0
-        mask = df_d.apply(_is_crit, axis=1)
-    else:
-        mask = (qs_col <= qs_thr_nobrand) & (cost_col > 0) & qs_col.notna()
+    check_col = df_d.get("check_qs", pd.Series("", index=df_d.index)).fillna("")
+    # Critica = check_qs KO + costo > 0
+    mask = (check_col == "KO") & (cost_col > 0)
     df_c = df_d[mask].sort_values("cost", ascending=False) if "cost" in df_d.columns else df_d[mask]
-    thr_label = f"Brand ≤{int(qs_thr_brand)} / No-Brand ≤{int(qs_thr_nobrand)}" if brand_col else f"≤{int(qs_thr_nobrand)}"
+    thr_label = f"Brand ≥{int(qs_thr_brand)} / No-Brand ≥{int(qs_thr_nobrand)}" if brand_col else f"≥{int(qs_thr_nobrand)}"
     # Usa INTERNAL_BRAND_COL se presente (da file classificazione), altrimenti brand_nobrand nativo
     brand_col_out = INTERNAL_BRAND_COL if INTERNAL_BRAND_COL in df_c.columns else "brand_nobrand"
     cat_col_out   = INTERNAL_CATEGORIA_COL if INTERNAL_CATEGORIA_COL in df_c.columns else None
@@ -1114,49 +1111,104 @@ with row2_c2:
 st.caption("✱ obbligatorio")
 st.divider()
 
-# ── CONFIGURAZIONE SOGLIE QS ──────────────────────────────────
+# ── SOGLIE QS — configurazione prima del processing ──────────
 st.markdown("### ⚙️ Soglie Quality Score")
 st.caption(
-    "Imposta le soglie minime di QS per Brand e No-Brand. "
-    "Le keyword con QS inferiore alla soglia saranno segnalate come critiche. "
-    "Se carichi un file di classificazione con colonna Brand/NoBrand, "
-    "le soglie verranno applicate per riga in base alla classificazione."
+    "Imposta le soglie minime di QS prima di avviare l'analisi. "
+    "Con un file di classificazione Brand/NoBrand le soglie vengono applicate per tipo di keyword."
 )
-
 _qs_c1, _qs_c2 = st.columns(2)
 with _qs_c1:
     qs_thr_brand = st.slider(
-        "QS minimo Brand",
-        min_value=1, max_value=10, value=7, step=1,
-        help="Keyword Brand con QS inferiore a questa soglia → segnalate come critiche (KO)."
+        "QS minimo — Brand", min_value=1, max_value=10,
+        value=st.session_state.get("qs_thr_brand", 8), step=1,
+        key="qs_thr_brand",
+        help="Keyword Brand con QS < soglia → KO"
     )
 with _qs_c2:
     qs_thr_nobrand = st.slider(
-        "QS minimo No-Brand",
-        min_value=1, max_value=10, value=6, step=1,
-        help="Keyword No-Brand con QS inferiore a questa soglia → segnalate come critiche (KO)."
+        "QS minimo — No-Brand", min_value=1, max_value=10,
+        value=st.session_state.get("qs_thr_nobrand", 6), step=1,
+        key="qs_thr_nobrand",
+        help="Keyword No-Brand con QS < soglia → KO"
     )
+
 st.divider()
 
+# ── BOTTONE AVVIO ─────────────────────────────────────────────
+_can_run = file_prima is not None and file_dopo is not None
+if _can_run:
+    if st.button("▶ Genera analisi", type="primary", use_container_width=False):
+        st.session_state["_run"] = True
+        st.session_state["_qs_thr_brand"]   = qs_thr_brand
+        st.session_state["_qs_thr_nobrand"] = qs_thr_nobrand
+        # Invalida cache se cambiano i file
+        st.session_state["_cache_key"] = None
+else:
+    st.info("Carica i file ADS PRIMA e ADS DOPO per avviare l'analisi.")
+
 # ── PROCESS ──────────────────────────────────────────────────
-if file_prima and file_dopo:
+if _can_run and st.session_state.get("_run"):
+    # Leggi le soglie salvate al momento del click (non quelle correnti degli slider)
+    qs_thr_brand   = st.session_state.get("_qs_thr_brand",   qs_thr_brand)
+    qs_thr_nobrand = st.session_state.get("_qs_thr_nobrand", qs_thr_nobrand)
     try:
-        with st.spinner("Parsing file Google Ads..."):
-            df_prima = parse_ads_file(file_prima)
-            df_dopo  = parse_ads_file(file_dopo)
+        # Cache key: rigenera il parsing solo se cambiano i file
+        _cache_key = (
+            getattr(file_prima,   "name", "") + str(getattr(file_prima,   "size", "")),
+            getattr(file_dopo,    "name", "") + str(getattr(file_dopo,    "size", "")),
+            getattr(file_gsc,     "name", "") + str(getattr(file_gsc,     "size", "")) if file_gsc    else "",
+            getattr(file_classif, "name", "") + str(getattr(file_classif, "size", "")) if file_classif else "",
+        )
+        _needs_reparse = st.session_state.get("_cache_key") != _cache_key
 
-            df_gsc = parse_gsc_file(file_gsc) if file_gsc else None
-            df_prima = join_with_gsc(df_prima, df_gsc)
-            df_dopo  = join_with_gsc(df_dopo,  df_gsc)
-            df_sf = parse_screaming_frog(file_sf) if file_sf else None
-            # NOTA: classify_qs_flag viene chiamata DOPO il join classificazione
-            # così check_qs usa le soglie Brand/NoBrand corrette
+        if _needs_reparse:
+            with st.spinner("Parsing file..."):
+                df_prima = parse_ads_file(file_prima)
+                df_dopo  = parse_ads_file(file_dopo)
+                df_gsc   = parse_gsc_file(file_gsc) if file_gsc else None
+                df_prima = join_with_gsc(df_prima, df_gsc)
+                df_dopo  = join_with_gsc(df_dopo,  df_gsc)
+                df_sf    = parse_screaming_frog(file_sf) if file_sf else None
 
-        # Default variabili classificazione — sovrascritte se file caricato
-        brand_col_detected = None
-        brand_flag_values  = set()
-        classif_extra_cols = []  # sovrascritta se file classificazione caricato
-        # qs_thr_brand e qs_thr_nobrand definiti dagli slider sopra
+                brand_col_detected = None
+                brand_flag_values  = set()
+                classif_extra_cols = []
+                if file_classif:
+                    try:
+                        df_classif, classif_extra_cols, _brand_col, _cat_col = parse_classification_file(file_classif)
+                        df_dopo  = join_classification(df_dopo,  df_classif, classif_extra_cols)
+                        df_prima = join_classification(df_prima, df_classif, classif_extra_cols)
+                        if _brand_col and _brand_col in df_dopo.columns:
+                            brand_col_detected = _brand_col
+                            vals = df_dopo[_brand_col].dropna().unique()
+                            brand_flag_values = {
+                                str(v).strip().lower() for v in vals
+                                if "brand" in str(v).lower()
+                                and not str(v).strip().lower().startswith("no")
+                                and not str(v).strip().lower().startswith("non")
+                            }
+                    except Exception as ce:
+                        st.error(f"❌ Errore nel file classificazione: {ce}")
+
+                st.session_state["_cache_key"]          = _cache_key
+                st.session_state["_df_prima"]           = df_prima
+                st.session_state["_df_dopo"]            = df_dopo
+                st.session_state["_df_sf"]              = df_sf
+                st.session_state["_brand_col"]          = brand_col_detected
+                st.session_state["_brand_flag_values"]  = brand_flag_values
+                st.session_state["_classif_extra_cols"] = classif_extra_cols
+        else:
+            df_prima           = st.session_state["_df_prima"]
+            df_dopo            = st.session_state["_df_dopo"]
+            df_sf              = st.session_state.get("_df_sf")
+            brand_col_detected = st.session_state["_brand_col"]
+            brand_flag_values  = st.session_state["_brand_flag_values"]
+            classif_extra_cols = st.session_state["_classif_extra_cols"]
+
+        brand_col_detected = brand_col_detected or None
+        brand_flag_values  = brand_flag_values  or set()
+        classif_extra_cols = classif_extra_cols or []
 
         # Avviso automatico se colonne chiave mancano nel DOPO
         missing_key = [c for c in ["quality_score", "cost", "impressions", "clicks"]
@@ -1374,27 +1426,17 @@ if file_prima and file_dopo:
                 st.dataframe(df_top10, use_container_width=True, hide_index=True)
 
         with tab4:
-            qs_col   = pd.to_numeric(df_dopo.get("quality_score", pd.Series(dtype=float)), errors="coerce")
+            # check_qs già calcolato da classify_qs_flag con soglie brand/nobrand corrette
             cost_col = df_dopo.get("cost", pd.Series(0.0, index=df_dopo.index)).fillna(0)
-            # brand_col_detected punta già a INTERNAL_BRAND_COL se da classificazione
-            if brand_col_detected and brand_col_detected in df_dopo.columns and brand_flag_values:
-                def _crit_ui(row):
-                    val = str(row.get(brand_col_detected, "")).strip().lower()
-                    is_brand = any(bv in val for bv in brand_flag_values)
-                    thr = qs_thr_brand if is_brand else qs_thr_nobrand
-                    qs   = pd.to_numeric(row.get("quality_score"), errors="coerce")
-                    cost = float(row.get("cost") or 0)
-                    return (not pd.isna(qs)) and float(qs) <= thr and cost > 0
-                mask = df_dopo.apply(_crit_ui, axis=1)
-            else:
-                mask = (qs_col <= qs_thr_nobrand) & (cost_col > 0) & qs_col.notna()
+            check_col = df_dopo.get("check_qs", pd.Series("", index=df_dopo.index)).fillna("")
+            mask = (check_col == "KO") & (cost_col > 0)
             df_crit = df_dopo[mask].sort_values("cost", ascending=False) if "cost" in df_dopo.columns else df_dopo[mask]
-            thr_label = f"Brand ≤{qs_thr_brand} / No-Brand ≤{qs_thr_nobrand}" if brand_col_detected else f"≤{qs_thr_nobrand}"
+            thr_label = f"Brand ≥{qs_thr_brand} / No-Brand ≥{qs_thr_nobrand}" if brand_col_detected else f"≥{qs_thr_nobrand}"
 
             if df_crit.empty:
-                st.success(f"✓ Nessuna keyword critica trovata (soglia QS {thr_label}) e costo > 0")
+                st.success(f"✓ Nessuna keyword critica trovata (QS minimo {thr_label}) con costo > 0")
             else:
-                st.warning(f"⚠️ {len(df_crit)} keyword critiche (QS {thr_label}) con spesa registrata")
+                st.warning(f"⚠️ {len(df_crit)} keyword critiche (QS minimo {thr_label}) con spesa registrata")
                 crit_cols = [c for c in (
                     ["keyword", "match_type"] +
                     ([brand_col_detected] if brand_col_detected and brand_col_detected in df_crit.columns else []) +
@@ -1491,54 +1533,52 @@ if file_prima and file_dopo:
                         if not has_sf_data:
                             st.caption("💡 Carica un export Screaming Frog nella sidebar per vedere i title e il check keyword/title.")
 
-        # ── CLASSIFICAZIONE KEYWORD ────────────────────────────
+        # ── CLASSIFICAZIONE KEYWORD — riepilogo ───────────────
         st.divider()
         st.markdown("### 🏷️ Classificazione Keyword")
 
-        df_classif = None
-        classif_extra_cols = []
-        brand_col_detected = None
-        brand_flag_values  = set()
+        if file_classif and classif_extra_cols:
+            _proxy = classif_extra_cols[0]
+            n_dopo  = int((df_dopo[_proxy]  != "").sum()) if _proxy in df_dopo.columns  else 0
+            n_prima = int((df_prima[_proxy] != "").sum()) if _proxy in df_prima.columns else 0
+            cs1, cs2, cs3 = st.columns(3)
+            cs1.metric("Colonne aggiunte", len(classif_extra_cols))
+            cs2.metric("Match DOPO",  f"{n_dopo}/{len(df_dopo)}")
+            cs3.metric("Match PRIMA", f"{n_prima}/{len(df_prima)}")
+            col_labels = []
+            for c in classif_extra_cols:
+                if c == INTERNAL_BRAND_COL:
+                    col_labels.append(f"{c} (brand)")
+                elif c == INTERNAL_CATEGORIA_COL:
+                    col_labels.append(f"{c} (categoria)")
+                else:
+                    col_labels.append(c)
+            st.success(f"✓ Classificazione applicata — {', '.join(col_labels)}")
+        elif file_classif:
+            st.info("File classificazione caricato ma nessuna colonna riconosciuta oltre la keyword.")
+        else:
+            st.caption("Nessun file di classificazione caricato.")
 
-        if file_classif:
-            try:
-                df_classif, classif_extra_cols, _brand_col, _cat_col = parse_classification_file(file_classif)
-                # Join su entrambi i periodi
-                df_dopo  = join_classification(df_dopo,  df_classif, classif_extra_cols)
-                df_prima = join_classification(df_prima, df_classif, classif_extra_cols)
-                # Stats match (usa prima colonna disponibile come proxy)
-                _proxy = classif_extra_cols[0] if classif_extra_cols else None
-                n_dopo  = int((df_dopo[_proxy]  != "").sum()) if _proxy else 0
-                n_prima = int((df_prima[_proxy] != "").sum()) if _proxy else 0
-                cs1, cs2, cs3 = st.columns(3)
-                cs1.metric("Colonne aggiunte", len(classif_extra_cols))
-                cs2.metric("Match DOPO",  f"{n_dopo}/{len(df_dopo)}")
-                cs3.metric("Match PRIMA", f"{n_prima}/{len(df_prima)}")
-                # Mostra colonne riconosciute con tipo
-                col_labels = []
-                for c in classif_extra_cols:
-                    if c == INTERNAL_BRAND_COL:
-                        col_labels.append(f"{c} (brand)")
-                    elif c == INTERNAL_CATEGORIA_COL:
-                        col_labels.append(f"{c} (categoria)")
-                    else:
-                        col_labels.append(c)
-                st.success(f"✓ Classificazione applicata — {', '.join(col_labels)}")
+        # Mostra preview distribuzione brand/nobrand dopo il parsing
+        if brand_col_detected and brand_col_detected in df_dopo.columns and brand_flag_values:
+            def _is_brand_row(df, col, flag_vals):
+                return df[col].fillna("").str.strip().str.lower().apply(lambda v: v in flag_vals)
+            qs_col_d = pd.to_numeric(df_dopo.get("quality_score",  pd.Series(dtype=float)), errors="coerce")
+            qs_col_p = pd.to_numeric(df_prima.get("quality_score", pd.Series(dtype=float)), errors="coerce")
+            mask_d = _is_brand_row(df_dopo,  brand_col_detected, brand_flag_values)
+            mask_p = _is_brand_row(df_prima, brand_col_detected, brand_flag_values)
+            qs_b_d = qs_col_d[mask_d].dropna();  qs_nb_d = qs_col_d[~mask_d].dropna()
+            qs_b_p = qs_col_p[mask_p].dropna();  qs_nb_p = qs_col_p[~mask_p].dropna()
+            st.caption(
+                f"📊 **DOPO** — Brand: {len(qs_b_d)} KW, QS medio {qs_b_d.mean():.1f} · "
+                f"No-Brand: {len(qs_nb_d)} KW, QS medio {qs_nb_d.mean():.1f}"
+            )
+            st.caption(
+                f"📊 **PRIMA** — Brand: {len(qs_b_p)} KW, QS medio {qs_b_p.mean():.1f} · "
+                f"No-Brand: {len(qs_nb_p)} KW, QS medio {qs_nb_p.mean():.1f}"
+            )
 
-                # Usa brand_col rilevato da parser
-                if _brand_col and _brand_col in df_dopo.columns:
-                    brand_col_detected = _brand_col
-                    vals = df_dopo[_brand_col].dropna().unique()
-                    brand_flag_values = {
-                        str(v).strip().lower() for v in vals
-                        if "brand" in str(v).lower()
-                        and "no" not in str(v).lower()
-                        and "non" not in str(v).lower()
-                    }
-            except Exception as ce:
-                st.error(f"❌ Errore nel file classificazione: {ce}")
-
-        # ── Ricalcola check_qs con soglie e colonna brand rilevata ──
+        # Applica check_qs con le soglie salvate al click del bottone
         df_dopo  = classify_qs_flag(df_dopo,  qs_thr_brand, qs_thr_nobrand,
                                     brand_col_detected, brand_flag_values)
         df_prima = classify_qs_flag(df_prima, qs_thr_brand, qs_thr_nobrand,
