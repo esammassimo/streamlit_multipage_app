@@ -1028,12 +1028,16 @@ def build_tabelle_report_sheet(wb, df_d, df_p, p_dopo, p_prima,
             return {"Nr. Kw": 0, "Avg. QS": None, "%Pos": None, "Avg. CPC": None}
         qs  = pd.to_numeric(_safe_col(sub, "quality_score"), errors="coerce").dropna()
         cpc = pd.to_numeric(_safe_col(sub, "avg_cpc"),       errors="coerce").dropna()
-        pos = pd.to_numeric(_safe_col(sub, "pos_organica"),  errors="coerce")
-        has_pos = pos.notna() & (pos > 0)
+        # %Pos = OK / (OK + KO) — esclude celle vuote o N/D
+        chk = _safe_col(sub, "check_qs").fillna("")
+        n_ok  = (chk == "OK").sum()
+        n_ko  = (chk == "KO").sum()
+        n_tot = n_ok + n_ko
+        pct_pos = round(float(n_ok / n_tot), 4) if n_tot > 0 else None
         return {
             "Nr. Kw":   len(sub),
-            "Avg. QS":  round(float(qs.mean()),  2) if len(qs)  else None,
-            "%Pos":     round(float(has_pos.mean()), 4) if len(sub) and "pos_organica" in sub.columns else None,
+            "Avg. QS":  round(float(qs.mean()), 2) if len(qs) else None,
+            "%Pos":     pct_pos,
             "Avg. CPC": round(float(cpc.mean()), 4) if len(cpc) else None,
         }
 
