@@ -797,53 +797,109 @@ def build_ads_sheet(wb, df, name, periodo, color, classif_cols=None):
     ws.auto_filter.ref = f"A2:{get_column_letter(n)}2"
 
 
-def build_top10_sheet(wb, df_p, df_d, p_prima, p_dopo):
+def build_top10_sheet(wb, df_p, df_d, p_prima, p_dopo, cat_col=None):
     ws = wb.create_sheet(title="TOP10 Kw per costo")
     headers = ["Search Keyword", "Match Type",
                f"QS {p_dopo}", f"QS {p_prima}", "Δ QS",
                f"Cost {p_dopo}", f"Cost {p_prima}"]
+    n_cols = len(headers)
 
     def agg(df):
+        if "keyword" not in df.columns:
+            return pd.DataFrame()
         d = df.copy()
-        d["kk"] = d["keyword"].str.strip().str.lower()
-        return d.groupby(["kk", "match_type"], dropna=False).agg(
-            qs=("quality_score", "mean"), cost=("cost", "sum")).reset_index()
+        d["kk"] = d["keyword"].fillna("").astype(str).str.strip().str.lower()
+        cols = ["kk"] + (["match_type"] if "match_type" in d.columns else [])
+        agg_dict = {}
+        if "quality_score" in d.columns:
+            agg_dict["qs"] = ("quality_score", "mean")
+        if "cost" in d.columns:
+            agg_dict["cost"] = ("cost", "sum")
+        if not agg_dict:
+            return pd.DataFrame()
+        return d.groupby(cols, dropna=False).agg(**agg_dict).reset_index()
 
-    ad = agg(df_d); ap = agg(df_p)
-    merged = ad.merge(ap, on=["kk", "match_type"], how="outer", suffixes=("_d", "_p"))
-    top10 = merged.nlargest(10, "cost_d").reset_index(drop=True)
+    def _write_top10_block(ws, start_row, df_d_sub, df_p_sub, title, color=C_HEADER_DARK):
+        """Scrive un blocco TOP10 a partire da start_row. Ritorna la riga successiva."""
+        r = start_row
+        ad = agg(df_d_sub); ap = agg(df_p_sub)
+        if ad.empty:
+            return r
 
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
-    c = ws.cell(row=1, column=1)
-    c.value = f"TOP 10 Keyword per Costo · {p_dopo} vs {p_prima}"
-    c.fill = PatternFill("solid", fgColor=C_HEADER_DARK)
-    c.font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
-    c.alignment = Alignment(horizontal="center", vertical="center")
-    for j, h in enumerate(headers, 1):
-        ws.cell(row=2, column=j).value = h
-    hdr(ws, 2, C_HEADER_DARK)
+        join_keys = ["kk"] + (["match_type"] if "match_type" in ad.columns and "match_type" in ap.columns else [])
+        merged = ad.merge(ap, on=join_keys, how="outer", suffixes=("_d", "_p"))
+        sort_col = "cost_d" if "cost_d" in merged.columns else ("cost" if "cost" in merged.columns else None)
+        if sort_col is None:
+            return r
+        top10 = merged.nlargest(10, sort_col).reset_index(drop=True)
 
-    for i, row in top10.iterrows():
-        r = i + 3
-        qs_d = row.get("qs_d", np.nan)
-        qs_p = row.get("qs_p", np.nan)
-        try:
-            dq = float(qs_d) - float(qs_p)
-        except Exception:
-            dq = np.nan
-        vals = [row["kk"].title(), row.get("match_type", ""),
+        # Titolo blocco
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=n_cols)
+        c = ws.cell(row=r, column=1)
+        c.value = title
+        c.fill = PatternFill("solid", fgColor=color)
+        c.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[r].height = 20
+        r += 1
+
+        # Header colonne
+        for j, h in enumerate(headers, 1):
+            ws.cell(row=r, column=j).value = h
+        hdr(ws, r, color)
+        ws.row_dimensions[r].height = 28
+        r += 1
+
+        # Dati
+        for i, row in top10.iterrows():
+            qs_d = row.get("qs_d", np.nan)
+            qs_p = row.get("qs_p", np.nan)
+            try:
+                dq = float(qs_d) - float(qs_p)
+            except Exception:
+                dq = np.nan
+            vals = [
+                row["kk"].title(),
+                row.get("match_type", ""),
                 round(qs_d, 1) if pd.notna(qs_d) else "nd",
                 round(qs_p, 1) if pd.notna(qs_p) else "nd",
-                round(dq, 1) if pd.notna(dq) else "-",
+                round(dq, 1)   if pd.notna(dq)   else "-",
                 round(row.get("cost_d", 0), 2),
-                round(row.get("cost_p", 0), 2)]
-        for j, v in enumerate(vals, 1):
-            ws.cell(row=r, column=j).value = v
-        data_row(ws, r, alt=(i % 2 == 1))
-        dc = ws.cell(row=r, column=5)
-        if pd.notna(dq):
-            dc.fill = PatternFill("solid", fgColor=C_OK if dq > 0 else (C_KO if dq < 0 else C_WHITE))
-            dc.font = Font(name="Arial", size=9, color="276221" if dq > 0 else "9C0006")
+                round(row.get("cost_p", 0), 2),
+            ]
+            for j, v in enumerate(vals, 1):
+                ws.cell(row=r, column=j).value = v
+            data_row(ws, r, alt=(i % 2 == 1))
+            dc = ws.cell(row=r, column=5)
+            if pd.notna(dq):
+                dc.fill = PatternFill("solid", fgColor=C_OK if dq > 0 else (C_KO if dq < 0 else C_WHITE))
+                dc.font = Font(name="Arial", size=9, color="276221" if dq > 0 else "9C0006")
+            r += 1
+
+        return r + 1  # riga vuota di separazione
+
+    # ── Tabella generale ────────────────────────────────────────────────────
+    current_row = _write_top10_block(
+        ws, 1, df_d, df_p,
+        f"TOP 10 Keyword per Costo — Generale · {p_dopo} vs {p_prima}",
+        color=C_HEADER_DARK
+    )
+
+    # ── Tabelle per categoria ────────────────────────────────────────────────
+    if cat_col and cat_col in df_d.columns:
+        cats = sorted(df_d[cat_col].dropna().unique(), key=str)
+        # Palette colori per le categorie
+        cat_colors = ["2E5FAB", "5B9BD5", "70AD47", "ED7D31", "9E480E",
+                      "7030A0", "375623", "833C00", "0563C1", "954F72"]
+        for i, cat in enumerate(cats):
+            color = cat_colors[i % len(cat_colors)]
+            sub_d = df_d[df_d[cat_col] == cat]
+            sub_p = df_p[df_p[cat_col] == cat] if cat_col in df_p.columns else df_p.iloc[0:0]
+            current_row = _write_top10_block(
+                ws, current_row, sub_d, sub_p,
+                f"TOP 10 Keyword per Costo — {cat} · {p_dopo} vs {p_prima}",
+                color=color
+            )
 
     auto_width(ws)
 
@@ -1246,7 +1302,7 @@ def generate_excel(df_p, df_d, p_prima, p_dopo, qs_thr_brand=6, qs_thr_nobrand=6
                                brand_col, brand_values or set(), cat_col_excel)
     build_ads_sheet(wb, df_d, f"Kw {p_dopo} (DOPO)",  p_dopo,  C_HEADER_MID, classif_cols)
     build_ads_sheet(wb, df_p, f"Kw {p_prima} (PRIMA)", p_prima, "5B9BD5",     classif_cols)
-    build_top10_sheet(wb, df_p, df_d, p_prima, p_dopo)
+    build_top10_sheet(wb, df_p, df_d, p_prima, p_dopo, cat_col_excel)
     build_critiche_sheet(wb, df_d, p_dopo, qs_thr_brand, qs_thr_nobrand, brand_col, brand_values)
     buf = io.BytesIO()
     wb.save(buf)
