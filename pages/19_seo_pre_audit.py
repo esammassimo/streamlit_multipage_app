@@ -11,9 +11,17 @@ Locale:
   streamlit run seo_audit_app.py
 """
 
-import streamlit as st
 import sys
 import os
+
+# ── PLAYWRIGHT_BROWSERS_PATH prima di qualsiasi import ───────────────────────
+for _pw_path in ["/opt/pw-browsers", "/home/appuser/.cache/ms-playwright",
+                 os.path.expanduser("~/.cache/ms-playwright")]:
+    if os.path.isdir(_pw_path):
+        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", _pw_path)
+        break
+
+import streamlit as st
 import json
 import time
 import tempfile
@@ -67,25 +75,11 @@ for _mod_name in ["19_seo_pre_audit", "seo_pre_audit", "seo_audit"]:
 # tramite packages.txt. La variabile PLAYWRIGHT_BROWSERS_PATH non è sempre
 # propagata al processo Python — la impostiamo noi prima di qualsiasi chiamata.
 
-_PW_BROWSER_PATHS = [
-    "/opt/pw-browsers",
-    "/home/appuser/.cache/ms-playwright",
-    os.path.expanduser("~/.cache/ms-playwright"),
-]
-
 @st.cache_resource(show_spinner=False)
 def _detect_playwright():
-    """Trova il browser Playwright e imposta PLAYWRIGHT_BROWSERS_PATH."""
-    # Imposta il path se non già valido
-    current = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
-    if not (current and os.path.isdir(current)):
-        for p in _PW_BROWSER_PATHS:
-            if os.path.isdir(p):
-                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = p
-                current = p
-                break
-
-    # Verifica che il browser sia effettivamente avviabile
+    """Verifica che Playwright riesca ad avviare il browser.
+    PLAYWRIGHT_BROWSERS_PATH è già impostato prima degli import.
+    """
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as pw:
@@ -95,7 +89,8 @@ def _detect_playwright():
                       "--single-process", "--disable-gpu"],
             )
             browser.close()
-        return True, f"Browser trovato in: {current or 'path default'}"
+        pw_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "default")
+        return True, f"Browser OK — path: {pw_path}"
     except Exception as exc:
         return False, str(exc)
 

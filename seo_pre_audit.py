@@ -16,11 +16,23 @@ Dipendenze: requests, beautifulsoup4, lxml, playwright, openpyxl
 
 import argparse
 import sys
+import os
 import re
 import json
 import time
 from urllib.parse import urlparse, urljoin
 from datetime import datetime
+
+# ── Imposta PLAYWRIGHT_BROWSERS_PATH PRIMA di importare playwright ────────────
+# Su Streamlit Cloud il browser è in /opt/pw-browsers (installato da packages.txt).
+# La variabile deve essere impostata prima dell'import altrimenti Playwright
+# risolve il path alla home dell'utente e non trova il browser.
+for _pw_path in ["/opt/pw-browsers", "/home/appuser/.cache/ms-playwright",
+                 os.path.expanduser("~/.cache/ms-playwright")]:
+    if os.path.isdir(_pw_path):
+        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", _pw_path)
+        break
+
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
@@ -126,36 +138,11 @@ def fetch_html_static(url, session):
         return None, None, str(e)
 
 
-# Percorsi candidati dove Playwright può trovare Chromium.
-# Streamlit Cloud installa il browser in /opt/pw-browsers tramite packages.txt +
-# la variabile d'ambiente PLAYWRIGHT_BROWSERS_PATH, ma questa non è sempre
-# propagata al processo Python. La impostiamo esplicitamente qui come fallback.
-_PW_BROWSER_PATHS = [
-    "/opt/pw-browsers",                        # Streamlit Cloud
-    "/home/appuser/.cache/ms-playwright",       # Streamlit Cloud alternativo
-    os.path.expanduser("~/.cache/ms-playwright"), # locale
-]
-
-def _ensure_pw_path():
-    """Imposta PLAYWRIGHT_BROWSERS_PATH al primo percorso che esiste."""
-    import os as _os
-    current = _os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
-    if current and _os.path.isdir(current):
-        return current                          # già impostato e valido
-    for p in _PW_BROWSER_PATHS:
-        if _os.path.isdir(p):
-            _os.environ["PLAYWRIGHT_BROWSERS_PATH"] = p
-            return p
-    return None
-
-
 def fetch_html_rendered(url):
     """Fetch con Playwright (JS eseguito).
-    Compatibile con Streamlit Cloud: imposta PLAYWRIGHT_BROWSERS_PATH
-    prima del launch in modo che il browser venga trovato anche quando
-    la variabile d'ambiente non è propagata dal processo padre.
+    Compatibile con Streamlit Cloud: PLAYWRIGHT_BROWSERS_PATH è impostato
+    all'avvio del modulo, prima dell'import di playwright.
     """
-    _ensure_pw_path()
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
