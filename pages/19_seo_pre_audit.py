@@ -20,8 +20,10 @@ import glob as _glob
 _PW_HOME = os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = _PW_HOME
 
-if not _glob.glob(os.path.join(_PW_HOME, "chromium*")):
-    os.system("playwright install chromium")
+# Installa sempre il browser — playwright salta il download se già presente.
+# Non usiamo il glob perché la cartella potrebbe esistere ma il binario no.
+import subprocess as _sp
+_sp.run(["playwright", "install", "chromium"], check=False)
 
 import streamlit as st
 import json
