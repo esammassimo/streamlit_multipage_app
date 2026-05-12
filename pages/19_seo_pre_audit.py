@@ -14,17 +14,6 @@ Locale:
 import sys
 import os
 
-# ── Playwright: installa browser se mancante ─────────────────────────────────
-import glob as _glob
-
-_PW_HOME = os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = _PW_HOME
-
-# Installa sempre il browser — playwright salta il download se già presente.
-# Non usiamo il glob perché la cartella potrebbe esistere ma il binario no.
-import subprocess as _sp
-_sp.run(["playwright", "install", "chromium"], check=False)
-
 import streamlit as st
 import json
 import time
@@ -81,17 +70,11 @@ for _mod_name in ["seo_pre_audit", "seo_audit"]:
 
 @st.cache_resource(show_spinner=False)
 def _detect_playwright():
-    """Verifica che Playwright riesca ad avviare il browser."""
+    """Controlla se Playwright è disponibile nel modulo seo_pre_audit."""
     try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage",
-                      "--single-process", "--disable-gpu"],
-            )
-            browser.close()
-        return True, "Browser OK"
+        if sa and getattr(sa, 'PLAYWRIGHT_AVAILABLE', False):
+            return True, "Playwright disponibile"
+        return False, "Playwright non disponibile — solo fetch statico attivo"
     except Exception as exc:
         return False, str(exc)
 
@@ -107,7 +90,7 @@ USE_PLAYWRIGHT: bool = _pw_ok
 FETCH_TIMEOUT: int = 15
 
 # Numero massimo di URL analizzabili da file (protezione Cloud)
-MAX_URLS: int = 20
+MAX_URLS: int = 100
 
 
 # ─── COSTANTI UI ─────────────────────────────────────────────────────────────
@@ -160,21 +143,31 @@ def color_cell(val):
     return m.get(val, "")
 
 def export_download(label, generate_fn, suffix, mime):
-    """Genera un file temporaneo e mostra il bottone download."""
-    if st.button(f"Genera e scarica {label}", use_container_width=True):
-        with st.spinner("Generazione…"):
+    """Genera un file e salva i bytes in session_state per persistenza tra rerun."""
+    key_data  = f"_export_data_{label}"
+    key_fname = f"_export_fname_{label}"
+
+    if st.button(f"Genera {label}", use_container_width=True):
+        with st.spinner(f"Generazione {label}…"):
             try:
                 with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                     tmp_path = tmp.name
                 generate_fn(tmp_path)
-                data = open(tmp_path, "rb").read()
+                st.session_state[key_data]  = open(tmp_path, "rb").read()
+                st.session_state[key_fname] = f"seo_audit_{datetime.now().strftime('%Y%m%d_%H%M')}{suffix}"
                 os.unlink(tmp_path)
-                fname = f"seo_audit_{datetime.now().strftime('%Y%m%d_%H%M')}{suffix}"
-                st.download_button(f"⬇️ Scarica {label}", data=data,
-                                   file_name=fname, mime=mime,
-                                   use_container_width=True)
             except Exception as exc:
-                st.error(f"Errore: {exc}")
+                st.error(f"Errore generazione {label}: {exc}")
+                return
+
+    if key_data in st.session_state:
+        st.download_button(
+            f"⬇️ Scarica {label}",
+            data=st.session_state[key_data],
+            file_name=st.session_state[key_fname],
+            mime=mime,
+            use_container_width=True,
+        )
 
 
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────────────
@@ -263,17 +256,22 @@ with tab_single:
 
 # ── Tab 2: Sitemap XML ────────────────────────────────────────────────────────
 with tab_sitemap:
-    st.caption(
-        f"Inserisci l'URL della sitemap XML. "
-        f"Verranno analizzate al massimo **{MAX_URLS}** URL."
-    )
-    col_sm, col_bsm = st.columns([6, 1])
+    col_sm, col_num, col_bsm = st.columns([5, 2, 1])
     with col_sm:
         sitemap_url = st.text_input(
             "Sitemap URL",
             placeholder="https://tuosito.com/sitemap.xml",
             label_visibility="collapsed",
             key="sitemap_url",
+        )
+    with col_num:
+        sitemap_max = st.number_input(
+            "Max URL",
+            min_value=1,
+            max_value=MAX_URLS,
+            value=10,
+            step=1,
+            help=f"Numero di URL da analizzare dalla sitemap (max {MAX_URLS})",
         )
     with col_bsm:
         run_sitemap = st.button(
@@ -284,33 +282,35 @@ with tab_sitemap:
         )
 
     if sitemap_url.strip():
-        # Anteprima URL in sitemap
-        if st.button("👁 Anteprima URL sitemap", key="preview_sitemap"):
-            with st.spinner("Lettura sitemap…"):
-                try:
-                    preview_urls = sa.get_urls_from_sitemap(
-                        sitemap_url.strip(), sa.get_session(), MAX_URLS
-                    )
-                    if preview_urls:
-                        st.info(f"✅ {len(preview_urls)} URL trovati nella sitemap")
-                        with st.expander(f"Mostra URL ({len(preview_urls)})"):
-                            for u in preview_urls:
-                                st.code(u, language="text")
-                    else:
-                        st.warning("Nessuna URL trovata. Verifica che la sitemap sia accessibile e in formato XML standard.")
-                except Exception as exc:
-                    st.error(f"Errore lettura sitemap: {exc}")
+        col_prev, _ = st.columns([2, 6])
+        with col_prev:
+            if st.button("👁 Anteprima URL", key="preview_sitemap"):
+                with st.spinner("Lettura sitemap…"):
+                    try:
+                        preview_urls = sa.get_urls_from_sitemap(
+                            sitemap_url.strip(), sa.get_session(), MAX_URLS
+                        )
+                        if preview_urls:
+                            st.info(f"✅ {len(preview_urls)} URL trovati nella sitemap — verranno analizzate le prime {sitemap_max}")
+                            with st.expander(f"Mostra tutte le URL ({len(preview_urls)})"):
+                                for u in preview_urls:
+                                    st.code(u, language="text")
+                        else:
+                            st.warning("Nessuna URL trovata. Verifica che la sitemap sia accessibile e in formato XML standard.")
+                    except Exception as exc:
+                        st.error(f"Errore lettura sitemap: {exc}")
 
     if run_sitemap:
         if sitemap_url.strip().startswith("http"):
             with st.spinner("Lettura sitemap…"):
                 try:
                     from_sitemap = sa.get_urls_from_sitemap(
-                        sitemap_url.strip(), sa.get_session(), MAX_URLS
+                        sitemap_url.strip(), sa.get_session(), int(sitemap_max)
                     )
                     if from_sitemap:
                         urls_to_audit = from_sitemap
                         input_label   = sitemap_url.strip()
+                        st.info(f"✅ {len(from_sitemap)} URL caricate dalla sitemap")
                     else:
                         st.error("Nessuna URL trovata nella sitemap.")
                 except Exception as exc:
@@ -320,11 +320,8 @@ with tab_sitemap:
 
 # ── Tab 3: File CSV / Excel ───────────────────────────────────────────────────
 with tab_file:
-    st.caption(
-        f"Il file deve avere una colonna chiamata **url**. "
-        f"Massimo **{MAX_URLS}** URL per analisi."
-    )
-    col_up, col_bup = st.columns([6, 1])
+    col_up, col_num_f, col_bup = st.columns([4, 2, 1])
+    file_max = MAX_URLS  # default, aggiornato dopo l'upload
     with col_up:
         uploaded = st.file_uploader(
             "File",
@@ -349,12 +346,23 @@ with tab_file:
                 None,
             )
             if col_name:
-                from_file = (
+                all_file_urls = (
                     df_up[col_name].dropna().astype(str).str.strip()
                     .pipe(lambda s: s[s.str.startswith("http")])
-                    .tolist()[:MAX_URLS]
+                    .tolist()
                 )
-                st.info(f"✅ {len(from_file)} URL trovati nel file")
+                total_in_file = len(all_file_urls)
+                with col_num_f:
+                    file_max = st.number_input(
+                        "Max URL",
+                        min_value=1,
+                        max_value=min(total_in_file, MAX_URLS),
+                        value=min(10, total_in_file),
+                        step=1,
+                        help=f"{total_in_file} URL nel file, max {MAX_URLS} analizzabili",
+                    )
+                from_file = all_file_urls[:int(file_max)]
+                st.info(f"✅ {total_in_file} URL nel file — verranno analizzate le prime {len(from_file)}")
                 with st.expander(f"Anteprima URL ({min(5, len(from_file))} di {len(from_file)})"):
                     for u in from_file[:5]:
                         st.code(u, language="text")
@@ -574,7 +582,7 @@ with tabs[1]:
     df_pg = pd.DataFrame(rows)
     st.dataframe(
         df_pg.style
-             .applymap(color_cell, subset=BADGE_COLS)
+             .map(color_cell, subset=BADGE_COLS)
              .background_gradient(subset=["Score"], cmap="RdYlGn", vmin=0, vmax=100),
         use_container_width=True,
         height=min(600, 80 + 38 * len(df_pg)),
@@ -648,7 +656,7 @@ with tabs[2]:
         df_pr = pd.DataFrame(probs)
         df_pr = df_pr[df_pr["Severity"].isin(sev_f)]
         st.dataframe(
-            df_pr.style.applymap(color_cell, subset=["Severity"]),
+            df_pr.style.map(color_cell, subset=["Severity"]),
             use_container_width=True,
             height=min(700, 80 + 38 * len(df_pr)),
         )
@@ -754,7 +762,7 @@ with tabs[5]:
             "Nota":      f.get("note", "")[:120],
         } for f in r["findings"]])
         st.dataframe(
-            df_f.style.applymap(color_cell, subset=["Severity"]),
+            df_f.style.map(color_cell, subset=["Severity"]),
             use_container_width=True, hide_index=True,
         )
     else:
@@ -849,7 +857,7 @@ with tabs[7]:
                 "Problema":        f.get("tipo", ""),
                 "Metrica CWV":     f.get("impatto", ""),
                 "Raccomandazione": f.get("nota", "")[:130],
-            } for f in pf]).style.applymap(color_cell, subset=["Severity"]),
+            } for f in pf]).style.map(color_cell, subset=["Severity"]),
             use_container_width=True, hide_index=True,
         )
 
@@ -953,17 +961,21 @@ with tabs[9]:
     st.divider()
     st.markdown("**📋 Dati grezzi JSON**")
     st.caption("Per integrazione con altri tool o archiviazione strutturata.")
-    try:
-        json_data = json.dumps(
-            [[{k: v for k, v in r.items() if k != "robots_content"} for r in pg]
-             for pg in grouped],
-            ensure_ascii=False, indent=2, default=str,
-        ).encode("utf-8")
+    if st.button("Genera JSON", use_container_width=False):
+        try:
+            st.session_state["_export_data_JSON"] = json.dumps(
+                [[{k: v for k, v in r.items() if k != "robots_content"} for r in pg]
+                 for pg in grouped],
+                ensure_ascii=False, indent=2, default=str,
+            ).encode("utf-8")
+            st.session_state["_export_fname_JSON"] = f"seo_audit_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
+        except Exception as exc:
+            st.error(f"Errore JSON: {exc}")
+
+    if "_export_data_JSON" in st.session_state:
         st.download_button(
             "⬇️ Scarica JSON",
-            data=json_data,
-            file_name=f"seo_audit_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            data=st.session_state["_export_data_JSON"],
+            file_name=st.session_state["_export_fname_JSON"],
             mime="application/json",
         )
-    except Exception as exc:
-        st.error(f"Errore JSON: {exc}")

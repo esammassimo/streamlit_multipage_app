@@ -28,17 +28,19 @@ from datetime import datetime
 # È il metodo confermato dalla community ufficiale Streamlit.
 import glob as _glob
 
-_PW_HOME = os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = _PW_HOME
-
-# Installa sempre il browser — playwright salta il download se già presente.
-# Non usiamo il glob perché la cartella potrebbe esistere ma il binario no.
-import subprocess as _sp
-_sp.run(["playwright", "install", "chromium"], check=False)
-
 import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+
+# Playwright opzionale — funziona senza per il fetch statico
+import warnings as _warnings
+_warnings.filterwarnings("ignore")
+try:
+    import logging as _logging
+    _logging.getLogger("playwright").setLevel(_logging.ERROR)
+    from playwright.sync_api import sync_playwright as _sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -142,11 +144,13 @@ def fetch_html_static(url, session):
 
 
 def fetch_html_rendered(url):
-    """Fetch con Playwright (JS eseguito).
-    Compatibile con Streamlit Cloud: PLAYWRIGHT_BROWSERS_PATH è impostato
-    all'avvio del modulo, prima dell'import di playwright.
-    """
+    """Fetch con Playwright (JS eseguito). Ritorna None se non disponibile."""
+    if not PLAYWRIGHT_AVAILABLE:
+        return None
     try:
+        import os as _os
+        _os.environ["PYTHONWARNINGS"] = "ignore"
+        from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
@@ -157,6 +161,7 @@ def fetch_html_rendered(url):
                     "--disable-gpu",
                     "--single-process",
                     "--disable-extensions",
+                    "--log-level=3",
                 ],
             )
             page = browser.new_page(user_agent=USER_AGENT)
