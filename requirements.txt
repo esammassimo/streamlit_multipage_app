@@ -19,3 +19,4 @@ gunicorn
 lxml
 google-search-results
 anthropic
+playwright
