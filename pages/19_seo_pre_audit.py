@@ -180,7 +180,7 @@ with col_hd:
 with col_st:
     st.markdown("")  # spacing
     if AUDIT_OK:
-        st.success("seo_pre_audit.py ✅")
+        st.success("19_seo_pre_audit.py ✅")
     else:
         st.error(f"seo_audit.py non trovato\n`{AUDIT_ERR[:100]}`")
 
