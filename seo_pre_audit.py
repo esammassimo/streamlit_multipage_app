@@ -23,15 +23,16 @@ import time
 from urllib.parse import urlparse, urljoin
 from datetime import datetime
 
-# ── Imposta PLAYWRIGHT_BROWSERS_PATH PRIMA di importare playwright ────────────
-# Su Streamlit Cloud il browser è in /opt/pw-browsers (installato da packages.txt).
-# La variabile deve essere impostata prima dell'import altrimenti Playwright
-# risolve il path alla home dell'utente e non trova il browser.
-for _pw_path in ["/opt/pw-browsers", "/home/appuser/.cache/ms-playwright",
-                 os.path.expanduser("~/.cache/ms-playwright")]:
-    if os.path.isdir(_pw_path):
-        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", _pw_path)
-        break
+# ── Playwright: installa browser se mancante ─────────────────────────────────
+# Su Streamlit Cloud il browser va scaricato a runtime con os.system.
+# È il metodo confermato dalla community ufficiale Streamlit.
+import glob as _glob
+
+_PW_HOME = os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = _PW_HOME
+
+if not _glob.glob(os.path.join(_PW_HOME, "chromium*")):
+    os.system("playwright install chromium")
 
 import requests
 from bs4 import BeautifulSoup
