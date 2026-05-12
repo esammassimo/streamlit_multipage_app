@@ -64,7 +64,7 @@ def _try_import(name, paths):
 
 _search_paths = [os.path.dirname(os.path.abspath(__file__)), os.getcwd()]
 
-for _mod_name in ["19_seo_pre_audit", "seo_pre_audit", "seo_audit"]:
+for _mod_name in ["seo_pre_audit", "seo_audit"]:
     try:
         sa = _try_import(_mod_name, _search_paths)
         AUDIT_OK  = True
