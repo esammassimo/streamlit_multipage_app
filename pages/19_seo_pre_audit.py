@@ -17,7 +17,6 @@ import os
 import json
 import time
 import tempfile
-import subprocess
 import pandas as pd
 from datetime import datetime
 
@@ -63,35 +62,50 @@ for _mod_name in ["19_seo_pre_audit", "seo_pre_audit", "seo_audit"]:
         AUDIT_ERR = str(_e)
 
 
-# ─── PLAYWRIGHT: installa browser una sola volta per istanza server ───────────
-# Su Streamlit Cloud il pacchetto playwright è installato da requirements.txt,
-# ma il browser Chromium va scaricato a runtime.
-# @st.cache_resource garantisce che il download avvenga una volta sola
-# (non ad ogni rerun o cambio utente).
+# ─── PLAYWRIGHT: rileva e configura il browser ───────────────────────────────
+# Su Streamlit Cloud il browser Chromium è installato in /opt/pw-browsers
+# tramite packages.txt. La variabile PLAYWRIGHT_BROWSERS_PATH non è sempre
+# propagata al processo Python — la impostiamo noi prima di qualsiasi chiamata.
+
+_PW_BROWSER_PATHS = [
+    "/opt/pw-browsers",
+    "/home/appuser/.cache/ms-playwright",
+    os.path.expanduser("~/.cache/ms-playwright"),
+]
 
 @st.cache_resource(show_spinner=False)
-def _install_chromium():
-    """Scarica chromium-headless-shell se non già presente."""
+def _detect_playwright():
+    """Trova il browser Playwright e imposta PLAYWRIGHT_BROWSERS_PATH."""
+    # Imposta il path se non già valido
+    current = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+    if not (current and os.path.isdir(current)):
+        for p in _PW_BROWSER_PATHS:
+            if os.path.isdir(p):
+                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = p
+                current = p
+                break
+
+    # Verifica che il browser sia effettivamente avviabile
     try:
-        result = subprocess.run(
-            ["python3", "-m", "playwright", "install", "chromium"],
-            capture_output=True,
-            text=True,
-            timeout=300,   # 5 minuti — sufficiente anche su Cloud lento
-        )
-        success = result.returncode == 0
-        return success, (result.stdout + result.stderr).strip()
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage",
+                      "--single-process", "--disable-gpu"],
+            )
+            browser.close()
+        return True, f"Browser trovato in: {current or 'path default'}"
     except Exception as exc:
         return False, str(exc)
 
-_pw_installed, _pw_log = _install_chromium()
+_pw_ok, _pw_log = _detect_playwright()
 
 
 # ─── CONFIGURAZIONE ──────────────────────────────────────────────────────────
 # Tutto qui. Nessuna config in sidebar o form utente.
 
-# Playwright: attivo se il browser è stato installato con successo
-USE_PLAYWRIGHT: bool = _pw_installed
+USE_PLAYWRIGHT: bool = _pw_ok
 
 # Timeout fetch HTTP statico (secondi)
 FETCH_TIMEOUT: int = 15
