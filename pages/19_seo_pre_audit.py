@@ -21,20 +21,46 @@ import subprocess
 import pandas as pd
 from datetime import datetime
 
-# ─── IMPORT seo_audit ────────────────────────────────────────────────────────
-# Prova la directory dello script e il cwd: su Cloud sono spesso diversi.
+# ─── IMPORT modulo audit ─────────────────────────────────────────────────────
+# Il modulo può chiamarsi seo_audit.py oppure seo_pre_audit.py a seconda del
+# repo. Prova entrambi i nomi, in entrambe le directory (script dir e cwd).
 
 for _p in [os.path.dirname(os.path.abspath(__file__)), os.getcwd()]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-try:
-    import seo_audit as sa
-    AUDIT_OK  = True
-    AUDIT_ERR = ""
-except Exception as _e:
-    AUDIT_OK  = False
-    AUDIT_ERR = str(_e)
+sa        = None
+AUDIT_OK  = False
+AUDIT_ERR = ""
+
+def _try_import(name, paths):
+    """Importa un modulo per nome o per nome-file (supporta nomi con cifre iniziali)."""
+    import importlib, importlib.util
+    # 1. prova import diretto (funziona per nomi Python validi)
+    try:
+        return importlib.import_module(name)
+    except ModuleNotFoundError:
+        pass
+    # 2. prova caricamento da file (funziona anche per "19_seo_pre_audit.py")
+    for base in paths:
+        candidate = os.path.join(base, name + ".py")
+        if os.path.isfile(candidate):
+            spec = importlib.util.spec_from_file_location("_sa_module", candidate)
+            mod  = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    raise ImportError(f"Modulo '{name}' non trovato")
+
+_search_paths = [os.path.dirname(os.path.abspath(__file__)), os.getcwd()]
+
+for _mod_name in ["19_seo_pre_audit", "seo_pre_audit", "seo_audit"]:
+    try:
+        sa = _try_import(_mod_name, _search_paths)
+        AUDIT_OK  = True
+        AUDIT_ERR = ""
+        break
+    except Exception as _e:
+        AUDIT_ERR = str(_e)
 
 
 # ─── PLAYWRIGHT: installa browser una sola volta per istanza server ───────────
@@ -180,7 +206,7 @@ with col_hd:
 with col_st:
     st.markdown("")  # spacing
     if AUDIT_OK:
-        st.success("19_seo_pre_audit.py ✅")
+        st.success("seo_audit.py ✅")
     else:
         st.error(f"seo_audit.py non trovato\n`{AUDIT_ERR[:100]}`")
 
