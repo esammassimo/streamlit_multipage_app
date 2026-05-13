@@ -784,7 +784,17 @@ with tabs[5]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tabs[6]:
-    r  = r4f
+    if npages > 1:
+        page_urls_sd = [pg[0].get("url", f"Pagina {i+1}") for i, pg in enumerate(grouped)]
+        sel_idx_sd = st.selectbox(
+            "Pagina",
+            range(len(page_urls_sd)),
+            format_func=lambda i: page_urls_sd[i],
+            key="sd_page_sel",
+        )
+        r = r_by(grouped[sel_idx_sd], "4.")
+    else:
+        r = r4f
     ov = r.get("overall", "ERROR")
     ct, cb = st.columns([7, 1])
     ct.subheader("Dati Strutturati — Schema.org & Open Graph")
