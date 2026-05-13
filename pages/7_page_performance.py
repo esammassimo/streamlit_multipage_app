@@ -105,16 +105,21 @@ def cwv_overall(lcp_s, cls_s, inp_s):
     return "NEEDS IMPROVEMENT"
 
 def apply_styles(df):
-    return (
-        df.style
-        .map(lambda x: style_metric(x, 2.5, 4.0) if isinstance(x, (int, float)) else '', subset=['LCP (s)'])
-        .map(lambda x: style_metric(x, 1.8, 3.0) if isinstance(x, (int, float)) else '', subset=['FCP (s)'])
-        .map(lambda x: style_metric(x, 0.1, 0.25) if isinstance(x, (int, float)) else '', subset=['CLS'])
-        .map(lambda x: style_metric(x, 0.2, 0.5) if isinstance(x, (int, float)) else '', subset=['INP (s)'])
-        .map(lambda x: style_metric(x, 0.8, 1.8) if isinstance(x, (int, float)) else '', subset=['TTFB (s)'])
-        .map(lambda x: style_metric(x, 90, 50, higher_is_better=True) if isinstance(x, (int, float)) else '', subset=['Performance Score'])
-        .map(style_cwv_status, subset=['CWV Status'])
-    )
+    # Styler.applymap → Styler.map in pandas 2.1.0; supporta entrambe le versioni
+    s = df.style
+    _emap = "map" if hasattr(s, "map") else "applymap"
+    specs = [
+        (lambda x: style_metric(x, 2.5,  4.0)  if isinstance(x, (int, float)) else '', 'LCP (s)'),
+        (lambda x: style_metric(x, 1.8,  3.0)  if isinstance(x, (int, float)) else '', 'FCP (s)'),
+        (lambda x: style_metric(x, 0.1,  0.25) if isinstance(x, (int, float)) else '', 'CLS'),
+        (lambda x: style_metric(x, 0.2,  0.5)  if isinstance(x, (int, float)) else '', 'INP (s)'),
+        (lambda x: style_metric(x, 0.8,  1.8)  if isinstance(x, (int, float)) else '', 'TTFB (s)'),
+        (lambda x: style_metric(x, 90,   50, higher_is_better=True) if isinstance(x, (int, float)) else '', 'Performance Score'),
+        (style_cwv_status, 'CWV Status'),
+    ]
+    for fn, col in specs:
+        s = getattr(s, _emap)(fn, subset=[col])
+    return s
 
 def fetch_url_data(url, api_key, strat, rate_lock, last_request_time, delay):
     """Worker: recupera i dati PageSpeed con rate limiting condiviso."""
@@ -206,8 +211,10 @@ if st.button("🔍 Analizza le Pagine"):
 
         def render_preview():
             rows = [{"URL": u, "Stato": s} for u, s in url_statuses.items()]
+            _s = pd.DataFrame(rows).style
+            _emap = "map" if hasattr(_s, "map") else "applymap"
             preview_ph.dataframe(
-                pd.DataFrame(rows).style.map(style_stato, subset=["Stato"]),
+                getattr(_s, _emap)(style_stato, subset=["Stato"]),
                 use_container_width=True,
                 hide_index=True,
             )
