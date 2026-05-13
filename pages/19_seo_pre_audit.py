@@ -649,8 +649,9 @@ with tabs[2]:
                                   "Dettaglio": f'{f.get("nota","")[:100]} [{f.get("impatto","")}]'})
             # 10 — topical
             for opp in r.get("opportunities", []):
+                opp_str = opp if isinstance(opp, str) else str(opp)
                 probs.append({"Area": area, "URL": u, "Tipo": "Opportunità",
-                              "Severity": "WARN", "Dettaglio": opp[:120]})
+                              "Severity": "WARN", "Dettaglio": opp_str[:120]})
 
     probs.sort(key=lambda x: {"FAIL": 0, "WARN": 1, "INFO": 2}.get(x["Severity"], 9))
     st.subheader(f"Problemi rilevati — {len(probs)} finding")
