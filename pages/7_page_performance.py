@@ -130,13 +130,30 @@ def fetch_url_data(url, api_key, strat, rate_lock, last_request_time, delay):
             time.sleep(delay - elapsed)
         last_request_time[0] = time.time()
 
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(
+                "https://www.googleapis.com/pagespeedonline/v5/runPagespeed",
+                params={"url": url, "key": api_key, "strategy": strat},
+                timeout=60,
+            )
+            if response.status_code == 500 and attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            if response.status_code == 429:
+                return {"status": "error", "url": url, "error": "Quota API esaurita (429). Attendi e riprova."}
+            response.raise_for_status()
+            break
+        except requests.exceptions.HTTPError as e:
+            if attempt < max_retries - 1 and response.status_code == 500:
+                time.sleep(2 ** attempt)
+                continue
+            return {"status": "error", "url": url, "error": f"HTTP {response.status_code}: errore del server Google"}
+        except Exception as e:
+            return {"status": "error", "url": url, "error": str(e)}
+
     try:
-        response = requests.get(
-            "https://www.googleapis.com/pagespeedonline/v5/runPagespeed",
-            params={"url": url, "key": api_key, "strategy": strat},
-            timeout=60,
-        )
-        response.raise_for_status()
         data = response.json()
 
         metrics = (data.get("loadingExperience", {}) or {}).get("metrics", {}) or {}
