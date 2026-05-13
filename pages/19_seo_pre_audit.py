@@ -103,12 +103,13 @@ AREA_META = {
     "1.":  ("1",  "Rendering & Visibilità",  "Contenuti nascosti, lazy-load, delta DOM"),
     "2.":  ("2",  "Struttura Heading",        "H1, H2/H3, gerarchia, blocchi orfani"),
     "3.":  ("3",  "Robots.txt",               "Direttive, sitemap, configurazione crawler"),
+    "4.":  ("4",  "Dati Strutturati",         "Schema.org, JSON-LD, Open Graph, rich results"),
     "8.":  ("8",  "E-E-A-T Signals",          "Autore, fonti, schema, YMYL detection"),
     "9.":  ("9",  "Performance",              "CLS, LCP, script bloccanti, framework JS"),
     "10.": ("10", "Topical Authority",        "Title, meta desc, canonical, citazioni, link"),
 }
 
-BADGE_COLS = ["Visibilità", "Heading", "Robots", "E-E-A-T", "Perf.", "Topical"]
+BADGE_COLS = ["Visibilità", "Heading", "Robots", "Strutt.", "E-E-A-T", "Perf.", "Topical"]
 
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
@@ -400,6 +401,8 @@ if urls_to_audit and AUDIT_OK:
          lambda u, h, rh, ss: sa.audit_heading_structure(u, h)),
         ("3.",  "Robots.txt",
          lambda u, h, rh, ss: sa.audit_robots_txt(u, ss)),
+        ("4.",  "Dati Strutturati",
+         lambda u, h, rh, ss: sa.audit_structured_data(u, h)),
         ("8.",  "E-E-A-T Signals",
          lambda u, h, rh, ss: sa.audit_eeat_signals(u, h)),
         ("9.",  "Performance",
@@ -496,6 +499,7 @@ first_pg = grouped[0]
 r1f  = r_by(first_pg, "1.")
 r2f  = r_by(first_pg, "2.")
 r3f  = r_by(first_pg, "3.")
+r4f  = r_by(first_pg, "4.")
 r8f  = r_by(first_pg, "8.")
 r9f  = r_by(first_pg, "9.")
 r10f = r_by(first_pg, "10.")
@@ -513,7 +517,7 @@ st.caption(
 tabs = st.tabs([
     "📊 Overview", "📋 Pagine", "⚠️ Problemi",
     "1 Visibilità", "2 Heading", "3 Robots.txt",
-    "8 E-E-A-T", "9 Performance", "10 Topical",
+    "4 Dati Strutt.", "8 E-E-A-T", "9 Performance", "10 Topical",
     "⬇️ Esporta",
 ])
 
@@ -574,6 +578,7 @@ with tabs[1]:
             "Visibilità": ovs.get("1. ", "N/D"),
             "Heading":    ovs.get("2. ", "N/D"),
             "Robots":     ovs.get("3. ", "N/D"),
+            "Strutt.":    ovs.get("4. ", "N/D"),
             "E-E-A-T":    ovs.get("8. ", "N/D"),
             "Perf.":      ovs.get("9. ", "N/D"),
             "Topical":    ovs.get("10.", "N/D"),
@@ -774,10 +779,115 @@ with tabs[5]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — AREA 8: E-E-A-T
+# TAB 6 — AREA 4: DATI STRUTTURATI
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tabs[6]:
+    r  = r4f
+    ov = r.get("overall", "ERROR")
+    ct, cb = st.columns([7, 1])
+    ct.subheader("Dati Strutturati — Schema.org & Open Graph")
+    cb.markdown(f"<div style='padding-top:10px'>{badge(ov)}</div>", unsafe_allow_html=True)
+    st.caption(r.get("summary", "").replace(" | ", " · "))
+    st.divider()
+
+    schemas = r.get("schemas", [])
+    warnings_sd = r.get("warnings", [])
+    opps_sd = r.get("opportunities", [])
+
+    # KPI
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Schema trovati",    len(schemas))
+    c2.metric("JSON-LD",           r.get("jsonld_blocks", 0))
+    c3.metric("Score medio",       f"{r.get('avg_score', 0)}/100")
+    c4.metric("Rich result ready", r.get("rich_ready", 0))
+    c5.metric("Tag Open Graph",    r.get("og_tags_count", 0))
+    c6.metric("Twitter Card",      "Sì" if r.get("twitter_card") else "No")
+
+    # Open Graph status
+    if r.get("og_complete"):
+        st.success(f"✅ Open Graph completo — tutti i tag essenziali presenti")
+    else:
+        og_miss = r.get("og_missing", [])
+        st.warning(f"⚠️ Open Graph incompleto — mancano: {', '.join('og:'+f for f in og_miss)}")
+
+    st.divider()
+
+    # Tabella schema trovati
+    if schemas:
+        st.markdown("**Schema rilevati:**")
+        prio_color = {"high": "🟢", "medium": "🟡", "low": "⚪"}
+        rows_s = []
+        for s in schemas:
+            miss_r = ", ".join(s.get("missing_required", [])) or "—"
+            miss_rec = f"{len(s.get('missing_recommended', []))} campi"
+            rows_s.append({
+                "Tipo":            s["type"],
+                "Formato":         s["format"],
+                "Priorità":        prio_color.get(s["priority"],"⚪") + " " + s["priority"].upper(),
+                "Score":           f"{s['schema_score']}/100",
+                "Rich result":     "✅" if s["has_rich_result_potential"] else "⚠️",
+                "Required mancanti": miss_r,
+                "Recommended mancanti": miss_rec,
+                "Nome/Titolo":     s.get("name","")[:50],
+            })
+        df_s = pd.DataFrame(rows_s)
+        st.dataframe(df_s, use_container_width=True, hide_index=True)
+    else:
+        st.error("⚠️ Nessun dato strutturato JSON-LD o Microdata trovato nella pagina.")
+
+    # Errori di validazione
+    if warnings_sd:
+        st.divider()
+        st.markdown("**Errori e avvisi di validazione:**")
+        sev_filter_sd = st.multiselect(
+            "Filtra", ["FAIL", "WARN"], default=["FAIL", "WARN"], key="sd_sev"
+        )
+        rows_w = [{"Severity": w["severity"], "Schema": w["schema"],
+                   "Tipo errore": w["type"], "Campo": w.get("field","—") or "—",
+                   "Messaggio": w["message"]}
+                  for w in warnings_sd if w["severity"] in sev_filter_sd]
+        if rows_w:
+            df_w = pd.DataFrame(rows_w)
+            st.dataframe(
+                df_w.style.map(color_cell, subset=["Severity"]),
+                use_container_width=True, hide_index=True,
+            )
+
+    # Opportunità
+    if opps_sd:
+        st.divider()
+        st.markdown("**💡 Opportunità schema non sfruttate:**")
+        for op in opps_sd:
+            prio = op.get("priority","medium")
+            icon = "🔴" if prio == "high" else "🟡"
+            with st.expander(f"{icon} **{op['type']}** — {op['reason'][:80]}"):
+                st.markdown(f"**Beneficio:** {op['benefit']}")
+                st.markdown(f"**Priorità:** {prio.upper()}")
+
+    # Open Graph dettaglio
+    og_fields = r.get("og_fields", {})
+    if og_fields:
+        st.divider()
+        st.markdown("**Tag Open Graph presenti:**")
+        df_og = pd.DataFrame(
+            [{"Tag": f"og:{k}", "Valore": v[:100]} for k, v in og_fields.items()]
+        )
+        st.dataframe(df_og, use_container_width=True, hide_index=True)
+
+    # Twitter Card
+    tc = r.get("tc_fields", {})
+    if tc:
+        st.markdown(f"**Twitter Card:** `{r.get('tc_card_type','—')}` — "
+                    f"{len(tc)} tag presenti")
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 7 — AREA 8: E-E-A-T
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tabs[7]:
     r = r8f; ov = r.get("overall", "ERROR")
     ct, cb = st.columns([7, 1])
     ct.subheader("E-E-A-T Signals")
@@ -822,7 +932,7 @@ with tabs[6]:
 # TAB 7 — AREA 9: PERFORMANCE
 # ══════════════════════════════════════════════════════════════════════════════
 
-with tabs[7]:
+with tabs[8]:
     r = r9f; ov = r.get("overall", "ERROR")
     ct, cb = st.columns([7, 1])
     ct.subheader("Performance Signals")
@@ -871,7 +981,7 @@ with tabs[7]:
 # TAB 8 — AREA 10: TOPICAL AUTHORITY
 # ══════════════════════════════════════════════════════════════════════════════
 
-with tabs[8]:
+with tabs[9]:
     r = r10f; ov = r.get("overall", "ERROR")
     ct, cb = st.columns([7, 1])
     ct.subheader("Autorevolezza Topica")
@@ -931,7 +1041,7 @@ with tabs[8]:
 # TAB 9 — ESPORTA
 # ══════════════════════════════════════════════════════════════════════════════
 
-with tabs[9]:
+with tabs[10]:
     st.subheader("Esporta risultati")
     st.caption("Genera i report e scaricali direttamente dal browser.")
     st.divider()

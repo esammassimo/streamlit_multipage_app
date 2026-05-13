@@ -640,6 +640,484 @@ def audit_robots_txt(base_url, session):
 
 
 
+# ─── AREA 4: DATI STRUTTURATI ─────────────────────────────────────────────────
+
+# Priorità rispetto ai rich results Google
+SCHEMA_PRIORITY = {
+    "FAQPage": "high", "HowTo": "high", "Recipe": "high",
+    "Product": "high", "Offer": "high", "AggregateRating": "high",
+    "Review": "high", "Event": "high", "JobPosting": "high",
+    "Article": "high", "NewsArticle": "high", "BlogPosting": "high",
+    "BreadcrumbList": "high", "SiteLinksSearchBox": "high",
+    "VideoObject": "high", "LocalBusiness": "high",
+    "Organization": "medium", "Person": "medium",
+    "ImageObject": "medium", "ItemList": "medium",
+    "WebSite": "low", "WebPage": "low", "ListItem": "low",
+}
+
+# Campi obbligatori per rich results Google (fonte: developers.google.com/search)
+SCHEMA_REQUIRED_FIELDS = {
+    "Product": {
+        "required": ["name"],
+        "recommended": ["image", "description", "offers", "aggregateRating", "brand", "sku"],
+        "rich_result_fields": ["name", "image", "offers"],
+    },
+    "Offer": {
+        "required": ["price", "priceCurrency"],
+        "recommended": ["availability", "url", "priceValidUntil"],
+        "rich_result_fields": ["price", "priceCurrency", "availability"],
+    },
+    "Article": {
+        "required": ["headline", "author", "datePublished"],
+        "recommended": ["image", "dateModified", "publisher", "description"],
+        "rich_result_fields": ["headline", "author", "image", "datePublished"],
+    },
+    "NewsArticle": {
+        "required": ["headline", "author", "datePublished"],
+        "recommended": ["image", "dateModified", "publisher"],
+        "rich_result_fields": ["headline", "author", "image", "datePublished"],
+    },
+    "BlogPosting": {
+        "required": ["headline", "author", "datePublished"],
+        "recommended": ["image", "dateModified", "description"],
+        "rich_result_fields": ["headline", "author", "datePublished"],
+    },
+    "FAQPage": {
+        "required": ["mainEntity"],
+        "recommended": [],
+        "rich_result_fields": ["mainEntity"],
+        "validate_fn": lambda item: _validate_faqpage(item),
+    },
+    "HowTo": {
+        "required": ["name", "step"],
+        "recommended": ["image", "totalTime", "description", "estimatedCost"],
+        "rich_result_fields": ["name", "step"],
+    },
+    "Recipe": {
+        "required": ["name", "image", "author"],
+        "recommended": ["recipeIngredient", "recipeInstructions", "totalTime",
+                        "recipeYield", "nutrition", "aggregateRating"],
+        "rich_result_fields": ["name", "image", "author", "recipeIngredient"],
+    },
+    "Event": {
+        "required": ["name", "startDate", "location"],
+        "recommended": ["endDate", "description", "image", "offers", "organizer"],
+        "rich_result_fields": ["name", "startDate", "location"],
+    },
+    "LocalBusiness": {
+        "required": ["name", "address"],
+        "recommended": ["telephone", "openingHours", "geo", "url", "image",
+                        "priceRange", "aggregateRating"],
+        "rich_result_fields": ["name", "address", "telephone"],
+    },
+    "JobPosting": {
+        "required": ["title", "description", "datePosted", "hiringOrganization", "jobLocation"],
+        "recommended": ["baseSalary", "employmentType", "validThrough"],
+        "rich_result_fields": ["title", "description", "datePosted", "hiringOrganization"],
+    },
+    "BreadcrumbList": {
+        "required": ["itemListElement"],
+        "recommended": [],
+        "rich_result_fields": ["itemListElement"],
+        "validate_fn": lambda item: _validate_breadcrumb(item),
+    },
+    "VideoObject": {
+        "required": ["name", "description", "thumbnailUrl", "uploadDate"],
+        "recommended": ["contentUrl", "embedUrl", "duration", "publisher"],
+        "rich_result_fields": ["name", "description", "thumbnailUrl", "uploadDate"],
+    },
+    "AggregateRating": {
+        "required": ["ratingValue", "ratingCount"],
+        "recommended": ["bestRating", "worstRating", "reviewCount"],
+        "rich_result_fields": ["ratingValue", "ratingCount"],
+    },
+    "Organization": {
+        "required": ["name"],
+        "recommended": ["url", "logo", "contactPoint", "sameAs", "address"],
+        "rich_result_fields": [],
+    },
+    "WebSite": {
+        "required": ["name", "url"],
+        "recommended": ["potentialAction", "sameAs"],
+        "rich_result_fields": [],
+    },
+}
+
+def _validate_faqpage(item):
+    """Valida struttura interna FAQPage — ogni domanda deve avere name e acceptedAnswer."""
+    errors = []
+    entities = item.get("mainEntity", [])
+    if not isinstance(entities, list):
+        entities = [entities]
+    if not entities:
+        errors.append("mainEntity vuoto — aggiungere almeno una domanda")
+        return errors
+    for i, q in enumerate(entities):
+        if not isinstance(q, dict):
+            continue
+        if not q.get("name"):
+            errors.append(f"Q{i+1}: campo 'name' (domanda) mancante")
+        ans = q.get("acceptedAnswer", {})
+        if not isinstance(ans, dict) or not ans.get("text"):
+            errors.append(f"Q{i+1}: acceptedAnswer.text mancante")
+    return errors
+
+def _validate_breadcrumb(item):
+    """Valida struttura BreadcrumbList — ogni elemento deve avere position, name/item."""
+    errors = []
+    elements = item.get("itemListElement", [])
+    if not isinstance(elements, list) or not elements:
+        errors.append("itemListElement vuoto")
+        return errors
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        if "position" not in el:
+            errors.append(f"ListItem senza 'position': {el.get('name','?')}")
+        if not el.get("name") and not el.get("item"):
+            errors.append(f"ListItem posizione {el.get('position','?')} senza name né item")
+    return errors
+
+def _flatten_jsonld(data):
+    """Appiattisce JSON-LD: gestisce oggetti, liste e @graph."""
+    items = []
+    if isinstance(data, list):
+        for d in data:
+            items.extend(_flatten_jsonld(d))
+    elif isinstance(data, dict):
+        if "@graph" in data:
+            items.extend(_flatten_jsonld(data["@graph"]))
+        else:
+            items.append(data)
+    return items
+
+def _schema_type(item):
+    """Estrae il tipo principale da @type (può essere stringa, lista o URL)."""
+    t = item.get("@type", "")
+    if isinstance(t, list):
+        t = t[0] if t else ""
+    return t.split("/")[-1] if "/" in t else t
+
+def audit_structured_data(url, static_html):
+    """
+    Analisi approfondita dati strutturati:
+    - Parsing JSON-LD (incluso @graph) e Microdata
+    - Validazione campo per campo per ogni tipo (required + recommended)
+    - Score di qualità per singolo schema (0-100)
+    - Errori strutturali (FAQPage, BreadcrumbList)
+    - Open Graph e Twitter Card
+    - Rilevamento opportunità mancanti dal DOM
+    """
+    if not static_html:
+        return {"area": "4. Dati Strutturati", "overall": "ERROR",
+                "summary": "HTML non disponibile", "schemas": [],
+                "warnings": [], "opportunities": []}
+
+    soup = BeautifulSoup(static_html, "lxml")
+    schemas     = []      # schema trovati con dettaglio completo
+    warnings    = []      # errori di validazione
+    opps        = []      # opportunità mancanti
+
+    # ── 4a. JSON-LD ──────────────────────────────────────────────────────────
+    blocks_raw = soup.find_all("script", type="application/ld+json")
+    for block in blocks_raw:
+        raw_text = block.string or ""
+        try:
+            data  = json.loads(raw_text)
+        except json.JSONDecodeError as je:
+            warnings.append({
+                "type": "JSON_PARSE_ERROR",
+                "schema": "JSON-LD",
+                "severity": "FAIL",
+                "message": f"JSON-LD non parsabile: {str(je)[:80]}",
+                "field": None,
+            })
+            continue
+
+        for item in _flatten_jsonld(data):
+            if not isinstance(item, dict):
+                continue
+            stype    = _schema_type(item)
+            if not stype:
+                continue
+            priority = SCHEMA_PRIORITY.get(stype, "low")
+            rules    = SCHEMA_REQUIRED_FIELDS.get(stype, {})
+            req      = rules.get("required", [])
+            rec      = rules.get("recommended", [])
+            rich_req = rules.get("rich_result_fields", [])
+
+            missing_required    = [f for f in req      if f not in item]
+            missing_recommended = [f for f in rec      if f not in item]
+            missing_rich        = [f for f in rich_req if f not in item]
+            present_fields      = [k for k in item if not k.startswith("@")]
+
+            # Validazione struttura interna (FAQPage, BreadcrumbList)
+            structural_errors = []
+            validate_fn = rules.get("validate_fn")
+            if validate_fn:
+                structural_errors = validate_fn(item)
+
+            # Score qualità schema: 40 base + fino a 40 dai required + 20 dai recommended
+            schema_score = 40
+            if req:
+                schema_score += int(40 * (len(req) - len(missing_required)) / len(req))
+            if rec:
+                schema_score += int(20 * (len(rec) - len(missing_recommended)) / len(rec))
+            schema_score = max(0, min(100, schema_score))
+
+            # Registra warnings per campi mancanti critici
+            for f in missing_required:
+                warnings.append({
+                    "type": "MISSING_REQUIRED",
+                    "schema": stype,
+                    "severity": "FAIL",
+                    "message": f"Campo obbligatorio '{f}' mancante",
+                    "field": f,
+                })
+            for f in missing_rich:
+                if f not in missing_required:  # evita doppioni
+                    warnings.append({
+                        "type": "MISSING_RICH_RESULT",
+                        "schema": stype,
+                        "severity": "WARN",
+                        "message": f"Campo '{f}' necessario per rich result mancante",
+                        "field": f,
+                    })
+            for err in structural_errors:
+                warnings.append({
+                    "type": "STRUCTURAL_ERROR",
+                    "schema": stype,
+                    "severity": "WARN",
+                    "message": err,
+                    "field": None,
+                })
+
+            # Estrai preview dati chiave
+            name      = item.get("name", item.get("headline", ""))
+            name      = str(name)[:80] if name else ""
+            context   = str(item.get("@context", ""))
+
+            schemas.append({
+                "type":                 stype,
+                "format":               "JSON-LD",
+                "priority":             priority,
+                "name":                 name,
+                "context":              context,
+                "fields_present":       present_fields,
+                "fields_count":         len(present_fields),
+                "missing_required":     missing_required,
+                "missing_recommended":  missing_recommended,
+                "missing_rich_result":  missing_rich,
+                "structural_errors":    structural_errors,
+                "schema_score":         schema_score,
+                "has_rich_result_potential": len(missing_rich) == 0 and len(missing_required) == 0,
+            })
+
+    # ── 4b. Microdata ─────────────────────────────────────────────────────────
+    for el in soup.find_all(itemtype=True):
+        raw_type = el.get("itemtype", "")
+        stype    = raw_type.split("/")[-1] if raw_type else "Unknown"
+        props    = [p.get("itemprop") for p in el.find_all(itemprop=True) if p.get("itemprop")]
+        priority = SCHEMA_PRIORITY.get(stype, "low")
+        rules    = SCHEMA_REQUIRED_FIELDS.get(stype, {})
+        req      = rules.get("required", [])
+        missing_required = [f for f in req if f not in props]
+
+        schemas.append({
+            "type":                stype,
+            "format":              "Microdata",
+            "priority":            priority,
+            "name":                "",
+            "context":             raw_type,
+            "fields_present":      props,
+            "fields_count":        len(props),
+            "missing_required":    missing_required,
+            "missing_recommended": [],
+            "missing_rich_result": [],
+            "structural_errors":   [],
+            "schema_score":        60 if not missing_required else 30,
+            "has_rich_result_potential": len(missing_required) == 0,
+        })
+
+    # ── 4c. Open Graph ────────────────────────────────────────────────────────
+    og_fields    = {m.get("property","").replace("og:",""):
+                    m.get("content","")
+                    for m in soup.find_all("meta", property=True)
+                    if m.get("property","").startswith("og:")}
+    og_required  = ["title", "description", "image", "url", "type"]
+    og_missing   = [f for f in og_required if f not in og_fields]
+    og_complete  = len(og_missing) == 0
+
+    # Twitter Card
+    tc_fields   = {m.get("name","").replace("twitter:",""):
+                   m.get("content","")
+                   for m in soup.find_all("meta", attrs={"name": True})
+                   if m.get("name","").startswith("twitter:")}
+    tc_present  = bool(tc_fields)
+    tc_card     = tc_fields.get("card", "")
+
+    # Problemi OG
+    for f in og_missing:
+        warnings.append({
+            "type": "MISSING_OG",
+            "schema": "Open Graph",
+            "severity": "WARN",
+            "message": f"Tag og:{f} mancante",
+            "field": f"og:{f}",
+        })
+
+    # ── 4d. Opportunità dal DOM ───────────────────────────────────────────────
+    existing_types = {s["type"] for s in schemas}
+    body_text      = soup.get_text(" ", strip=True).lower()
+
+    # BreadcrumbList
+    if "BreadcrumbList" not in existing_types:
+        nav_els = soup.select("[class*='breadcrumb'],[aria-label*='breadcrumb']")
+        if nav_els or len(soup.find_all("nav")) > 0:
+            opps.append({
+                "type": "BreadcrumbList",
+                "priority": "high",
+                "reason": "Struttura navigazione rilevata nel DOM ma nessun schema BreadcrumbList",
+                "benefit": "Breadcrumb nei risultati di ricerca, migliore comprensione struttura sito",
+            })
+
+    # FAQPage
+    if "FAQPage" not in existing_types:
+        faq_els = soup.select("[class*='faq'],[id*='faq'],[class*='accordion']")
+        if faq_els:
+            opps.append({
+                "type": "FAQPage",
+                "priority": "high",
+                "reason": f"Elementi FAQ/accordion rilevati ({len(faq_els)}) ma nessun schema FAQPage",
+                "benefit": "Rich results FAQ in SERP, visibilità in AI Overview",
+            })
+
+    # Product
+    if "Product" not in existing_types:
+        product_els = soup.select("[class*='product'],[id*='product'],[itemtype*='Product']")
+        price_els   = soup.select("[class*='price'],[class*='prezzo'],[itemprop='price']")
+        if product_els and price_els:
+            opps.append({
+                "type": "Product",
+                "priority": "high",
+                "reason": "Elementi prodotto e prezzo rilevati ma nessun schema Product",
+                "benefit": "Rich results con prezzo e disponibilità in SERP",
+            })
+
+    # Article / BlogPosting
+    article_types = {"Article", "NewsArticle", "BlogPosting"}
+    if not existing_types & article_types:
+        if soup.find("article") or soup.find(class_=re.compile(r"post|article|blog", re.I)):
+            date_el = soup.find("time") or soup.find(itemprop="datePublished")
+            if date_el:
+                opps.append({
+                    "type": "Article",
+                    "priority": "high",
+                    "reason": "Tag <article> e data trovati ma nessun schema Article/BlogPosting",
+                    "benefit": "Eligibilità Top Stories, rich results articolo",
+                })
+
+    # LocalBusiness
+    if "LocalBusiness" not in existing_types:
+        addr_els = soup.select("[itemprop='address'],[class*='address'],[class*='indirizzo']")
+        phone_els = soup.select("[itemprop='telephone'],[class*='phone'],[class*='telefono']")
+        if addr_els or phone_els:
+            opps.append({
+                "type": "LocalBusiness",
+                "priority": "high",
+                "reason": "Indirizzo/telefono rilevati nel DOM ma nessun schema LocalBusiness",
+                "benefit": "Knowledge Panel, rich results local, Google Maps integration",
+            })
+
+    # AggregateRating
+    if "AggregateRating" not in existing_types:
+        rating_els = soup.select("[class*='rating'],[class*='star'],[class*='review'],[class*='recensi']")
+        if rating_els:
+            opps.append({
+                "type": "AggregateRating",
+                "priority": "high",
+                "reason": f"Elementi rating/recensioni rilevati ({len(rating_els)}) ma nessun schema AggregateRating",
+                "benefit": "Stelle nei risultati di ricerca — aumento CTR stimato +15-30%",
+            })
+
+    # VideoObject
+    if "VideoObject" not in existing_types:
+        video_els = soup.find_all(["video", "iframe"])
+        yt_iframes = [v for v in video_els if "youtube" in v.get("src","") or "vimeo" in v.get("src","")]
+        if yt_iframes:
+            opps.append({
+                "type": "VideoObject",
+                "priority": "medium",
+                "reason": f"{len(yt_iframes)} video embed rilevati (YouTube/Vimeo) senza schema VideoObject",
+                "benefit": "Rich results video in SERP con thumbnail e durata",
+            })
+
+    # SiteLinksSearchBox
+    if "SiteLinksSearchBox" not in existing_types and "WebSite" not in existing_types:
+        search_els = soup.select("input[type='search'],input[name*='search'],[class*='search']")
+        if search_els:
+            opps.append({
+                "type": "SiteLinksSearchBox",
+                "priority": "medium",
+                "reason": "Campo ricerca rilevato nel DOM — possibile aggiunta WebSite con potentialAction",
+                "benefit": "Sitelinks Searchbox nei risultati di ricerca per brand query",
+            })
+
+    # ── 4e. Valutazione overall ───────────────────────────────────────────────
+    n_schemas      = len(schemas)
+    n_jsonld       = len([s for s in schemas if s["format"] == "JSON-LD"])
+    n_high         = len([s for s in schemas if s["priority"] == "high"])
+    n_fail_warn    = len([w for w in warnings if w["severity"] == "FAIL"])
+    n_with_missing = len([s for s in schemas if s["missing_required"]])
+    rich_ready     = len([s for s in schemas if s["has_rich_result_potential"] and s["priority"] == "high"])
+    avg_score      = round(sum(s["schema_score"] for s in schemas) / n_schemas) if schemas else 0
+
+    details = []
+    if n_schemas == 0:
+        overall = "FAIL"
+        details.append("Nessun dato strutturato rilevato — opportunità persa per rich results e AI visibility.")
+    elif n_fail_warn > 0:
+        overall = "WARN"
+        details.append(f"{n_schemas} schema trovati (score medio: {avg_score}/100). "
+                       f"{n_fail_warn} errori di validazione da correggere.")
+    elif rich_ready == 0 and n_high > 0:
+        overall = "WARN"
+        details.append(f"{n_schemas} schema trovati ma nessuno pronto per rich results — "
+                       f"campi obbligatori mancanti.")
+    else:
+        overall = "OK"
+        details.append(f"{n_schemas} schema trovati (score medio: {avg_score}/100). "
+                       f"{rich_ready} schema pronti per rich results.")
+
+    if not og_complete:
+        details.append(f"Open Graph incompleto — mancano: {', '.join('og:'+f for f in og_missing)}.")
+    if opps:
+        details.append(f"{len(opps)} opportunità schema non sfruttate rilevate dal DOM.")
+
+    return {
+        "area":              "4. Dati Strutturati",
+        "overall":           overall,
+        "summary":           " | ".join(details),
+        "schemas":           schemas,
+        "warnings":          warnings,
+        "opportunities":     opps,
+        "og_fields":         og_fields,
+        "og_missing":        og_missing,
+        "og_complete":       og_complete,
+        "og_tags_count":     len(og_fields),
+        "tc_fields":         tc_fields,
+        "twitter_card":      tc_present,
+        "tc_card_type":      tc_card,
+        "jsonld_blocks":     n_jsonld,
+        "microdata_count":   len([s for s in schemas if s["format"] == "Microdata"]),
+        "schemas_high":      n_high,
+        "avg_score":         avg_score,
+        "rich_ready":        rich_ready,
+    }
+
+
+
+
 # ─── AREA 8: E-E-A-T SIGNALS ─────────────────────────────────────────────────
 
 # Schemi che indicano autorevolezza autore/organizzazione
@@ -2830,6 +3308,9 @@ def run_audit(url, use_playwright=True, verbose=True):
     print("  → Area 3: robots.txt…")
     r3 = audit_robots_txt(url, session)
 
+    print("  → Area 4: dati strutturati…")
+    r4 = audit_structured_data(url, static_html)
+
     print("  → Area 8: E-E-A-T signals…")
     r8 = audit_eeat_signals(url, static_html)
 
@@ -2839,10 +3320,10 @@ def run_audit(url, use_playwright=True, verbose=True):
     print("  → Area 10: autorevolezza topica…")
     r10 = audit_topical_authority(url, static_html, session)
 
-    for r in [r1, r2, r3, r8, r9, r10]:
+    for r in [r1, r2, r3, r4, r8, r9, r10]:
         r["url"] = url
 
-    results = [r1, r2, r3, r8, r9, r10]
+    results = [r1, r2, r3, r4, r8, r9, r10]
 
     if verbose:
         for r in results:
