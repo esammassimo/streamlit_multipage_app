@@ -675,7 +675,35 @@ with tabs[2]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tabs[3]:
-    r = r1f; ov = r.get("overall", "ERROR")
+    if npages > 1:
+        st.subheader(f"Riepilogo Visibilità — {npages} pagine")
+        rows_v_all = []
+        for pg in grouped:
+            pg_url = pg[0].get("url", "—") if pg else "—"
+            rr = r_by(pg, "1.")
+            rows_v_all.append({
+                "URL":             pg_url,
+                "Overall":         rr.get("overall", "ERROR"),
+                "Blocchi nascosti": len(rr.get("hidden_blocks", [])),
+                "Lazy-load":       rr.get("lazy_elements", 0),
+                "Pattern JS":      len(rr.get("js_patterns", [])),
+                "DOM delta":       rr.get("dom_delta", "N/A"),
+            })
+        st.dataframe(
+            pd.DataFrame(rows_v_all).style.map(color_cell, subset=["Overall"]),
+            use_container_width=True,
+            height=min(600, 80 + 38 * len(rows_v_all)),
+        )
+        st.divider()
+        page_urls_v = [pg[0].get("url", f"Pagina {i+1}") for i, pg in enumerate(grouped)]
+        sel_idx_v = st.selectbox(
+            "Dettaglio pagina", range(len(page_urls_v)),
+            format_func=lambda i: page_urls_v[i], key="v_page_sel",
+        )
+        r = r_by(grouped[sel_idx_v], "1.")
+    else:
+        r = r1f
+    ov = r.get("overall", "ERROR")
     ct, cb = st.columns([7, 1])
     ct.subheader("Rendering & Visibilità Contenuti")
     cb.markdown(f"<div style='padding-top:10px'>{badge(ov)}</div>", unsafe_allow_html=True)
@@ -710,7 +738,36 @@ with tabs[3]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tabs[4]:
-    r = r2f; ov = r.get("overall", "ERROR")
+    if npages > 1:
+        st.subheader(f"Riepilogo Heading — {npages} pagine")
+        rows_h_all = []
+        for pg in grouped:
+            pg_url = pg[0].get("url", "—") if pg else "—"
+            rr = r_by(pg, "2.")
+            rows_h_all.append({
+                "URL":            pg_url,
+                "Overall":        rr.get("overall", "ERROR"),
+                "H1":             rr.get("h1_count", 0),
+                "H2":             rr.get("h2_count", 0),
+                "H3":             rr.get("h3_count", 0),
+                "Salti livello":  len(rr.get("level_jumps", [])),
+                "Blocchi orfani": len(rr.get("orphan_blocks", [])),
+            })
+        st.dataframe(
+            pd.DataFrame(rows_h_all).style.map(color_cell, subset=["Overall"]),
+            use_container_width=True,
+            height=min(600, 80 + 38 * len(rows_h_all)),
+        )
+        st.divider()
+        page_urls_h = [pg[0].get("url", f"Pagina {i+1}") for i, pg in enumerate(grouped)]
+        sel_idx_h = st.selectbox(
+            "Dettaglio pagina", range(len(page_urls_h)),
+            format_func=lambda i: page_urls_h[i], key="h_page_sel",
+        )
+        r = r_by(grouped[sel_idx_h], "2.")
+    else:
+        r = r2f
+    ov = r.get("overall", "ERROR")
     ct, cb = st.columns([7, 1])
     ct.subheader("Struttura Heading H2/H3")
     cb.markdown(f"<div style='padding-top:10px'>{badge(ov)}</div>", unsafe_allow_html=True)
@@ -746,7 +803,35 @@ with tabs[4]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tabs[5]:
-    r = r3f; ov = r.get("overall", "ERROR")
+    if npages > 1:
+        st.subheader(f"Riepilogo Robots.txt — {npages} pagine")
+        rows_rb_all = []
+        for pg in grouped:
+            pg_url = pg[0].get("url", "—") if pg else "—"
+            rr = r_by(pg, "3.")
+            rows_rb_all.append({
+                "URL":                     pg_url,
+                "Overall":                 rr.get("overall", "ERROR"),
+                "Direttive non supportate": rr.get("unsupported_count", 0),
+                "Typo Disallow":           rr.get("typos_count", 0),
+                "Sitemap dichiarata":      "Sì" if rr.get("sitemap_declared") else "No",
+                "Finding":                 len(rr.get("findings", [])),
+            })
+        st.dataframe(
+            pd.DataFrame(rows_rb_all).style.map(color_cell, subset=["Overall"]),
+            use_container_width=True,
+            height=min(600, 80 + 38 * len(rows_rb_all)),
+        )
+        st.divider()
+        page_urls_rb = [pg[0].get("url", f"Pagina {i+1}") for i, pg in enumerate(grouped)]
+        sel_idx_rb = st.selectbox(
+            "Dettaglio pagina", range(len(page_urls_rb)),
+            format_func=lambda i: page_urls_rb[i], key="rb_page_sel",
+        )
+        r = r_by(grouped[sel_idx_rb], "3.")
+    else:
+        r = r3f
+    ov = r.get("overall", "ERROR")
     ct, cb = st.columns([7, 1])
     ct.subheader("Robots.txt")
     cb.markdown(f"<div style='padding-top:10px'>{badge(ov)}</div>", unsafe_allow_html=True)
@@ -924,7 +1009,40 @@ with tabs[6]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tabs[7]:
-    r = r8f; ov = r.get("overall", "ERROR")
+    if npages > 1:
+        st.subheader(f"Riepilogo E-E-A-T — {npages} pagine")
+        rows_e_all = []
+        for pg in grouped:
+            pg_url = pg[0].get("url", "—") if pg else "—"
+            rr = r_by(pg, "8.")
+            rows_e_all.append({
+                "URL":         pg_url,
+                "Overall":     rr.get("overall", "ERROR"),
+                "Score":       rr.get("score", 0),
+                "Autori":      len(rr.get("author_found", [])),
+                "Bio autore":  "Sì" if rr.get("bio_found") else "No",
+                "Data pubbl.": "Sì" if rr.get("date_pub") else "No",
+                "Schema Org.": "Sì" if rr.get("org_schema") else "No",
+                "Fonti est.":  len(rr.get("auth_links", [])),
+                "YMYL":        "⚠️ Sì" if rr.get("is_ymyl") else "No",
+            })
+        st.dataframe(
+            pd.DataFrame(rows_e_all).style
+                .map(color_cell, subset=["Overall"])
+                .background_gradient(subset=["Score"], cmap="RdYlGn", vmin=0, vmax=100),
+            use_container_width=True,
+            height=min(600, 80 + 38 * len(rows_e_all)),
+        )
+        st.divider()
+        page_urls_e = [pg[0].get("url", f"Pagina {i+1}") for i, pg in enumerate(grouped)]
+        sel_idx_e = st.selectbox(
+            "Dettaglio pagina", range(len(page_urls_e)),
+            format_func=lambda i: page_urls_e[i], key="e_page_sel",
+        )
+        r = r_by(grouped[sel_idx_e], "8.")
+    else:
+        r = r8f
+    ov = r.get("overall", "ERROR")
     ct, cb = st.columns([7, 1])
     ct.subheader("E-E-A-T Signals")
     cb.markdown(f"<div style='padding-top:10px'>{badge(ov)}</div>", unsafe_allow_html=True)
@@ -969,7 +1087,39 @@ with tabs[7]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tabs[8]:
-    r = r9f; ov = r.get("overall", "ERROR")
+    if npages > 1:
+        st.subheader(f"Riepilogo Performance — {npages} pagine")
+        rows_p_all = []
+        for pg in grouped:
+            pg_url = pg[0].get("url", "—") if pg else "—"
+            rr = r_by(pg, "9.")
+            rows_p_all.append({
+                "URL":             pg_url,
+                "Overall":         rr.get("overall", "ERROR"),
+                "Score":           rr.get("score", 0),
+                "Img senza dim.":  rr.get("imgs_no_size", 0),
+                "Img senza alt":   rr.get("imgs_no_alt", 0),
+                "Script blocc.":   rr.get("blocking_scripts", 0),
+                "Script esterni":  rr.get("ext_scripts", 0),
+                "Preconnect":      rr.get("preconnect_count", 0),
+            })
+        st.dataframe(
+            pd.DataFrame(rows_p_all).style
+                .map(color_cell, subset=["Overall"])
+                .background_gradient(subset=["Score"], cmap="RdYlGn", vmin=0, vmax=100),
+            use_container_width=True,
+            height=min(600, 80 + 38 * len(rows_p_all)),
+        )
+        st.divider()
+        page_urls_p = [pg[0].get("url", f"Pagina {i+1}") for i, pg in enumerate(grouped)]
+        sel_idx_p = st.selectbox(
+            "Dettaglio pagina", range(len(page_urls_p)),
+            format_func=lambda i: page_urls_p[i], key="p_page_sel",
+        )
+        r = r_by(grouped[sel_idx_p], "9.")
+    else:
+        r = r9f
+    ov = r.get("overall", "ERROR")
     ct, cb = st.columns([7, 1])
     ct.subheader("Performance Signals")
     cb.markdown(f"<div style='padding-top:10px'>{badge(ov)}</div>", unsafe_allow_html=True)
@@ -1018,7 +1168,39 @@ with tabs[8]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tabs[9]:
-    r = r10f; ov = r.get("overall", "ERROR")
+    if npages > 1:
+        st.subheader(f"Riepilogo Topical Authority — {npages} pagine")
+        rows_t_all = []
+        for pg in grouped:
+            pg_url = pg[0].get("url", "—") if pg else "—"
+            rr = r_by(pg, "10.")
+            rows_t_all.append({
+                "URL":              pg_url,
+                "Overall":          rr.get("overall", "ERROR"),
+                "Score":            rr.get("score", 0),
+                "Title (car.)":     rr.get("title_len", 0),
+                "Meta desc (car.)": rr.get("desc_len", 0),
+                "Canonical":        "Sì" if rr.get("has_canonical") else "No",
+                "Breadcrumb":       "Sì" if rr.get("has_breadcrumb") else "No",
+                "Parole":           rr.get("word_count", 0),
+            })
+        st.dataframe(
+            pd.DataFrame(rows_t_all).style
+                .map(color_cell, subset=["Overall"])
+                .background_gradient(subset=["Score"], cmap="RdYlGn", vmin=0, vmax=100),
+            use_container_width=True,
+            height=min(600, 80 + 38 * len(rows_t_all)),
+        )
+        st.divider()
+        page_urls_t = [pg[0].get("url", f"Pagina {i+1}") for i, pg in enumerate(grouped)]
+        sel_idx_t = st.selectbox(
+            "Dettaglio pagina", range(len(page_urls_t)),
+            format_func=lambda i: page_urls_t[i], key="t_page_sel",
+        )
+        r = r_by(grouped[sel_idx_t], "10.")
+    else:
+        r = r10f
+    ov = r.get("overall", "ERROR")
     ct, cb = st.columns([7, 1])
     ct.subheader("Autorevolezza Topica")
     cb.markdown(f"<div style='padding-top:10px'>{badge(ov)}</div>", unsafe_allow_html=True)
