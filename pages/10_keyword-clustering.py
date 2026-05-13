@@ -175,6 +175,8 @@ if keywords and labels and api_key and confirm_run:
                         temperature=0,
                         max_tokens=6 * len(kw_batch) + 100,  # margine sufficiente
                     )
+                    if not response.choices:
+                        raise ValueError("Risposta OpenAI vuota.")
                     content = response.choices[0].message.content.strip()
                     usage = response.usage
                     if usage:

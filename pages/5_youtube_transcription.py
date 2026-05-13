@@ -403,6 +403,8 @@ def summarize_text(client: OpenAI, text: str, model: str, temperature: float, mi
             temperature=temperature,
             max_tokens=4000,
         )
+        if not resp.choices:
+            raise ValueError("Risposta OpenAI vuota.")
         return resp.choices[0].message.content
 
     partial_summaries = []
@@ -420,6 +422,8 @@ def summarize_text(client: OpenAI, text: str, model: str, temperature: float, mi
             temperature=temperature,
             max_tokens=1200,
         )
+        if not resp.choices:
+            raise ValueError("Risposta OpenAI vuota.")
         partial_summaries.append(resp.choices[0].message.content)
 
     synthesis_prompt = (
@@ -437,6 +441,8 @@ def summarize_text(client: OpenAI, text: str, model: str, temperature: float, mi
         temperature=temperature,
         max_tokens=4000,
     )
+    if not final_resp.choices:
+        raise ValueError("Risposta OpenAI vuota.")
     return final_resp.choices[0].message.content
 
 STOPWORDS = set("""
@@ -488,6 +494,8 @@ def summarize_text_safe_mapreduce(client: OpenAI, text: str, model: str, tempera
             temperature=temperature,
             max_tokens=300,
         )
+        if not resp.choices:
+            raise ValueError("Risposta OpenAI vuota.")
         partials.append(resp.choices[0].message.content)
     final = client.chat.completions.create(
         model=model,
@@ -499,6 +507,8 @@ def summarize_text_safe_mapreduce(client: OpenAI, text: str, model: str, tempera
         temperature=temperature,
         max_tokens=1000,
     )
+    if not final.choices:
+        raise ValueError("Risposta OpenAI vuota.")
     return final.choices[0].message.content
 
 # ============================
@@ -623,6 +633,8 @@ if st.button("📄 Generate Transcript and Summary", use_container_width=True):
                         temperature=temperature,
                         max_tokens=1200,
                     )
+                    if not final_resp.choices:
+                        raise ValueError("Risposta OpenAI vuota.")
                     summary = final_resp.choices[0].message.content
 
             elif summary_mode == "Extractive (no OpenAI)":

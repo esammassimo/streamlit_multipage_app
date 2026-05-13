@@ -15,10 +15,17 @@ def get_paa_questions(keyword, serpapi_api_key):
         "api_key": serpapi_api_key
     }
     # Esegui la richiesta GET a SerpAPI
-    response = requests.get(url, params=params)
+    try:
+        response = requests.get(url, params=params, timeout=30)
+    except requests.exceptions.RequestException as e:
+        st.error(f"❌ Errore di rete nella richiesta SerpAPI: {e}")
+        return []
     if response.status_code == 200:
-        data = response.json()
-        # Estrai le domande dal campo related_questions (People Also Ask)
+        try:
+            data = response.json()
+        except ValueError:
+            st.error("❌ Risposta SerpAPI non valida (JSON non parsabile).")
+            return []
         return [q["question"] for q in data.get("related_questions", [])]
     else:
         st.error(f"❌ Errore nella richiesta SerpAPI: {response.status_code}")

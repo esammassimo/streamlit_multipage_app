@@ -177,6 +177,8 @@ if unique_norm_domains and labels and api_key and confirm_run:
                         temperature=0,
                         max_tokens=4 * len(dom_batch) + 50,  # margine
                     )
+                    if not response.choices:
+                        raise ValueError("Risposta OpenAI vuota.")
                     content = response.choices[0].message.content.strip()
                     usage = response.usage
                     if usage:

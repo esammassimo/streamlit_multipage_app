@@ -690,6 +690,8 @@ if df_raw is not None:
             kwargs["max_tokens"] = 3000
 
         response = client.chat.completions.create(**kwargs)
+        if not response.choices:
+            raise ValueError("Risposta OpenAI vuota.")
         return response.choices[0].message.content
 
     def _add_hyperlink(paragraph, text, url):

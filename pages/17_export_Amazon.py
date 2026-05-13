@@ -258,7 +258,10 @@ def get_amazon_product_data(asin, api_key, amazon_domain="amazon.it"):
             f"Errore API per ASIN {asin} - HTTP {response.status_code}: {response.text[:300]}"
         )
 
-    data = response.json()
+    try:
+        data = response.json()
+    except ValueError:
+        raise RuntimeError(f"Risposta non valida per ASIN {asin} (JSON non parsabile).")
 
     if "error" in data:
         raise RuntimeError(f"Errore API per ASIN {asin}: {data['error']}")

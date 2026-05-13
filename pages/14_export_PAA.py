@@ -23,13 +23,20 @@ def get_top4_paa_with_meta_and_indicators(keyword, api_key, gl="it", hl="it"):
         "hl": hl
     }
 
-    resp = requests.get(API_URL, params=params)
+    try:
+        resp = requests.get(API_URL, params=params, timeout=30)
+    except requests.exceptions.RequestException as e:
+        st.warning(f"❌ Errore di rete per '{keyword}': {e}")
+        return []
     if resp.status_code != 200:
-        # Ritorno lista vuota in caso di errore
-        st.warning(f"❌ Errore per '{keyword}' – status {resp.status_code}: {resp.text}")
+        st.warning(f"❌ Errore per '{keyword}' – status {resp.status_code}: {resp.text[:200]}")
         return []
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError:
+        st.warning(f"❌ Risposta non valida per '{keyword}' (JSON non parsabile).")
+        return []
     rq = data.get("related_questions", [])  # contiene anche title, link, snippet
 
     results = []

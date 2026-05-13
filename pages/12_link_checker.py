@@ -14,9 +14,11 @@ def verifica_link(url, anchor_text, target_url):
             return f"❌ HTTP {response.status_code}"
 
         soup = BeautifulSoup(response.text, 'html.parser')
-        links = soup.find_all('a', href=True)
+        links = soup.find_all('a')
         for link in links:
-            href = link['href'].strip()
+            href = (link.get('href') or '').strip()
+            if not href:
+                continue
             text = link.get_text().strip()
             if href == target_url and anchor_text.lower() in text.lower():
                 return "✅ Link corretto"

@@ -30,7 +30,9 @@ def get_openai_api_key():
         # Salva in sessione
         st.session_state['oai_api_key'] = oai_api_key
         return oai_api_key
-    oai_client = openai.Client(api_key=oai_api_key)
+
+oai_api_key = get_openai_api_key()
+oai_client = openai.OpenAI(api_key=oai_api_key)
 
 # 📌 Caricamento del file Excel
 uploaded_file = st.file_uploader("Upload Excel file", type=["xlsx"])
@@ -72,6 +74,8 @@ if uploaded_file:
             max_tokens=3000
         )
 
+        if not response.choices:
+            raise ValueError("Risposta OpenAI vuota per il paragrafo.")
         return response.choices[0].message.content
 
     # ✨ Generazione del contenuto totale con controllo sulla lunghezza
