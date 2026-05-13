@@ -785,9 +785,34 @@ with tabs[5]:
 
 with tabs[6]:
     if npages > 1:
+        st.subheader(f"Riepilogo Dati Strutturati — {npages} pagine")
+        rows_sd_all = []
+        for pg in grouped:
+            pg_url = pg[0].get("url", "—") if pg else "—"
+            rr = r_by(pg, "4.")
+            rows_sd_all.append({
+                "URL":           pg_url,
+                "Overall":       rr.get("overall", "ERROR"),
+                "Schema trovati": len(rr.get("schemas", [])),
+                "JSON-LD":       rr.get("jsonld_blocks", 0),
+                "Score medio":   rr.get("avg_score", 0),
+                "Rich result":   rr.get("rich_ready", 0),
+                "OG completo":   "Sì" if rr.get("og_complete") else "No",
+                "Twitter Card":  "Sì" if rr.get("twitter_card") else "No",
+            })
+        df_sd_all = pd.DataFrame(rows_sd_all)
+        st.dataframe(
+            df_sd_all.style
+                .map(color_cell, subset=["Overall"])
+                .background_gradient(subset=["Score medio"], cmap="RdYlGn", vmin=0, vmax=100),
+            use_container_width=True,
+            height=min(600, 80 + 38 * len(df_sd_all)),
+        )
+        st.divider()
+
         page_urls_sd = [pg[0].get("url", f"Pagina {i+1}") for i, pg in enumerate(grouped)]
         sel_idx_sd = st.selectbox(
-            "Pagina",
+            "Dettaglio pagina",
             range(len(page_urls_sd)),
             format_func=lambda i: page_urls_sd[i],
             key="sd_page_sel",
