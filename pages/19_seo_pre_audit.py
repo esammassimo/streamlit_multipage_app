@@ -386,13 +386,8 @@ if urls_to_audit and AUDIT_OK:
     st.session_state["audit_url"] = input_label or urls_to_audit[0]
     st.session_state["audit_ts"]  = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-    total      = len(urls_to_audit)
-    is_multi   = total > 1          # sitemap o file → mostra loader dettagliato
-    pbar       = st.progress(0, text="Avvio…")
-    info       = st.empty()
-
-    # Contatore URL — visibile solo per analisi multi-URL
-    url_counter = st.empty() if is_multi else None
+    total    = len(urls_to_audit)
+    is_multi = total > 1
 
     steps = [
         ("1.",  "Rendering & Visibilità",
@@ -412,59 +407,132 @@ if urls_to_audit and AUDIT_OK:
     ]
     n = len(steps)
 
+    # ── UI logging ────────────────────────────────────────────────────────────
+    pbar        = st.progress(0, text="Avvio…")
+    status_line = st.empty()
+
+    if is_multi:
+        m1, m2, m3, m4 = st.columns(4)
+        slot_done  = m1.empty()
+        slot_err   = m2.empty()
+        slot_eta   = m3.empty()
+        slot_elap  = m4.empty()
+        log_box    = st.empty()
+
+    _OV_ICON = {"OK": "✅", "WARN": "⚠️", "FAIL": "❌", "ERROR": "💀"}
+
+    audit_start = time.time()
+    log_lines   = []   # righe log accumulate
+    err_count   = 0
+
+    # ── Loop URL ──────────────────────────────────────────────────────────────
     for idx, url in enumerate(urls_to_audit):
-        info.info(f"🔍 {url}")
+        url_start = time.time()
+        short_url = (url.split("//")[-1])[:70]
 
-        # Loader URL-per-URL per sitemap e file
-        if is_multi and url_counter is not None:
-            url_counter.markdown(
-                f"**Pagina {idx + 1} di {total}** analizzata &nbsp;·&nbsp; "
-                f"{idx} completate &nbsp;·&nbsp; {total - idx - 1} rimanenti"
-            )
+        status_line.info(f"🔍 [{idx+1}/{total}] {short_url}")
 
-        page_res = []
+        if is_multi:
+            elapsed = time.time() - audit_start
+            if idx > 0:
+                avg = elapsed / idx
+                rem = avg * (total - idx)
+                eta_str = f"{int(rem//60)}m {int(rem%60)}s"
+            else:
+                eta_str = "—"
+            slot_done.metric("Completate",  f"{idx} / {total}")
+            slot_err.metric("Errori",        err_count)
+            slot_eta.metric("ETA",           eta_str)
+            slot_elap.metric("Trascorso",    f"{int(elapsed//60)}m {int(elapsed%60)}s")
+
+        page_res     = []
+        step_summary = []   # (area_label, overall, seconds)
 
         try:
             session = sa.get_session()
 
-            pbar.progress(idx / total, text=f"[{idx+1}/{total}] Fetch statico…")
+            # — Fetch statico ─────────────────────────────────────────────────
+            pbar.progress(idx / total,
+                          text=f"[{idx+1}/{total}] Fetch HTTP statico…")
+            t0 = time.time()
             static_html, _, final_url = sa.fetch_html_static(url, session)
+            fetch_s = time.time() - t0
 
             if not static_html:
-                info.error(f"❌ {url} — impossibile recuperare ({final_url})")
+                err_count += 1
+                msg = f"❌ [{idx+1}/{total}] {short_url}  — fetch fallito ({fetch_s:.1f}s)"
+                log_lines.append(msg)
+                status_line.error(msg)
+                if is_multi:
+                    log_box.code("\n".join(reversed(log_lines[-30:])), language="text")
                 pbar.progress((idx + 1) / total)
                 continue
 
+            # — Rendering JS ──────────────────────────────────────────────────
             rendered_html = None
             if USE_PLAYWRIGHT:
-                pbar.progress(
-                    (idx + 0.1) / total,
-                    text=f"[{idx+1}/{total}] Rendering JavaScript…",
-                )
+                pbar.progress((idx + 0.05) / total,
+                              text=f"[{idx+1}/{total}] Rendering JavaScript…")
+                t0 = time.time()
                 rendered_html = sa.fetch_html_rendered(url)
+                render_s = time.time() - t0
+                step_summary.append(("JS render", "—", render_s))
 
+            # — Analisi per area ──────────────────────────────────────────────
             for si, (pfx, name, fn) in enumerate(steps):
                 pbar.progress(
                     (idx + (si + 1) / n) / total,
-                    text=f"[{idx+1}/{total}] Area {pfx.rstrip('.')} — {name}",
+                    text=f"[{idx+1}/{total}] Area {pfx.rstrip('.')} — {name}…",
                 )
-                r = fn(url, static_html, rendered_html, session)
+                t0 = time.time()
+                r  = fn(url, static_html, rendered_html, session)
+                step_s = time.time() - t0
                 r["url"] = url
                 page_res.append(r)
+                step_summary.append((f"A{pfx.rstrip('.')}", r.get("overall", "ERROR"), step_s))
 
             st.session_state["grouped"].append(page_res)
 
+            # — Riga log URL completata ────────────────────────────────────────
+            url_s    = time.time() - url_start
+            badges   = "  ".join(
+                f"{_OV_ICON.get(ov,'?')} A{lbl}={ov} ({s:.1f}s)"
+                for lbl, ov, s in step_summary
+                if lbl.startswith("A")
+            )
+            fetch_info = f"fetch {fetch_s:.1f}s"
+            log_lines.append(
+                f"✅ [{idx+1}/{total}] {short_url}  ({url_s:.1f}s tot · {fetch_info})\n"
+                f"   {badges}"
+            )
+
         except Exception as exc:
-            info.error(f"❌ Errore su {url}: {exc}")
+            err_count += 1
+            log_lines.append(
+                f"💀 [{idx+1}/{total}] {short_url}  — ERRORE: {str(exc)[:120]}"
+            )
+            status_line.error(f"❌ Errore su {url}: {exc}")
 
-        pbar.progress((idx + 1) / total, text=f"Completati {idx+1}/{total}")
+        pbar.progress((idx + 1) / total,
+                      text=f"Completati {idx+1}/{total}")
 
-    pbar.progress(1.0, text=f"✅ Completato — {len(st.session_state['grouped'])} URL analizzate")
-    time.sleep(0.6)
+        if is_multi:
+            log_box.code("\n".join(reversed(log_lines[-30:])), language="text")
+
+    # ── Fine ──────────────────────────────────────────────────────────────────
+    total_s = time.time() - audit_start
+    done_n  = len(st.session_state["grouped"])
+    pbar.progress(
+        1.0,
+        text=f"✅ Completato — {done_n} URL in {int(total_s//60)}m {int(total_s%60)}s"
+             + (f" · {err_count} errori" if err_count else ""),
+    )
+    time.sleep(0.8)
     pbar.empty()
-    info.empty()
-    if url_counter is not None:
-        url_counter.empty()
+    status_line.empty()
+    if is_multi:
+        slot_done.empty(); slot_err.empty(); slot_eta.empty(); slot_elap.empty()
+        log_box.empty()
     st.rerun()
 
 
@@ -681,16 +749,20 @@ with tabs[3]:
         for pg in grouped:
             pg_url = pg[0].get("url", "—") if pg else "—"
             rr = r_by(pg, "1.")
+            ov_v = rr.get("overall", "ERROR")
             rows_v_all.append({
-                "URL":             pg_url,
-                "Overall":         rr.get("overall", "ERROR"),
+                "URL":              pg_url,
+                "Overall":          ov_v,
+                "Score":            SC.get(ov_v, 0),
                 "Blocchi nascosti": len(rr.get("hidden_blocks", [])),
-                "Lazy-load":       rr.get("lazy_elements", 0),
-                "Pattern JS":      len(rr.get("js_patterns", [])),
-                "DOM delta":       rr.get("dom_delta", "N/A"),
+                "Lazy-load":        rr.get("lazy_elements", 0),
+                "Pattern JS":       len(rr.get("js_patterns", [])),
+                "DOM delta":        rr.get("dom_delta", "N/A"),
             })
         st.dataframe(
-            pd.DataFrame(rows_v_all).style.map(color_cell, subset=["Overall"]),
+            pd.DataFrame(rows_v_all).style
+                .map(color_cell, subset=["Overall"])
+                .background_gradient(subset=["Score"], cmap="RdYlGn", vmin=0, vmax=100),
             use_container_width=True,
             height=min(600, 80 + 38 * len(rows_v_all)),
         )
@@ -744,9 +816,11 @@ with tabs[4]:
         for pg in grouped:
             pg_url = pg[0].get("url", "—") if pg else "—"
             rr = r_by(pg, "2.")
+            ov_h = rr.get("overall", "ERROR")
             rows_h_all.append({
                 "URL":            pg_url,
-                "Overall":        rr.get("overall", "ERROR"),
+                "Overall":        ov_h,
+                "Score":          SC.get(ov_h, 0),
                 "H1":             rr.get("h1_count", 0),
                 "H2":             rr.get("h2_count", 0),
                 "H3":             rr.get("h3_count", 0),
@@ -754,7 +828,9 @@ with tabs[4]:
                 "Blocchi orfani": len(rr.get("orphan_blocks", [])),
             })
         st.dataframe(
-            pd.DataFrame(rows_h_all).style.map(color_cell, subset=["Overall"]),
+            pd.DataFrame(rows_h_all).style
+                .map(color_cell, subset=["Overall"])
+                .background_gradient(subset=["Score"], cmap="RdYlGn", vmin=0, vmax=100),
             use_container_width=True,
             height=min(600, 80 + 38 * len(rows_h_all)),
         )
@@ -809,16 +885,20 @@ with tabs[5]:
         for pg in grouped:
             pg_url = pg[0].get("url", "—") if pg else "—"
             rr = r_by(pg, "3.")
+            ov_rb = rr.get("overall", "ERROR")
             rows_rb_all.append({
-                "URL":                     pg_url,
-                "Overall":                 rr.get("overall", "ERROR"),
+                "URL":                      pg_url,
+                "Overall":                  ov_rb,
+                "Score":                    SC.get(ov_rb, 0),
                 "Direttive non supportate": rr.get("unsupported_count", 0),
-                "Typo Disallow":           rr.get("typos_count", 0),
-                "Sitemap dichiarata":      "Sì" if rr.get("sitemap_declared") else "No",
-                "Finding":                 len(rr.get("findings", [])),
+                "Typo Disallow":            rr.get("typos_count", 0),
+                "Sitemap dichiarata":       "Sì" if rr.get("sitemap_declared") else "No",
+                "Finding":                  len(rr.get("findings", [])),
             })
         st.dataframe(
-            pd.DataFrame(rows_rb_all).style.map(color_cell, subset=["Overall"]),
+            pd.DataFrame(rows_rb_all).style
+                .map(color_cell, subset=["Overall"])
+                .background_gradient(subset=["Score"], cmap="RdYlGn", vmin=0, vmax=100),
             use_container_width=True,
             height=min(600, 80 + 38 * len(rows_rb_all)),
         )
