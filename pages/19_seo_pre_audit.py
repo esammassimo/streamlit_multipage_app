@@ -208,7 +208,7 @@ with col_hd:
     st.title("SEO Audit")
     st.caption("NVL Agency · Analisi tecnica on-page · 9 aree di analisi")
 with col_st:
-    st.markdown("")  # spacing
+    st.markdown(" - ")  # spacing
     if AUDIT_OK:
         st.success("seo_audit.py ✅")
     else:
