@@ -626,63 +626,30 @@ def _wrap_paragraph_or_passthrough(html_line: str) -> str:
         return t
     return '<p class="h-text-size-14 h-font-primary">{}</p>'.format(t)
 
-def _build_image_placeholder(idx: int) -> str:
-    """Genera il blocco HTML placeholder per un'immagine."""
-    return (
-        '<div class="h-image-placeholder" data-position="{idx}">'
-        '<!-- IMAGE {idx} -->'
-        '</div>'
-    ).format(idx=idx)
-
-
-def _build_carousel_block(product_ids: List[str]) -> str:
-    """Genera il blocco HTML per il carosello prodotti."""
-    ids_attr = ",".join(product_ids)
-    items_html = "\n".join(
-        '  <!-- PRODUCT: {pid} -->'.format(pid=pid) for pid in product_ids
-    )
-    return (
-        '<div class="h-product-carousel" data-products="{ids}">\n'
-        '{items}\n'
-        '</div>'
-    ).format(ids=ids_attr, items=items_html)
-
-
 def build_html_rows(
     parsed: Dict[str, Any],
     n_images: int = 0,
     product_ids: Optional[List[str]] = None,
 ) -> List[Tuple[str, str]]:
     """
-    Costruisce le righe Block/HTML.
-    - n_images: numero di placeholder immagine da distribuire tra le sezioni.
-    - product_ids: lista di ID prodotto per il carosello finale.
+    Costruisce le righe Block/HTML allineate al formato di riferimento:
 
-    Strategia di distribuzione immagini:
-      - 1 placeholder subito dopo l'intro
-      - i restanti distribuiti uniformemente tra le sezioni S3
-      - se non ci sono sezioni, tutte le immagini dopo l'intro
+      ("H1",           "<h1>...</h1>")
+      ("Intro",        "<p ...>...</p>")
+      ("S1 IMAGE",     "")          ← cella vuota PRIMA della sezione
+      ("S1",           "<h2>...</h2>  <p>...</p>")
+      ("S2 IMAGE",     "")
+      ("S2",           "...")
+      ...
+      ("➡️Related Product", "00266-LAC ; 01123-LAC")  ← ID grezzi, non HTML
+
+    Le immagini vengono assegnate alle prime N sezioni (una per sezione),
+    inserendo il placeholder IMAGE vuoto immediatamente prima della sezione.
+    Le sezioni oltre n_images non ricevono IMAGE.
     """
     rows: List[Tuple[str, str]] = []
     if product_ids is None:
         product_ids = []
-
-    sections = parsed.get("sections", [])
-    total_sections = len(sections)
-
-    # calcolo distribuzione: immagini rimaste dopo la prima (intro)
-    img_counter = [0]  # lista per mutabilità nel closure
-
-    def next_img() -> Optional[str]:
-        img_counter[0] += 1
-        if img_counter[0] <= n_images:
-            return _build_image_placeholder(img_counter[0])
-        return None
-
-    # Quante immagini "interne" alle sezioni (esclusa la prima dopo intro)
-    images_after_intro = max(0, n_images - 1) if n_images > 0 else 0
-    # frequenza: ogni quante sezioni inserire un'immagine
-    img_freq = max(1, total_sections // images_after_intro) if images_after_intro and total_sections else 0
 
     # --- H1 ---
     h1 = parsed.get("h1") or ""
@@ -696,18 +663,18 @@ def build_html_rows(
         intro_html = '<p class="h-text-size-14 h-font-primary"></p>'
     rows.append(("Intro", intro_html))
 
-    # Prima immagine: subito dopo l'intro
-    if n_images > 0:
-        img_html = next_img()
-        if img_html:
-            rows.append(("IMG", img_html))
+    # --- Sezioni numerate con IMAGE prima (se prevista) ---
+    for sec_idx, sec in enumerate(parsed.get("sections", [])):
+        sec_num = sec_idx + 1
+        title   = sec.get("title", "")
+        level   = (sec.get("level") or "h2").lower()
+        paras   = sec.get("paras", [])
 
-    # --- Sezioni S3 con immagini intercalate ---
-    for sec_idx, sec in enumerate(sections):
-        title  = sec.get("title", "")
-        level  = (sec.get("level") or "h2").lower()
-        paras  = sec.get("paras", [])
+        # Placeholder vuoto prima della sezione, se rientra nel conteggio immagini
+        if sec_num <= n_images:
+            rows.append(("S{} IMAGE".format(sec_num), ""))
 
+        # Contenuto sezione
         if level == "h3":
             heading = '<h3><strong>{}</strong></h3>'.format(title)
         else:
@@ -715,40 +682,29 @@ def build_html_rows(
 
         parts = [heading]
         parts.extend(_wrap_paragraph_or_passthrough(p) for p in paras if (p or "").strip())
-        rows.append(("S3", "\n\n".join(parts).strip()))
+        rows.append(("S{}".format(sec_num), "\n\n".join(parts).strip()))
 
-        # Inserisci immagine dopo questa sezione secondo la frequenza calcolata
-        if img_freq and images_after_intro > 0 and img_counter[0] < n_images:
-            if (sec_idx + 1) % img_freq == 0:
-                img_html = next_img()
-                if img_html:
-                    rows.append(("IMG", img_html))
-
-    # Immagini residue (se non tutte distribuite)
-    while img_counter[0] < n_images:
-        img_html = next_img()
-        if img_html:
-            rows.append(("IMG", img_html))
-
-    # --- Carosello prodotti (in fondo) ---
+    # --- Related Product (ID grezzi separati da " ; ") ---
     if product_ids:
-        rows.append(("CAROUSEL", _build_carousel_block(product_ids)))
+        rows.append(("➡️Related Product", " ; ".join(product_ids)))
 
     return rows
 
+
 def build_structure_of_content(html_rows: List[Tuple[str, str]]) -> List[str]:
+    """
+    Produce la lista per 'Structure of content'.
+    Mostra H1, Intro e le sezioni Sx come '✏️ S3'.
+    I blocchi IMAGE e Related Product non compaiono nella struttura.
+    """
     s = []
     for block, _ in html_rows:
         if block == "H1":
             s.append("H1")
         elif block == "Intro":
             s.append("Intro")
-        elif block == "S3":
+        elif block.startswith("S") and not block.endswith("IMAGE") and block != "Intro":
             s.append("✏️ S3")
-        elif block == "IMG":
-            s.append("🖼️ IMG")
-        elif block == "CAROUSEL":
-            s.append("🎠 CAROUSEL")
     return s
 
 
@@ -822,10 +778,10 @@ def write_output_docx(
         row_cells[1].text = html_block
 
         # evidenzia visivamente le righe speciali
-        if block == "IMG":
+        if "IMAGE" in block:
             shade_cell(row_cells[0], "FFF2CC")  # giallo chiaro
             shade_cell(row_cells[1], "FFF2CC")
-        elif block == "CAROUSEL":
+        elif "Related Product" in block:
             shade_cell(row_cells[0], "D9EAD3")  # verde chiaro
             shade_cell(row_cells[1], "D9EAD3")
 

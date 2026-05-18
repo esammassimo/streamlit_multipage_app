@@ -295,20 +295,21 @@ if btn_convert and docx_files:
 
             # Applica strategia immagini
             if img_strategy == "Solo dopo l'intro":
-                # build_html_rows mette già la prima immagine dopo l'intro;
-                # forziamo n_images=1 così vengono messe solo lì
+                # Solo la prima sezione riceve IMAGE
                 n_images_for_build = min(1, n_images)
                 html_rows = build_html_rows(parsed, n_images=n_images_for_build, product_ids=product_ids)
             elif img_strategy == "Solo in fondo al contenuto":
-                # costruiamo senza immagini, poi le appendiamo prima del carosello
+                # Costruiamo senza immagini, poi appendiamo i placeholder prima di Related Product
                 html_rows = build_html_rows(parsed, n_images=0, product_ids=product_ids)
                 img_blocks = [
-                    ("IMG", f'<div class="h-image-placeholder" data-position="{j+1}"><!-- IMAGE {j+1} --></div>')
+                    ("S{} IMAGE".format(j + 1), "")
                     for j in range(n_images)
                 ]
-                carousel_idx = next((j for j, (b, _) in enumerate(html_rows) if b == "CAROUSEL"), None)
-                if carousel_idx is not None:
-                    html_rows = html_rows[:carousel_idx] + img_blocks + html_rows[carousel_idx:]
+                related_idx = next(
+                    (j for j, (b, _) in enumerate(html_rows) if "Related Product" in b), None
+                )
+                if related_idx is not None:
+                    html_rows = html_rows[:related_idx] + img_blocks + html_rows[related_idx:]
                 else:
                     html_rows = html_rows + img_blocks
             else:  # Distribuiti uniformemente (default)
@@ -413,24 +414,23 @@ if results:
     # ── Preview per file ───────────────────────────────────────────────────────
     if show_preview:
 
-        # Mappe pill
+        # Mappe pill — i blocchi IMAGE hanno nome dinamico tipo "S1 IMAGE"
         PILL_CLS = {
-            "H1": "p-h1", "Intro": "p-intro", "S3": "p-s3",
-            "IMG": "p-img", "CAROUSEL": "p-carousel",
+            "H1": "p-h1", "Intro": "p-intro",
         }
         PILL_LBL = {
-            "H1": "H1", "Intro": "INTRO", "S3": "S3",
-            "IMG": "🖼 IMG", "CAROUSEL": "🎠 CAROUSEL",
+            "H1": "H1", "Intro": "INTRO",
         }
 
         def pill(block: str) -> str:
-            cls = PILL_CLS.get(block, "p-meta")
-            lbl = PILL_LBL.get(block, block)
-            return f'<span class="bpill {cls}">{lbl}</span>'
-
-        # Chiave pulita per la SoC (rimuove emoji prefix da build_structure_of_content)
-        def clean_block(b: str) -> str:
-            return b.replace("✏️ ", "").replace("🖼️ ", "").replace("🎠 ", "")
+            if block in PILL_CLS:
+                return f'<span class="bpill {PILL_CLS[block]}">{PILL_LBL[block]}</span>'
+            if "IMAGE" in block:
+                return f'<span class="bpill p-img">🖼 {block}</span>'
+            if "Related Product" in block:
+                return f'<span class="bpill p-carousel">➡️ Related Product</span>'
+            # Sezioni Sx
+            return f'<span class="bpill p-s3">{block}</span>'
 
         for res in results:
             exp_label = ("✅ " if res["ok"] else "❌ ") + res["name"]
@@ -482,8 +482,14 @@ if results:
                 structure  = build_structure_of_content(html_rows)
                 soc_items  = []
                 for idx, b in enumerate(structure):
-                    cb = clean_block(b)
-                    soc_items.append(pill(cb))
+                    # build_structure_of_content restituisce già H1 / Intro / ✏️ S3
+                    label = b.replace("✏️ ", "").replace("🖼️ ", "").replace("🎠 ", "")
+                    if label == "H1":
+                        soc_items.append('<span class="bpill p-h1">H1</span>')
+                    elif label == "Intro":
+                        soc_items.append('<span class="bpill p-intro">INTRO</span>')
+                    else:
+                        soc_items.append('<span class="bpill p-s3">S3</span>')
                     if idx < len(structure) - 1:
                         soc_items.append('<span class="soc-arrow">›</span>')
                 soc_html = "\n".join(soc_items)
