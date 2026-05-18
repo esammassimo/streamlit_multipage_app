@@ -96,12 +96,25 @@ def _parse_product_ids(raw) -> List[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-def load_ped_lookup(xlsx_path: Path) -> Dict[str, Dict[str, Any]]:
+def get_xlsx_sheet_names(xlsx_path: Path) -> List[str]:
+    """Restituisce la lista dei fogli disponibili nel file Excel."""
+    if not _OPENPYXL_AVAILABLE or not Path(xlsx_path).exists():
+        return []
+    wb = openpyxl.load_workbook(str(xlsx_path), read_only=True, data_only=True)
+    return wb.sheetnames
+
+
+def load_ped_lookup(
+    xlsx_path: Path,
+    sheet_name: str = PED_SHEET_NAME,
+) -> Dict[str, Dict[str, Any]]:
     """
     Carica il foglio PED e restituisce un dizionario:
       { slug_normalizzato: { "n_images": int, "product_ids": [str,...] }, ... }
     La chiave è lo slug (col H) normalizzato (strip + lower).
     Costruisce anche un indice secondario per H1.
+
+    sheet_name: nome del foglio da leggere (default: PED_SHEET_NAME dalla config).
     """
     if not _OPENPYXL_AVAILABLE:
         print("WARNING: openpyxl non disponibile – placeholder immagini/carosello disabilitati.")
@@ -112,11 +125,11 @@ def load_ped_lookup(xlsx_path: Path) -> Dict[str, Dict[str, Any]]:
         return {}
 
     wb = openpyxl.load_workbook(str(xlsx_path), read_only=True, data_only=True)
-    if PED_SHEET_NAME not in wb.sheetnames:
-        print(f"WARNING: foglio '{PED_SHEET_NAME}' non trovato nel file Excel.")
+    if sheet_name not in wb.sheetnames:
+        print(f"WARNING: foglio '{sheet_name}' non trovato nel file Excel.")
         return {}
 
-    ws = wb[PED_SHEET_NAME]
+    ws = wb[sheet_name]
     lookup: Dict[str, Dict[str, Any]] = {}
 
     for row in ws.iter_rows(min_row=2, values_only=True):
@@ -632,24 +645,32 @@ def build_html_rows(
     product_ids: Optional[List[str]] = None,
 ) -> List[Tuple[str, str]]:
     """
-    Costruisce le righe Block/HTML allineate al formato di riferimento:
+    Costruisce le righe Block/HTML allineate al formato di riferimento.
 
-      ("H1",           "<h1>...</h1>")
-      ("Intro",        "<p ...>...</p>")
-      ("S1 IMAGE",     "")          ← cella vuota PRIMA della sezione
-      ("S1",           "<h2>...</h2>  <p>...</p>")
-      ("S2 IMAGE",     "")
-      ("S2",           "...")
+    Struttura output:
+      ("H1",            "<h1>...</h1>")
+      ("Intro",         "<p ...>...</p>")
+      ("S1",            "<h2>...</h2>  <p>...</p>")
+      ("S1 IMAGE",      "")   ← placeholder vuoto DOPO la sezione, di default sempre presente
+      ("S2",            "...")
+      ("S2 IMAGE",      "")
       ...
-      ("➡️Related Product", "00266-LAC ; 01123-LAC")  ← ID grezzi, non HTML
+      ("➡️Related Product", "00266-LAC ; 01123-LAC")
 
-    Le immagini vengono assegnate alle prime N sezioni (una per sezione),
-    inserendo il placeholder IMAGE vuoto immediatamente prima della sezione.
-    Le sezioni oltre n_images non ricevono IMAGE.
+    Logica IMAGE:
+      - Il placeholder viene inserito DOPO ogni sezione, con progressivo corrispondente.
+      - Se n_images > 0 (da PED), vengono inseriti al massimo n_images placeholder;
+        le sezioni oltre quel numero non ricevono IMAGE.
+      - Se n_images == 0 (PED assente o articolo non trovato), IMAGE viene inserito
+        dopo ogni sezione senza limite (una per sezione, come default).
     """
     rows: List[Tuple[str, str]] = []
     if product_ids is None:
         product_ids = []
+
+    sections = parsed.get("sections", [])
+    # Limite immagini: se non specificato dal PED, una per ogni sezione
+    img_limit = n_images if n_images > 0 else len(sections)
 
     # --- H1 ---
     h1 = parsed.get("h1") or ""
@@ -663,16 +684,12 @@ def build_html_rows(
         intro_html = '<p class="h-text-size-14 h-font-primary"></p>'
     rows.append(("Intro", intro_html))
 
-    # --- Sezioni numerate con IMAGE prima (se prevista) ---
-    for sec_idx, sec in enumerate(parsed.get("sections", [])):
+    # --- Sezioni + IMAGE dopo ognuna ---
+    for sec_idx, sec in enumerate(sections):
         sec_num = sec_idx + 1
         title   = sec.get("title", "")
         level   = (sec.get("level") or "h2").lower()
         paras   = sec.get("paras", [])
-
-        # Placeholder vuoto prima della sezione, se rientra nel conteggio immagini
-        if sec_num <= n_images:
-            rows.append(("S{} IMAGE".format(sec_num), ""))
 
         # Contenuto sezione
         if level == "h3":
@@ -683,6 +700,10 @@ def build_html_rows(
         parts = [heading]
         parts.extend(_wrap_paragraph_or_passthrough(p) for p in paras if (p or "").strip())
         rows.append(("S{}".format(sec_num), "\n\n".join(parts).strip()))
+
+        # Placeholder IMAGE dopo la sezione, se rientra nel limite
+        if sec_num <= img_limit:
+            rows.append(("S{} IMAGE".format(sec_num), ""))
 
     # --- Related Product (ID grezzi separati da " ; ") ---
     if product_ids:

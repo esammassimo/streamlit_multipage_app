@@ -162,6 +162,7 @@ st.markdown("""
 try:
     from docx_to_html_engine import (
         parse_input_docx,
+        get_xlsx_sheet_names,
         load_ped_lookup,
         lookup_article_extras,
         build_html_rows,
@@ -173,9 +174,11 @@ except ImportError as e:
     st.stop()
 
 # ── Session state defaults ─────────────────────────────────────────────────────
-if "dth_results"    not in st.session_state: st.session_state.dth_results    = []
-if "dth_ped_lookup" not in st.session_state: st.session_state.dth_ped_lookup = {}
-if "dth_xlsx_hash"  not in st.session_state: st.session_state.dth_xlsx_hash  = None
+if "dth_results"      not in st.session_state: st.session_state.dth_results      = []
+if "dth_ped_lookup"   not in st.session_state: st.session_state.dth_ped_lookup   = {}
+if "dth_xlsx_hash"    not in st.session_state: st.session_state.dth_xlsx_hash    = None
+if "dth_sheet_names"  not in st.session_state: st.session_state.dth_sheet_names  = []
+if "dth_sheet_name"   not in st.session_state: st.session_state.dth_sheet_name   = ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -206,23 +209,47 @@ if xlsx_file is not None:
     xlsx_hash = hash(raw)
     xlsx_file.seek(0)
 
+    # Nuovo file: rileva fogli disponibili
     if st.session_state.dth_xlsx_hash != xlsx_hash:
         with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
             tmp.write(raw)
-            tmp_xlsx = Path(tmp.name)
-        st.session_state.dth_ped_lookup = load_ped_lookup(tmp_xlsx)
-        st.session_state.dth_xlsx_hash  = xlsx_hash
+            st.session_state._dth_xlsx_tmp = tmp.name
+        sheet_names = get_xlsx_sheet_names(Path(st.session_state._dth_xlsx_tmp))
+        st.session_state.dth_sheet_names = sheet_names
+        st.session_state.dth_xlsx_hash   = xlsx_hash
+        # Reset lookup e selezione foglio
+        st.session_state.dth_ped_lookup  = {}
+        st.session_state.dth_sheet_name  = sheet_names[0] if sheet_names else ""
+
+    # Selectbox per la scelta del foglio
+    if st.session_state.dth_sheet_names:
+        selected_sheet = st.selectbox(
+            "Foglio da analizzare",
+            options=st.session_state.dth_sheet_names,
+            index=st.session_state.dth_sheet_names.index(st.session_state.dth_sheet_name)
+                  if st.session_state.dth_sheet_name in st.session_state.dth_sheet_names else 0,
+            key="dth_sheet_select",
+        )
+        # Ricarica lookup solo se il foglio cambia
+        if selected_sheet != st.session_state.dth_sheet_name or not st.session_state.dth_ped_lookup:
+            st.session_state.dth_sheet_name = selected_sheet
+            st.session_state.dth_ped_lookup = load_ped_lookup(
+                Path(st.session_state._dth_xlsx_tmp),
+                sheet_name=selected_sheet,
+            )
 
     n_entries = len([k for k in st.session_state.dth_ped_lookup if not k.startswith("__h1__")])
     st.markdown(
-        f'<div class="scard sc-ok">✓ PED caricato — <strong>{n_entries}</strong> articoli indicizzati</div>',
+        f'<div class="scard sc-ok">✓ PED caricato &nbsp;·&nbsp; foglio <strong>{st.session_state.dth_sheet_name}</strong> &nbsp;·&nbsp; <strong>{n_entries}</strong> articoli indicizzati</div>',
         unsafe_allow_html=True,
     )
 else:
     # Reset se il file viene rimosso
     if st.session_state.dth_xlsx_hash is not None:
-        st.session_state.dth_ped_lookup = {}
-        st.session_state.dth_xlsx_hash  = None
+        st.session_state.dth_ped_lookup  = {}
+        st.session_state.dth_xlsx_hash   = None
+        st.session_state.dth_sheet_names = []
+        st.session_state.dth_sheet_name  = ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -231,25 +258,13 @@ else:
 
 st.markdown('<p class="sec-label">2 · Configurazione</p>', unsafe_allow_html=True)
 
-cfg_col1, cfg_col2, cfg_col3 = st.columns(3, gap="medium")
+cfg_col1, cfg_col2 = st.columns(2, gap="medium")
 
 with cfg_col1:
-    img_strategy = st.selectbox(
-        "Distribuzione placeholder immagini",
-        options=[
-            "Distribuiti uniformemente",
-            "Solo dopo l'intro",
-            "Solo in fondo al contenuto",
-        ],
-        index=0,
-        key="dth_img_strategy",
-    )
-
-with cfg_col2:
     show_preview = st.checkbox("Mostra anteprima blocchi", value=True, key="dth_preview")
     show_html    = st.checkbox("HTML completo nella preview", value=False, key="dth_show_html")
 
-with cfg_col3:
+with cfg_col2:
     merge_output = st.checkbox(
         "Unisci output in un unico .docx",
         value=False,
@@ -293,27 +308,8 @@ if btn_convert and docx_files:
             n_images    = extras["n_images"]
             product_ids = extras["product_ids"]
 
-            # Applica strategia immagini
-            if img_strategy == "Solo dopo l'intro":
-                # Solo la prima sezione riceve IMAGE
-                n_images_for_build = min(1, n_images)
-                html_rows = build_html_rows(parsed, n_images=n_images_for_build, product_ids=product_ids)
-            elif img_strategy == "Solo in fondo al contenuto":
-                # Costruiamo senza immagini, poi appendiamo i placeholder prima di Related Product
-                html_rows = build_html_rows(parsed, n_images=0, product_ids=product_ids)
-                img_blocks = [
-                    ("S{} IMAGE".format(j + 1), "")
-                    for j in range(n_images)
-                ]
-                related_idx = next(
-                    (j for j, (b, _) in enumerate(html_rows) if "Related Product" in b), None
-                )
-                if related_idx is not None:
-                    html_rows = html_rows[:related_idx] + img_blocks + html_rows[related_idx:]
-                else:
-                    html_rows = html_rows + img_blocks
-            else:  # Distribuiti uniformemente (default)
-                html_rows = build_html_rows(parsed, n_images=n_images, product_ids=product_ids)
+            # IMAGE inserita di default dopo ogni sezione (limite da PED se disponibile)
+            html_rows = build_html_rows(parsed, n_images=n_images, product_ids=product_ids)
 
             # Genera docx output
             with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp_out:
