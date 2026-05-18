@@ -1,8 +1,29 @@
 import time
 import io
+from datetime import date
 import pandas as pd
 import streamlit as st
 from serpapi import GoogleSearch
+
+# ==========================
+# CACHE GIORNALIERA
+# ==========================
+_CACHE_SS = "_aio_cache"
+
+def _cache_get(key):
+    cache = st.session_state.get(_CACHE_SS, {})
+    if cache.get("date") != date.today().isoformat():
+        return None
+    return cache.get("data", {}).get(key)
+
+def _cache_set(key, value):
+    today = date.today().isoformat()
+    cache = st.session_state.get(_CACHE_SS, {})
+    if cache.get("date") != today:
+        cache = {"date": today, "data": {}}
+    cache["data"][key] = value
+    st.session_state[_CACHE_SS] = cache
+
 
 # ==========================
 # FUNZIONI DI BACKEND
@@ -12,17 +33,24 @@ def fetch_ai_overview(query, api_key, hl="it", gl="it"):
     """
     Chiama SerpAPI e restituisce l'oggetto 'ai_overview' (se presente).
     """
+    cache_key = f"{query}|{hl}|{gl}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     params = {
         "q": query,
         "engine": "google",
         "api_key": api_key,
         "hl": hl,
         "gl": gl,
-        "no_cache": False  # usa la cache se la query è già stata fatta
+        "no_cache": False
     }
     search = GoogleSearch(params)
     results = search.get_dict()
-    return results.get("ai_overview")
+    ai_overview = results.get("ai_overview")
+    _cache_set(cache_key, ai_overview)
+    return ai_overview
 
 
 def read_keywords_from_excel(file_obj, column_name="Keyword"):
@@ -46,7 +74,9 @@ def scrape_ai_overviews_to_dataframe(keywords, api_key, sleep_seconds=1.0, hl="i
     total = len(keywords)
 
     for idx, keyword in enumerate(keywords, start=1):
-        status_text.write(f"🔍 Ricerca per: **{keyword}** ({idx}/{total})")
+        is_cached = _cache_get(f"{keyword}|{hl}|{gl}") is not None
+        label = "(da cache) " if is_cached else ""
+        status_text.write(f"🔍 {label}Ricerca per: **{keyword}** ({idx}/{total})")
 
         try:
             ai_overview = fetch_ai_overview(
@@ -77,7 +107,8 @@ def scrape_ai_overviews_to_dataframe(keywords, api_key, sleep_seconds=1.0, hl="i
             st.error(f"❌ Errore durante la ricerca per '{keyword}': {e}")
 
         progress_bar.progress(idx / total)
-        time.sleep(sleep_seconds)
+        if not is_cached:
+            time.sleep(sleep_seconds)
 
     status_text.write("✅ Elaborazione completata.")
     df_results = pd.DataFrame(data)

@@ -1,13 +1,32 @@
 import io
 import json
 import time
-from datetime import datetime
+from datetime import datetime, date
 
 import pandas as pd
 import requests
 import streamlit as st
 
 API_URL = "https://serpapi.com/search.json"
+
+# =========================================================
+# CACHE GIORNALIERA
+# =========================================================
+_CACHE_SS = "_amazon_cache"
+
+def _cache_get(key):
+    cache = st.session_state.get(_CACHE_SS, {})
+    if cache.get("date") != date.today().isoformat():
+        return None
+    return cache.get("data", {}).get(key)
+
+def _cache_set(key, value):
+    today = date.today().isoformat()
+    cache = st.session_state.get(_CACHE_SS, {})
+    if cache.get("date") != today:
+        cache = {"date": today, "data": {}}
+    cache["data"][key] = value
+    st.session_state[_CACHE_SS] = cache
 
 
 # =========================================================
@@ -243,6 +262,11 @@ def extract_asins_from_df(df, asin_column, deduplicate=True):
 # SERPAPI
 # =========================================================
 def get_amazon_product_data(asin, api_key, amazon_domain="amazon.it"):
+    cache_key = f"{asin}|{amazon_domain}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     params = {
         "engine": "amazon_product",
         "api_key": api_key,
@@ -266,6 +290,7 @@ def get_amazon_product_data(asin, api_key, amazon_domain="amazon.it"):
     if "error" in data:
         raise RuntimeError(f"Errore API per ASIN {asin}: {data['error']}")
 
+    _cache_set(cache_key, data)
     return data
 
 
@@ -699,7 +724,9 @@ def process_asin_list(
     log_lines = []
 
     for idx, asin in enumerate(asins, start=1):
-        status_placeholder.write(f"🔍 Elaboro ASIN **{asin}** ({idx}/{total})")
+        is_cached = _cache_get(f"{asin}|{amazon_domain}") is not None
+        label = "(da cache) " if is_cached else ""
+        status_placeholder.write(f"🔍 {label}Elaboro ASIN **{asin}** ({idx}/{total})")
 
         try:
             data = get_amazon_product_data(
@@ -748,7 +775,7 @@ def process_asin_list(
         if show_logs:
             log_placeholder.text("\n".join(log_lines[-15:]))
 
-        if delay_seconds > 0 and idx < total:
+        if not is_cached and delay_seconds > 0 and idx < total:
             time.sleep(delay_seconds)
 
     status_placeholder.write("✅ Estrazione completata.")

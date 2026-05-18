@@ -1,10 +1,30 @@
 import time
 import io
+from datetime import date
 import requests
 import pandas as pd
 import streamlit as st
 
 API_URL = "https://serpapi.com/search.json"
+
+# ==========================
+# CACHE GIORNALIERA
+# ==========================
+_CACHE_SS = "_paa_cache"
+
+def _cache_get(key):
+    cache = st.session_state.get(_CACHE_SS, {})
+    if cache.get("date") != date.today().isoformat():
+        return None
+    return cache.get("data", {}).get(key)
+
+def _cache_set(key, value):
+    today = date.today().isoformat()
+    cache = st.session_state.get(_CACHE_SS, {})
+    if cache.get("date") != today:
+        cache = {"date": today, "data": {}}
+    cache["data"][key] = value
+    st.session_state[_CACHE_SS] = cache
 
 
 # ==========================
@@ -15,6 +35,11 @@ def get_top4_paa_with_meta_and_indicators(keyword, api_key, gl="it", hl="it"):
     """
     Chiama SerpAPI e restituisce le prime 4 PAA con title/link/snippet e flag booleani.
     """
+    cache_key = f"{keyword}|{gl}|{hl}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     params = {
         "engine": "google",
         "q": keyword,
@@ -37,7 +62,7 @@ def get_top4_paa_with_meta_and_indicators(keyword, api_key, gl="it", hl="it"):
     except ValueError:
         st.warning(f"❌ Risposta non valida per '{keyword}' (JSON non parsabile).")
         return []
-    rq = data.get("related_questions", [])  # contiene anche title, link, snippet
+    rq = data.get("related_questions", [])
 
     results = []
     seen = set()
@@ -60,6 +85,7 @@ def get_top4_paa_with_meta_and_indicators(keyword, api_key, gl="it", hl="it"):
         if len(results) >= 4:
             break
 
+    _cache_set(cache_key, results)
     return results
 
 
@@ -83,7 +109,9 @@ def scrape_keywords_to_dataframe(keywords, api_key, sleep_seconds=1):
     total = len(keywords)
 
     for idx, kw in enumerate(keywords, start=1):
-        status_text.write(f"🔍 Elaboro keyword: **{kw}** ({idx}/{total})")
+        is_cached = _cache_get(f"{kw}|it|it") is not None
+        label = "(da cache) " if is_cached else ""
+        status_text.write(f"🔍 {label}Elaboro keyword: **{kw}** ({idx}/{total})")
 
         items = get_top4_paa_with_meta_and_indicators(kw, api_key=api_key)
         if items:
@@ -108,11 +136,9 @@ def scrape_keywords_to_dataframe(keywords, api_key, sleep_seconds=1):
                 "Has Link": 0
             })
 
-        # Aggiorna barra di progresso
         progress_bar.progress(idx / total)
-
-        # Rate limit minimale
-        time.sleep(sleep_seconds)
+        if not is_cached:
+            time.sleep(sleep_seconds)
 
     status_text.write("✅ Elaborazione completata.")
     df = pd.DataFrame(rows)

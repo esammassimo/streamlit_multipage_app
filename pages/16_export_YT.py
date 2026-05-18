@@ -1,8 +1,29 @@
 import time
 import io
+from datetime import date
 import pandas as pd
 import streamlit as st
 from serpapi import GoogleSearch
+
+# ==========================
+# CACHE GIORNALIERA
+# ==========================
+_CACHE_SS = "_yt_cache"
+
+def _cache_get(key):
+    cache = st.session_state.get(_CACHE_SS, {})
+    if cache.get("date") != date.today().isoformat():
+        return None
+    return cache.get("data", {}).get(key)
+
+def _cache_set(key, value):
+    today = date.today().isoformat()
+    cache = st.session_state.get(_CACHE_SS, {})
+    if cache.get("date") != today:
+        cache = {"date": today, "data": {}}
+    cache["data"][key] = value
+    st.session_state[_CACHE_SS] = cache
+
 
 # ==========================
 # FUNZIONI DI BACKEND
@@ -12,9 +33,14 @@ def fetch_youtube_results(query, api_key, hl="it", gl="it"):
     """
     Chiama SerpAPI (engine youtube) e restituisce l'array dei risultati video (se presente).
     """
+    cache_key = f"{query}|{hl}|{gl}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     params = {
         "engine": "youtube",
-        "search_query": query,   # per youtube engine si usa spesso search_query
+        "search_query": query,
         "api_key": api_key,
         "hl": hl,
         "gl": gl,
@@ -23,16 +49,14 @@ def fetch_youtube_results(query, api_key, hl="it", gl="it"):
     search = GoogleSearch(params)
     results = search.get_dict()
 
-    # SerpAPI può usare chiavi diverse a seconda del response schema:
-    # - video_results
-    # - organic_results
-    # - results
-    return (
+    video_results = (
         results.get("video_results")
         or results.get("organic_results")
         or results.get("results")
         or []
     )
+    _cache_set(cache_key, video_results)
+    return video_results
 
 
 def read_keywords_from_excel(file_obj, column_name="Keyword"):
@@ -57,7 +81,9 @@ def scrape_youtube_to_dataframe(keywords, api_key, sleep_seconds=1.0, hl="it", g
     total = len(keywords)
 
     for idx, keyword in enumerate(keywords, start=1):
-        status_text.write(f"🔍 Ricerca YouTube per: **{keyword}** ({idx}/{total})")
+        is_cached = _cache_get(f"{keyword}|{hl}|{gl}") is not None
+        label = "(da cache) " if is_cached else ""
+        status_text.write(f"🔍 {label}Ricerca YouTube per: **{keyword}** ({idx}/{total})")
 
         try:
             results = fetch_youtube_results(keyword, api_key=api_key, hl=hl, gl=gl)
@@ -116,7 +142,8 @@ def scrape_youtube_to_dataframe(keywords, api_key, sleep_seconds=1.0, hl="it", g
             st.error(f"❌ Errore durante la ricerca per '{keyword}': {e}")
 
         progress_bar.progress(idx / total)
-        time.sleep(sleep_seconds)
+        if not is_cached:
+            time.sleep(sleep_seconds)
 
     status_text.write("✅ Elaborazione completata.")
     df_results = pd.DataFrame(data)
