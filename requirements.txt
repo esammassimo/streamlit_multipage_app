@@ -14,5 +14,5 @@ scikit-learn>=1.2.0
 youtube-transcript-api>=0.6.0
 webvtt-py>=0.5.1
 yt-dlp>=2023.0.0
-serpapi>=0.0.2
+google-search-results
 Pillow>=9.4.0
