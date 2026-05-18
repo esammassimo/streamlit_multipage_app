@@ -160,7 +160,7 @@ st.markdown("""
 
 # ── Import motore ──────────────────────────────────────────────────────────────
 try:
-    from app import (
+    from docx_to_html_engine import (
         parse_input_docx,
         load_ped_lookup,
         lookup_article_extras,
@@ -169,7 +169,7 @@ try:
         write_output_docx,
     )
 except ImportError as e:
-    st.error(f"❌ Impossibile importare `app.py` (motore di conversione): {e}")
+    st.error(f"❌ Impossibile importare `docx_to_html_engine.py`: {e}")
     st.stop()
 
 # ── Session state defaults ─────────────────────────────────────────────────────
