@@ -145,6 +145,16 @@ def color_cell(val):
     }
     return m.get(str(val), "")
 
+def color_score(val):
+    """Colora lo Score numerico senza bisogno di matplotlib."""
+    try:
+        v = int(val)
+        if v >= 80:   return "background-color:#d1fae5;color:#065f46;font-weight:700"
+        elif v >= 50: return "background-color:#fef3c7;color:#78350f;font-weight:700"
+        else:         return "background-color:#fee2e2;color:#7f1d1d;font-weight:700"
+    except Exception:
+        return ""
+
 def export_download(label, generate_fn, suffix, mime):
     """Genera un file e salva i bytes in session_state per persistenza tra rerun."""
     key_data  = f"_export_data_{label}"
@@ -591,7 +601,7 @@ with tabs[1]:
     st.dataframe(
         df_pg.style
              .map(color_cell, subset=_badge_present)
-             .background_gradient(subset=["Score"], cmap="RdYlGn", vmin=0, vmax=100),
+             .map(color_score, subset=["Score"]),
         use_container_width=True,
         height=min(600, 80 + 38 * len(df_pg)),
     )
