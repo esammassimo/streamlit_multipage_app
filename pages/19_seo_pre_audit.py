@@ -660,10 +660,21 @@ with tabs[2]:
                     probs.append({"Area": area, "URL": u, "Tipo": f.get("tipo", "—"),
                                   "Severity": f["severity"],
                                   "Dettaglio": f'{f.get("nota","")[:100]} [{f.get("impatto","")}]'})
-            # 10 — topical
+            # 4 — errori validazione schema (warnings area 4)
+            for w in r.get("warnings", []):
+                if isinstance(w, dict) and w.get("severity") in ("FAIL", "WARN"):
+                    probs.append({"Area": area, "URL": u,
+                                  "Tipo": f'Schema {w.get("schema","?")} — {w.get("type","—")}',
+                                  "Severity": w["severity"],
+                                  "Dettaglio": w.get("message","")[:120]})
+            # 4 / 10 — opportunità (stringhe o dict)
             for opp in r.get("opportunities", []):
+                if isinstance(opp, dict):
+                    dettaglio = f'{opp.get("type","—")}: {opp.get("reason","")}'[:150]
+                else:
+                    dettaglio = str(opp)[:120]
                 probs.append({"Area": area, "URL": u, "Tipo": "Opportunità",
-                              "Severity": "WARN", "Dettaglio": opp[:120]})
+                              "Severity": "WARN", "Dettaglio": dettaglio})
 
     probs.sort(key=lambda x: {"FAIL": 0, "WARN": 1, "INFO": 2}.get(x["Severity"], 9))
     st.subheader(f"Problemi rilevati — {len(probs)} finding")
