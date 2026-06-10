@@ -16,4 +16,6 @@ webvtt-py>=0.5.1
 yt-dlp>=2023.0.0
 google-search-results
 Pillow>=9.4.0
-anthropic
+anthropic>=0.25.0
+playwright>=1.40.0  # dopo pip install eseguire: playwright install chromium
+pdfplumber>=0.10.0
