@@ -13,6 +13,11 @@ import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+try:
+    from rapidfuzz import fuzz as _rfuzz, process as _rprocess
+    _HAS_RAPIDFUZZ = True
+except ImportError:
+    _HAS_RAPIDFUZZ = False
 
 # ─────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -468,23 +473,30 @@ def build_url_title_check(df_dopo, df_gsc, df_sf):
     return pd.DataFrame(rows)
 
 # Pattern per riconoscere le colonne speciali nel file di classificazione
-BRAND_COL_PATTERNS    = ("brand",)
+BRAND_COL_PATTERNS     = ("brand",)
 CATEGORIA_COL_PATTERNS = ("cluster", "territorio", "territory", "territories", "categoria", "category")
+INTENTO_COL_PATTERNS   = ("intento", "intent", "intenti", "intenzione", "commercial intent")
 
 # Nomi interni normalizzati usati nel df e nell'Excel
 INTERNAL_BRAND_COL    = "Brand/NoBrand"
 INTERNAL_CATEGORIA_COL = "Categoria"
+INTERNAL_INTENTO_COL   = "Intento"
+
+# Soglia default per fuzzy match (0-100)
+FUZZY_MATCH_DEFAULT = 65
 
 
 def detect_classif_col_type(col_name: str):
     """
-    Ritorna 'brand', 'categoria' o None in base al nome della colonna.
+    Ritorna 'brand', 'categoria', 'intento' o None in base al nome della colonna.
     """
     cn = normalize_col(col_name)
     if any(p in cn for p in BRAND_COL_PATTERNS):
         return "brand"
     if any(p in cn for p in CATEGORIA_COL_PATTERNS):
         return "categoria"
+    if any(p in cn for p in INTENTO_COL_PATTERNS):
+        return "intento"
     return None
 
 
@@ -545,6 +557,8 @@ def parse_classification_file(uploaded_file):
         elif col_type == "categoria" and categoria_col is None:
             rename_map[c] = INTERNAL_CATEGORIA_COL
             categoria_col = INTERNAL_CATEGORIA_COL
+        elif col_type == "intento":
+            rename_map[c] = INTERNAL_INTENTO_COL
         # Altre colonne: mantieni nome originale
 
     df = df.rename(columns=rename_map)
@@ -557,27 +571,66 @@ def parse_classification_file(uploaded_file):
     return df, extra_cols, brand_col, categoria_col
 
 
-def join_classification(df_ads, df_classif, extra_cols):
+def join_classification(df_ads, df_classif, extra_cols, fuzzy_threshold=None):
     """
-    Join left tra df_ads e df_classif sulla keyword normalizzata.
-    Aggiunge le extra_cols al df_ads; keyword senza match → colonne vuote.
+    Join tra df_ads e df_classif con tre livelli di match:
+      1. Sottostringa esatta (pattern contenuto nella keyword ADS)
+      2. Fuzzy token (rapidfuzz, se disponibile) sopra soglia
+      3. Nessun match → colonne vuote
+
+    Aggiunge colonna '_intento_score' (0-100) se la colonna Intento è presente.
     """
     if df_classif is None or df_classif.empty:
         return df_ads
 
+    threshold = fuzzy_threshold if fuzzy_threshold is not None else FUZZY_MATCH_DEFAULT
+    has_intento = INTERNAL_INTENTO_COL in extra_cols
+
     df_ads = df_ads.copy()
-    df_ads["_join_kw"] = df_ads["keyword"].fillna("").astype(str).str.strip().str.lower()
+    kw_ads = df_ads["keyword"].fillna("").astype(str).str.strip().str.lower()
+    patterns = df_classif["_classif_kw"].fillna("").astype(str).str.strip().str.lower().tolist()
 
-    df_ads = df_ads.merge(
-        df_classif[["_classif_kw"] + extra_cols].rename(columns={"_classif_kw": "_join_kw"}),
-        on="_join_kw", how="left"
-    )
-    df_ads = df_ads.drop(columns=["_join_kw"])
-
-    # Riempi NaN con stringa vuota nelle colonne aggiunte
+    # Inizializza colonne output
     for c in extra_cols:
-        if c in df_ads.columns:
-            df_ads[c] = df_ads[c].fillna("")
+        df_ads[c] = ""
+    if has_intento:
+        df_ads["_intento_score"] = 0
+
+    classif_lookup = dict(zip(patterns, df_classif.to_dict("records")))
+
+    def _best_match(kw: str):
+        """Trova il miglior match per una keyword ADS."""
+        kw_l = kw.lower().strip()
+
+        # Livello 1: sottostringa esatta — il pattern è contenuto nella keyword
+        for pat in patterns:
+            if pat and pat in kw_l:
+                return classif_lookup[pat], 100
+
+        # Livello 2: fuzzy token
+        if _HAS_RAPIDFUZZ and patterns:
+            best = _rprocess.extractOne(
+                kw_l, patterns,
+                scorer=_rfuzz.token_set_ratio,
+                score_cutoff=threshold
+            )
+            if best:
+                matched_pat, score, _ = best
+                return classif_lookup[matched_pat], int(score)
+
+        return None, 0
+
+    # Applica match riga per riga
+    for idx, kw in kw_ads.items():
+        record, score = _best_match(kw)
+        if record:
+            for c in extra_cols:
+                col_key = c
+                # Mappa nome interno → chiave nel record classif
+                val = record.get(col_key, record.get("_classif_kw", ""))
+                df_ads.at[idx, c] = val if val else ""
+            if has_intento:
+                df_ads.at[idx, "_intento_score"] = score
 
     return df_ads
 
@@ -1481,6 +1534,7 @@ if _can_run and st.session_state.get("_run"):
                 brand_col_detected = None
                 brand_flag_values  = set()
                 classif_extra_cols = []
+                df_classif_cached  = None
                 if file_classif:
                     try:
                         df_classif, classif_extra_cols, _brand_col, _cat_col = parse_classification_file(file_classif)
@@ -1506,6 +1560,7 @@ if _can_run and st.session_state.get("_run"):
                 st.session_state["_brand_col"]          = brand_col_detected
                 st.session_state["_brand_flag_values"]  = brand_flag_values
                 st.session_state["_classif_extra_cols"] = classif_extra_cols
+                st.session_state["_df_classif"]         = df_classif if file_classif else None
         else:
             df_prima           = st.session_state["_df_prima"]
             df_dopo            = st.session_state["_df_dopo"]
@@ -1514,6 +1569,7 @@ if _can_run and st.session_state.get("_run"):
             brand_col_detected = st.session_state["_brand_col"]
             brand_flag_values  = st.session_state["_brand_flag_values"]
             classif_extra_cols = st.session_state["_classif_extra_cols"]
+            df_classif_cached  = st.session_state.get("_df_classif")
 
         brand_col_detected = brand_col_detected or None
         brand_flag_values  = brand_flag_values  or set()
@@ -1850,23 +1906,53 @@ if _can_run and st.session_state.get("_run"):
             _proxy = classif_extra_cols[0]
             n_dopo  = int((df_dopo[_proxy]  != "").sum()) if _proxy in df_dopo.columns  else 0
             n_prima = int((df_prima[_proxy] != "").sum()) if _proxy in df_prima.columns else 0
-            cs1, cs2, cs3 = st.columns(3)
+            cs1, cs2, cs3, cs4 = st.columns(4)
             cs1.metric("Colonne aggiunte", len(classif_extra_cols))
             cs2.metric("Match DOPO",  f"{n_dopo}/{len(df_dopo)}")
             cs3.metric("Match PRIMA", f"{n_prima}/{len(df_prima)}")
+            # Score medio intento se disponibile
+            if "_intento_score" in df_dopo.columns:
+                avg_score = df_dopo.loc[df_dopo["_intento_score"] > 0, "_intento_score"].mean()
+                cs4.metric("Score medio match", f"{avg_score:.0f}/100" if not pd.isna(avg_score) else "—")
             col_labels = []
             for c in classif_extra_cols:
                 if c == INTERNAL_BRAND_COL:
                     col_labels.append(f"{c} (brand)")
                 elif c == INTERNAL_CATEGORIA_COL:
                     col_labels.append(f"{c} (categoria)")
+                elif c == INTERNAL_INTENTO_COL:
+                    col_labels.append(f"{c} ⟵ Close Reading")
                 else:
                     col_labels.append(c)
             st.success(f"✓ Classificazione applicata — {', '.join(col_labels)}")
+
+            # Slider soglia fuzzy (solo se ha Intento)
+            if INTERNAL_INTENTO_COL in classif_extra_cols:
+                with st.expander("⚙️ Configurazione match fuzzy", expanded=False):
+                    st.caption(
+                        "Il match fuzzy confronta le keyword ADS con i pattern del Close Reading. "
+                        "Abbassa la soglia per più match, alzala per match più precisi."
+                    )
+                    fuzzy_thr = st.slider(
+                        "Soglia similarità (0-100)",
+                        min_value=40, max_value=95, value=65, step=5,
+                        key="fuzzy_threshold",
+                        help="65 = bilanciato · <55 = molti match · >80 = solo match precisi"
+                    )
+                    if st.button("🔄 Ricalcola match con nuova soglia", key="btn_refuzzy"):
+                        with st.spinner("Ricalcolo match..."):
+                            df_dopo  = join_classification(df_dopo,  df_classif_cached, classif_extra_cols, fuzzy_thr)
+                            df_prima = join_classification(df_prima, df_classif_cached, classif_extra_cols, fuzzy_thr)
+                            st.session_state["_df_dopo"]  = df_dopo
+                            st.session_state["_df_prima"] = df_prima
+                        st.rerun()
         elif file_classif:
             st.info("File classificazione caricato ma nessuna colonna riconosciuta oltre la keyword.")
         else:
-            st.caption("Nessun file di classificazione caricato.")
+            st.caption(
+                "Nessun file di classificazione caricato. "
+                "Puoi usare il file esportato da **Close Reading & Signal Cleaning** ↗"
+            )
 
         # Mostra preview distribuzione brand/nobrand dopo il parsing
         if brand_col_detected and brand_col_detected in df_dopo.columns and brand_flag_values:
@@ -1892,6 +1978,73 @@ if _can_run and st.session_state.get("_run"):
                                     brand_col_detected, brand_flag_values)
         df_prima = classify_qs_flag(df_prima, qs_thr_brand, qs_thr_nobrand,
                                     brand_col_detected, brand_flag_values)
+
+        # ── EXPORT PER CLOSE READING ──────────────────────────
+        st.divider()
+        st.markdown("### 🔗 Workflow → Close Reading")
+
+        def build_critiche_txt(df, periodo, qs_thr_b, qs_thr_nb, brand_col, brand_vals):
+            """Testo strutturato delle keyword critiche per analisi Close Reading."""
+            cost_col  = df.get("cost",     pd.Series(0.0, index=df.index)).fillna(0)
+            check_col = df.get("check_qs", pd.Series("",  index=df.index)).fillna("")
+            df_k = df[(check_col == "KO") & (cost_col > 0)].copy()
+            if "cost" in df_k.columns:
+                df_k = df_k.sort_values("cost", ascending=False)
+
+            lines = [
+                f"# Keyword Critiche — {periodo}",
+                f"# Soglie QS: Brand ≥{qs_thr_b} / No-Brand ≥{qs_thr_nb}",
+                f"# Totale keyword critiche: {len(df_k)}",
+                "",
+                "Queste keyword hanno QS sotto soglia e spesa attiva.",
+                "Analizzale nel Close Reading per capire perché non performano.",
+                "",
+            ]
+            for _, row in df_k.head(50).iterrows():
+                kw      = str(row.get("keyword",       "")).strip()
+                brand   = str(row.get(brand_col or "", "")).strip() if brand_col else ""
+                intento = str(row.get(INTERNAL_INTENTO_COL, "")).strip()
+                qs      = row.get("quality_score", "")
+                cost    = row.get("cost", "")
+                score   = row.get("_intento_score", "")
+
+                line = f"- {kw}"
+                if brand:    line += f" [{brand}]"
+                if intento:  line += f" | Intento: {intento}"
+                if score:    line += f" (match score: {score})"
+                line += f" | QS: {qs} | Costo: €{cost}"
+                lines.append(line)
+
+            return "\n".join(lines).encode("utf-8")
+
+        cr_txt = build_critiche_txt(
+            df_dopo, periodo_dopo, qs_thr_brand, qs_thr_nobrand,
+            brand_col_detected, brand_flag_values
+        )
+        cr_fname = f"kw_critiche_close_reading_{cliente.lower().replace(' ','_')}.txt"
+
+        col_cr1, col_cr2 = st.columns([2, 3])
+        with col_cr1:
+            st.download_button(
+                "⬇ Esporta keyword critiche → Close Reading",
+                data=cr_txt,
+                file_name=cr_fname,
+                mime="text/plain",
+                disabled=not cr_txt.strip(),
+                help="Carica questo file in Close Reading come fonte di analisi (tipo: 'brand' o 'competitor')."
+            )
+        with col_cr2:
+            n_kw_ko = int((df_dopo.get("check_qs", pd.Series(dtype=str)) == "KO").sum())
+            st.markdown(f"""
+Le **{n_kw_ko} keyword critiche** (QS KO con spesa) vengono esportate come testo strutturato.
+
+**Come usarlo in Close Reading:**
+1. Scarica il file ↑
+2. Vai su **Close Reading & Signal Cleaning**
+3. Carica il file come fonte (etichetta: *brand*)
+4. Claude analizza perché queste keyword non performano
+5. I risultati arricchiscono la Signal Map con nuovi pattern
+            """)
 
         # ── DOWNLOAD ──────────────────────────────────────────
         st.divider()

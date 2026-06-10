@@ -26,6 +26,11 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from openpyxl import Workbook
+try:
+    from rapidfuzz import fuzz as _rfuzz
+    _HAS_RAPIDFUZZ = True
+except ImportError:
+    _HAS_RAPIDFUZZ = False
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -455,6 +460,66 @@ def build_negative_kw_csv(result: dict) -> bytes:
     return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 
+def build_classification_csv(result: dict) -> bytes:
+    """
+    Esporta i pattern degli intenti commerciali come file di classificazione
+    pronto per l'upload in 18_seo_sea.py.
+
+    Formato output:
+      keyword  |  Intento  |  Priorità
+    ─────────────────────────────────────
+    (una riga per pattern, con eventuale esempio_query come keyword alternativa)
+
+    Il file viene riconosciuto automaticamente da SEO/SEA:
+    - colonna "keyword"  → chiave di join (fuzzy)
+    - colonna "Intento"  → etichetta (riconosciuta come tipo "intento")
+    - colonna "Priorità" → metadato aggiuntivo
+    """
+    rows_out = []
+
+    # Da intenti_commerciali: usa esempio_query come keyword se disponibile
+    for item in result.get("intenti_commerciali", []):
+        pattern   = str(item.get("pattern", "")).strip()
+        esempio   = str(item.get("esempio_query", "")).strip()
+        priorita  = str(item.get("priorita", "media")).strip()
+        segnale   = str(item.get("segnale", "")).strip()
+
+        # Riga principale: il pattern
+        if pattern:
+            rows_out.append({
+                "keyword":  pattern,
+                "Intento":  segnale if segnale else pattern,
+                "Priorità": priorita,
+                "Tipo":     "pattern",
+            })
+        # Riga aggiuntiva: l'esempio di query (più facile da matchare con le keyword ADS)
+        if esempio and esempio != pattern:
+            rows_out.append({
+                "keyword":  esempio,
+                "Intento":  segnale if segnale else pattern,
+                "Priorità": priorita,
+                "Tipo":     "query_esempio",
+            })
+
+    # Da vocabolario_target: aggiungi le frasi ad alta frequenza
+    for item in result.get("vocabolario_target", []):
+        frase = str(item.get("frase", "")).strip()
+        freq  = str(item.get("frequenza_stimata", "")).strip().lower()
+        if frase and freq in ("alta", "media"):
+            rows_out.append({
+                "keyword":  frase,
+                "Intento":  "vocabolario_target",
+                "Priorità": "alta" if freq == "alta" else "media",
+                "Tipo":     "vocabolario",
+            })
+
+    if not rows_out:
+        return b""
+
+    df = pd.DataFrame(rows_out).drop_duplicates(subset=["keyword"])
+    return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+
 # ─────────────────────────────────────────────────────────────
 # MAIN UI
 # ─────────────────────────────────────────────────────────────
@@ -746,3 +811,44 @@ if result:
             "**Negative Keywords CSV** → formato Google Ads bulk upload "
             "(keyword con `[exact]`, `\"phrase\"`, broad)"
         )
+
+    # ── Export per SEO/SEA ────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### 🔗 Workflow → SEO/SEA Analysis")
+    st.markdown(
+        "Esporta il file di classificazione e caricalo direttamente nella pagina "
+        "**SEO/SEA Analysis** come *Classificazione Keyword*. "
+        "Il match è fuzzy: i pattern vengono confrontati con le keyword ADS "
+        "anche senza corrispondenza esatta."
+    )
+
+    classif_csv = build_classification_csv(result)
+    fname_classif = f"classif_intenti_{brand_name.lower().replace(' ', '_')}.csv"
+
+    col_w1, col_w2 = st.columns([2, 3])
+    with col_w1:
+        st.download_button(
+            "⬇ Scarica file classificazione → SEO/SEA",
+            data=classif_csv,
+            file_name=fname_classif,
+            mime="text/csv",
+            disabled=not classif_csv,
+            type="primary",
+            help="Carica questo file in SEO/SEA Analysis → sezione 'Classificazione Keyword'."
+        )
+    with col_w2:
+        n_patterns = len(result.get("intenti_commerciali", []))
+        n_vocab    = sum(1 for v in result.get("vocabolario_target", [])
+                        if v.get("frequenza_stimata", "").lower() in ("alta", "media"))
+        st.markdown(f"""
+**Contenuto del file:**
+- `{n_patterns * 2}` righe da intenti commerciali (pattern + query esempio)
+- `{n_vocab}` frasi da vocabolario (frequenza alta/media)
+- Colonne: `keyword` · `Intento` · `Priorità` · `Tipo`
+
+**Come usarlo in SEO/SEA:**
+1. Scarica il file ↑
+2. Vai su **SEO/SEA Analysis** → *Carica i file* → **Classificazione Keyword**
+3. Il match fuzzy associa automaticamente le keyword ADS agli intenti
+4. Nell'Excel di output trovi la colonna **Intento** in ogni sheet KW
+        """)
