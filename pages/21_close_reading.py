@@ -15,6 +15,7 @@ Output:
 """
 
 import io
+import json
 import re
 import time
 import traceback
@@ -337,12 +338,12 @@ def run_claude_analysis(texts: list[dict], brand: str, sector: str,
         raw = re.sub(r"^```json\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
         try:
-            all_results.append(pd.io.json.loads(raw))
+            all_results.append(json.loads(raw))
         except Exception:
             # Fallback: prova a estrarre il JSON dal testo
             match = re.search(r"\{.*\}", raw, re.DOTALL)
             if match:
-                all_results.append(pd.io.json.loads(match.group()))
+                all_results.append(json.loads(match.group()))
 
     if not all_results:
         raise ValueError("Nessun risultato valido dall'analisi LLM.")
