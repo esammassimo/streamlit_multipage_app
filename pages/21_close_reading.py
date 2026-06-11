@@ -151,40 +151,66 @@ def scrape_with_requests(url: str, timeout: int = 15) -> str:
 
 
 def scrape_with_playwright(url: str, timeout: int = 20000) -> str:
-    """Scraping headless con Playwright per siti con JS o protezioni."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return "ERRORE: Playwright non installato. Esegui: pip install playwright && playwright install chromium"
+    """
+    Scraping headless con Playwright tramite subprocess isolato.
+    Usa subprocess per evitare conflitti con il thread Streamlit.
+    """
+    import subprocess, sys, tempfile, os, textwrap
+
+    # Script Playwright scritto come stringa senza triple-quote annidate
+    js_cleanup = "['script','style','nav','footer','header','aside','iframe'].forEach(t=>{document.querySelectorAll(t).forEach(el=>el.remove())});"
+
+    script_lines = [
+        "import sys",
+        "from playwright.sync_api import sync_playwright",
+        f"url = {repr(url)}",
+        f"timeout = {timeout}",
+        "try:",
+        "    with sync_playwright() as p:",
+        "        browser = p.chromium.launch(headless=True, args=['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu'])",
+        "        ctx = browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')",
+        "        page = ctx.new_page()",
+        "        try:",
+        "            page.goto(url, timeout=timeout, wait_until='domcontentloaded')",
+        "        except Exception:",
+        "            pass",
+        "        page.wait_for_timeout(2000)",
+        f"        page.evaluate({repr(js_cleanup)})",
+        "        text = page.inner_text('body')",
+        "        browser.close()",
+        "    lines = [l.strip() for l in text.splitlines() if len(l.strip()) > 30]",
+        "    print('\\n'.join(lines))",
+        "except Exception as e:",
+        "    print(f'ERRORE Playwright: {e}')",
+        "    sys.exit(1)",
+    ]
+    script = "\n".join(script_lines)
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                )
-            )
-            page = context.new_page()
-            page.goto(url, timeout=timeout, wait_until="networkidle")
-            time.sleep(2)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py",
+                                         delete=False, encoding="utf-8") as tmp:
+            tmp.write(script)
+            tmp_path = tmp.name
 
-            # Rimuovi elementi non utili
-            page.evaluate("""
-                ['script','style','nav','footer','header','aside'].forEach(tag => {
-                    document.querySelectorAll(tag).forEach(el => el.remove());
-                });
-            """)
-            text = page.inner_text("body")
-            browser.close()
+        result = subprocess.run(
+            [sys.executable, tmp_path],
+            capture_output=True, text=True,
+            timeout=timeout // 1000 + 15
+        )
+        os.unlink(tmp_path)
 
-        lines = [l.strip() for l in text.splitlines() if len(l.strip()) > 30]
-        return "\n".join(lines)
+        output = result.stdout.strip()
+        if result.returncode != 0 or output.startswith("ERRORE"):
+            err = result.stderr.strip() or output
+            return f"ERRORE Playwright {url}: {err[:400]}"
+        if not output:
+            return f"ERRORE Playwright {url}: nessun contenuto estratto"
+        return output
+
+    except subprocess.TimeoutExpired:
+        return f"ERRORE Playwright {url}: timeout ({timeout//1000}s)"
     except Exception as e:
         return f"ERRORE Playwright {url}: {e}"
-
 
 def scrape_url(url: str, use_playwright: bool = False) -> str:
     if use_playwright:
