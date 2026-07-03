@@ -150,12 +150,64 @@ def scrape_with_requests(url: str, timeout: int = 15) -> str:
         return f"ERRORE scraping {url}: {e}"
 
 
+def ensure_playwright_browser_installed() -> tuple[bool, str]:
+    """
+    Verifica se Chromium è installato per Playwright; se manca, lo installa.
+    Risultato cachato in session_state per non ripetere il check ogni volta.
+    Ritorna (success, message).
+    """
+    import subprocess, sys
+
+    if st.session_state.get("_playwright_browser_ready"):
+        return True, "già verificato"
+
+    try:
+        # Verifica rapida: prova a lanciare il browser
+        check = subprocess.run(
+            [sys.executable, "-c",
+             "from playwright.sync_api import sync_playwright\n"
+             "with sync_playwright() as p:\n"
+             "    b = p.chromium.launch(headless=True)\n"
+             "    b.close()\n"
+             "print('OK')"],
+            capture_output=True, text=True, timeout=30
+        )
+        if check.returncode == 0 and "OK" in check.stdout:
+            st.session_state["_playwright_browser_ready"] = True
+            return True, "browser già presente"
+    except Exception:
+        pass
+
+    # Browser non presente — tenta installazione
+    try:
+        install = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
+            capture_output=True, text=True, timeout=180
+        )
+        if install.returncode == 0:
+            st.session_state["_playwright_browser_ready"] = True
+            return True, "installato ora"
+        else:
+            err = (install.stderr or install.stdout).strip()[-500:]
+            return False, f"installazione fallita: {err}"
+    except subprocess.TimeoutExpired:
+        return False, "installazione: timeout (>180s) — riprova o usa requests"
+    except Exception as e:
+        return False, f"installazione: errore {e}"
+
+
 def scrape_with_playwright(url: str, timeout: int = 20000) -> str:
     """
     Scraping headless con Playwright tramite subprocess isolato.
     Usa subprocess per evitare conflitti con il thread Streamlit.
+    Verifica/installa il browser Chromium al primo utilizzo.
     """
     import subprocess, sys, tempfile, os, textwrap
+
+    ready, msg = ensure_playwright_browser_installed()
+    if not ready:
+        return (f"ERRORE Playwright {url}: browser Chromium non disponibile ({msg}). "
+                f"Passa a 'requests' nella sidebar oppure riprova.")
 
     # Script Playwright scritto come stringa senza triple-quote annidate
     js_cleanup = "['script','style','nav','footer','header','aside','iframe'].forEach(t=>{document.querySelectorAll(t).forEach(el=>el.remove())});"
@@ -214,7 +266,14 @@ def scrape_with_playwright(url: str, timeout: int = 20000) -> str:
 
 def scrape_url(url: str, use_playwright: bool = False) -> str:
     if use_playwright:
-        return scrape_with_playwright(url)
+        result = scrape_with_playwright(url)
+        if result.startswith("ERRORE"):
+            # Fallback automatico a requests se Playwright non disponibile
+            fallback = scrape_with_requests(url)
+            if not fallback.startswith("ERRORE"):
+                return fallback
+            return f"{result}\n[Fallback requests fallito anche]: {fallback}"
+        return result
     return scrape_with_requests(url)
 
 
