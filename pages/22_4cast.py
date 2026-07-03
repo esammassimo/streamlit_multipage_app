@@ -672,24 +672,17 @@ def status_icon(status: str) -> str:
 #  LLM CONFIG  (globale, applicato a tutte le tab)
 # ══════════════════════════════════════════════════════════════════════════════
 with st.expander('⚙️ Configurazione LLM', expanded=True):
-    _lc1, _lc2, _lc3, _lc4, _lc5 = st.columns([1, 2, 1.2, 1.5, 1])
+    _lc1, _lc2, _lc3, _lc4 = st.columns([1, 1.2, 1.5, 1])
 
     with _lc1:
         _provider = st.radio('Provider', ['Anthropic', 'OpenAI'],
                              key='llm_prov', horizontal=True)
 
     with _lc2:
-        _key_label = 'Anthropic API Key' if _provider == 'Anthropic' else 'OpenAI API Key'
-        _key_hint  = 'sk-ant-... (opzionale se in .env)' if _provider == 'Anthropic' else 'sk-...'
-        _llm_key   = st.text_input(_key_label, type='password', key='llm_apikey',
-                                   placeholder=_key_hint,
-                                   help="Sovrascrive la variabile d'ambiente se compilato.")
-
-    with _lc3:
         _model_opts = ANT_MODELS if _provider == 'Anthropic' else OAI_MODELS
         _llm_model  = st.selectbox('Modello', _model_opts, key='llm_modelsel')
 
-    with _lc4:
+    with _lc3:
         _llm_mode = st.radio(
             'Modalità', ['Traduzione', 'Ottimizzazione', 'Completa'],
             key='llm_modesel', horizontal=True,
@@ -701,7 +694,7 @@ with st.expander('⚙️ Configurazione LLM', expanded=True):
             ),
         )
 
-    with _lc5:
+    with _lc4:
         _n_workers = st.slider('Workers', min_value=1, max_value=10, value=4, step=1,
                                key='llm_workers',
                                help='Richieste API parallele. Aumentare per velocizzare; '
@@ -711,7 +704,8 @@ with st.expander('⚙️ Configurazione LLM', expanded=True):
     _PROVIDER  = 'openai' if _provider == 'OpenAI' else 'anthropic'
     _MODE      = {'Traduzione': 'translate', 'Ottimizzazione': 'optimize',
                   'Completa': 'complete'}[_llm_mode]
-    _API_KEY   = _llm_key or None
+    # API key: letta dalla sidebar (propagata in os.environ nel blocco sidebar)
+    _API_KEY   = (_sb_ant if _PROVIDER == 'anthropic' else _sb_oai) or None
     _MODEL     = _llm_model
     _N_WORKERS = _n_workers
 
