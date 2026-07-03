@@ -31,120 +31,50 @@ st.set_page_config(
     initial_sidebar_state='expanded'
 )
 
-# ─── STYLES ───────────────────────────────────────────────────────────────────
+# ─── STYLES — light theme (Streamlit default) ─────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600;700&display=swap');
+/* Custom classes only — no background or color overrides */
 
-html, body, [class*="css"] { font-family: 'IBM Plex Sans', sans-serif; }
-
-.stApp { background: #0d0f14; color: #e8eaf0; }
-
-/* Header strip */
-.tool-header {
-    background: linear-gradient(135deg, #111827 0%, #1a2035 100%);
-    border-bottom: 1px solid #1e3a5f;
-    padding: 1.4rem 2rem;
-    margin: -1rem -1rem 2rem -1rem;
-    display: flex; align-items: center; gap: 1.2rem;
+/* Section labels */
+.section-label {
+    font-size: .7rem;
+    font-weight: 700;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: #6b7280;
+    border-bottom: 1px solid #e5e7eb;
+    padding-bottom: .35rem;
+    margin-bottom: .9rem;
 }
-.tool-header h1 {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 1.15rem; font-weight: 600;
-    color: #60a5fa; letter-spacing: .04em; margin: 0;
-}
-.tool-header .sub { font-size: .78rem; color: #64748b; margin: 0; }
-
-/* Tab styling */
-.stTabs [data-baseweb="tab-list"] {
-    gap: 0;
-    background: #111827;
-    border-radius: 8px;
-    padding: 4px;
-    border: 1px solid #1e3a5f;
-}
-.stTabs [data-baseweb="tab"] {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: .78rem; font-weight: 600;
-    color: #64748b; padding: .5rem 1.2rem;
-    border-radius: 6px; border: none;
-    letter-spacing: .04em; text-transform: uppercase;
-}
-.stTabs [aria-selected="true"] {
-    background: #1e3a5f !important;
-    color: #60a5fa !important;
-}
-
-/* Cards */
-.metric-card {
-    background: #111827; border: 1px solid #1e3a5f;
-    border-radius: 10px; padding: 1rem 1.2rem;
-    text-align: center;
-}
-.metric-card .val {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 2rem; font-weight: 700; color: #60a5fa;
-    line-height: 1.1;
-}
-.metric-card .lbl { font-size: .72rem; color: #64748b; text-transform: uppercase; letter-spacing:.06em; }
 
 /* Status badges */
-.badge { display:inline-block; padding:.18rem .6rem; border-radius:4px; font-size:.7rem; font-weight:600; font-family:'IBM Plex Mono',monospace; }
-.badge-ok    { background:#052e16; color:#4ade80; border:1px solid #166534; }
-.badge-long  { background:#450a0a; color:#f87171; border:1px solid #991b1b; }
-.badge-short { background:#422006; color:#fb923c; border:1px solid #9a3412; }
-.badge-en    { background:#1e1b4b; color:#a5b4fc; border:1px solid #4338ca; }
-.badge-it    { background:#042f2e; color:#2dd4bf; border:1px solid #0f766e; }
-.badge-new   { background:#1a2e05; color:#a3e635; border:1px solid #4d7c0f; }
-.badge-miss  { background:#1c1917; color:#a8a29e; border:1px solid #44403c; }
+.badge { display:inline-block; padding:.15rem .55rem; border-radius:4px; font-size:.7rem; font-weight:600; font-family:monospace; }
+.badge-ok    { background:#d1fae5; color:#065f46; }
+.badge-long  { background:#fee2e2; color:#991b1b; }
+.badge-short { background:#fef3c7; color:#92400e; }
+.badge-en    { background:#dbeafe; color:#1e40af; }
+.badge-it    { background:#ede9fe; color:#5b21b6; }
+.badge-new   { background:#d1fae5; color:#065f46; }
+.badge-miss  { background:#f3f4f6; color:#6b7280; }
 
-/* Section headers */
-.section-label {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: .7rem; font-weight: 600; letter-spacing: .1em;
-    text-transform: uppercase; color: #475569;
-    border-bottom: 1px solid #1e293b;
-    padding-bottom: .4rem; margin-bottom: 1rem;
+/* Metric cards */
+.metric-card {
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+    padding: .9rem 1rem;
+    text-align: center;
 }
-
-/* Upload area */
-.stFileUploader > div { border: 1px dashed #1e3a5f !important; border-radius: 8px !important; background: #0d1117 !important; }
-
-/* Buttons */
-.stButton > button {
-    font-family: 'IBM Plex Mono', monospace; font-size: .78rem;
-    font-weight: 600; letter-spacing: .06em;
-    background: #1e3a5f; color: #60a5fa;
-    border: 1px solid #2563eb; border-radius: 6px;
-    padding: .5rem 1.4rem;
-}
-.stButton > button:hover { background: #2563eb; color: #fff; }
-
-/* Dataframe */
-.stDataFrame { font-family: 'IBM Plex Mono', monospace; font-size: .75rem; }
-
-/* Info / warning boxes */
-div[data-testid="stInfo"]    { background: #0f172a; border-color: #1e3a5f; }
-div[data-testid="stSuccess"] { background: #052e16; border-color: #166534; }
-div[data-testid="stWarning"] { background: #422006; border-color: #9a3412; }
-
-/* Progress */
-.stProgress > div > div { background: #2563eb; }
-
-/* Selectbox / inputs */
-.stSelectbox > div, .stMultiSelect > div { background: #111827 !important; border-color: #1e3a5f !important; }
+.metric-card .val { font-size: 1.8rem; font-weight: 700; color: #1d4ed8; line-height: 1.1; }
+.metric-card .lbl { font-size: .7rem; color: #6b7280; text-transform: uppercase; letter-spacing:.06em; }
 </style>
 """, unsafe_allow_html=True)
 
 # ─── HEADER ───────────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="tool-header">
-  <div>
-    <h1>📊 4CAST — WSX SEO Analyzer</h1>
-    <p class="sub">Navla SEO Tools · Framework CAST: Content · Authority · Structure · Technical</p>
-  </div>
-</div>
-""", unsafe_allow_html=True)
+st.title("📊 4CAST — WSX SEO Analyzer")
+st.caption("Navla SEO Tools · Framework CAST: Content · Authority · Structure · Technical")
+st.divider()
+
 
 
 # ─── SIDEBAR — API KEYS ───────────────────────────────────────────────────────
