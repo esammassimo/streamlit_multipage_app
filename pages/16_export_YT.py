@@ -26,6 +26,37 @@ def _cache_set(key, value):
 
 
 # ==========================
+# SUPPORTO CONFIGURAZIONE
+# ==========================
+
+def get_language_options():
+    return {
+        "Italiano": "it",
+        "English": "en",
+        "Español": "es",
+        "Français": "fr",
+        "Deutsch": "de",
+        "Português": "pt",
+        "Nederlands": "nl",
+        "日本語 (Giapponese)": "ja"
+    }
+
+
+def get_country_options():
+    return {
+        "Italia": "it",
+        "Stati Uniti": "us",
+        "Regno Unito": "uk",
+        "Spagna": "es",
+        "Francia": "fr",
+        "Germania": "de",
+        "Portogallo": "pt",
+        "Paesi Bassi": "nl",
+        "Giappone": "jp"
+    }
+
+
+# ==========================
 # FUNZIONI DI BACKEND
 # ==========================
 
@@ -225,8 +256,33 @@ def page_scraping():
         )
         max_results_per_keyword = None if max_results == 0 else int(max_results)
 
-        hl = st.text_input("hl (lingua interfaccia)", value="it")
-        gl = st.text_input("gl (paese)", value="it")
+        language_options = get_language_options()
+        country_options = get_country_options()
+        language_values = list(language_options.values())
+        country_values = list(country_options.values())
+
+        col_hl, col_gl = st.columns(2)
+        with col_hl:
+            selected_language_label = st.selectbox(
+                "Lingua interfaccia (hl)",
+                options=list(language_options.keys()),
+                index=language_values.index("it") if "it" in language_values else 0
+            )
+        with col_gl:
+            selected_country_label = st.selectbox(
+                "Paese (gl)",
+                options=list(country_options.keys()),
+                index=country_values.index("it") if "it" in country_values else 0
+            )
+
+        hl = language_options[selected_language_label]
+        gl = country_options[selected_country_label]
+
+        with st.expander("Impostazioni avanzate (hl/gl personalizzati)"):
+            custom_locale = st.checkbox("Usa codici personalizzati", value=False)
+            if custom_locale:
+                hl = st.text_input("hl personalizzato (lingua interfaccia)", value=hl)
+                gl = st.text_input("gl personalizzato (paese)", value=gl)
 
         if st.button("🚀 Avvia scraping YouTube"):
             try:

@@ -138,7 +138,8 @@ def get_language_options():
         "Français": "fr",
         "Deutsch": "de",
         "Português": "pt",
-        "Nederlands": "nl"
+        "Nederlands": "nl",
+        "日本語 (Giapponese)": "ja"
     }
 
 
@@ -151,7 +152,8 @@ def get_country_options():
         "Francia": "fr",
         "Germania": "de",
         "Portogallo": "pt",
-        "Paesi Bassi": "nl"
+        "Paesi Bassi": "nl",
+        "Giappone": "jp"
     }
 
 
