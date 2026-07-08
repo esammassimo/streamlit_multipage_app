@@ -729,10 +729,10 @@ with tab_cfg:
     st.subheader("⚙️ Opzioni avanzate")
     c_a, c_b, c_c = st.columns(3)
     with c_a:
-        language = st.selectbox("Lingua", ["it", "en", "de", "fr", "es"],
-                                key="lbm_lang")
+        language = st.selectbox("Lingua", ["it", "en", "de", "fr", "es", "ja"],
+                               key="lbm_lang")
     with c_b:
-        country = st.selectbox("Paese", ["it", "us", "gb", "de", "fr"],
+        country = st.selectbox("Paese", ["it", "us", "gb", "de", "fr", "jp"],
                                key="lbm_country")
     with c_c:
         brand_method = st.selectbox(
