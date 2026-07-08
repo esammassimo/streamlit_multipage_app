@@ -678,7 +678,7 @@ with tab_cfg:
     ]
     c1, c2 = st.columns(2)
     for idx, (key, label, ph) in enumerate(OTHER_KEYS):
-        col = c1 if idx % 2 == 0 else col2
+        col = c1 if idx % 2 == 0 else c2
         with col:
             cur = st.session_state.lbm_keys.get(key, "")
             st.caption(("✅" if cur else "❌") + f" {label}" +
