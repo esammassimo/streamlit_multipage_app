@@ -604,11 +604,10 @@ with tab_input:
                     "volume": _auto("volume"), "intent": _auto("intent"),
                     "tone": _auto("tone"),
                 }
-                col1, col2 = st.columns(2)
+                import_map_cols = st.columns(2)
                 col_map = {}
                 for idx, (key, label) in enumerate(DISPLAY.items()):
-                    col = col1 if idx % 2 == 0 else col2
-                    with col:
+                    with import_map_cols[idx % 2]:
                         di = available.index(defs[key]) if defs[key] in available else 0
                         col_map[key] = st.selectbox(label, available, index=di,
                                                     key=f"lbm_cmap_{key}")
@@ -676,10 +675,9 @@ with tab_cfg:
         ("pplx",      "Perplexity",                  "pplx-..."),
         ("serpapi",   "SerpAPI (AI Overviews/Mode)", "serpapi_key..."),
     ]
-    c1, c2 = st.columns(2)
+    cfg_key_cols = st.columns(2)
     for idx, (key, label, ph) in enumerate(OTHER_KEYS):
-        col = c1 if idx % 2 == 0 else c2
-        with col:
+        with cfg_key_cols[idx % 2]:
             cur = st.session_state.lbm_keys.get(key, "")
             st.caption(("✅" if cur else "❌") + f" {label}" +
                        (f" `{cur[:6]}…{cur[-4:]}`" if cur else ""))
@@ -695,10 +693,10 @@ with tab_cfg:
     c_llm, c_ai = st.columns(2)
     with c_llm:
         sel_llms = st.multiselect("LLM", list(AVAILABLE_MODELS.keys()),
-                                  default=cfg["llms"])
+                                  default=cfg["llms"], key="lbm_sel_llms")
     with c_ai:
         sel_ai = st.multiselect("AI Features", ["AI Overviews", "AI Mode"],
-                                default=cfg["ai_features"])
+                                default=cfg["ai_features"], key="lbm_sel_ai")
 
     sel_models = dict(cfg.get("models", {}))
     if sel_llms:
