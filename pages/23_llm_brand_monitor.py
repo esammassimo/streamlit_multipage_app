@@ -264,13 +264,13 @@ def _brands_llm(text: str, openai_key: str) -> list[dict]:
         return _brands_regex(text)
 
 
-def _normalize(brands: list[dict], known: list[str]) -> list[dict]:
+def _normalize(brands: list[dict], known: list[str], threshold: int = 85) -> list[dict]:
     if not known or not brands:
         return brands
     norm, seen = [], set()
     for b in brands:
         res = process.extractOne(b["name"], known, scorer=fuzz.token_sort_ratio)
-        name = res[0] if res and res[1] >= 85 else b["name"]
+        name = res[0] if res and res[1] >= threshold else b["name"]
         k = name.lower()
         if k not in seen:
             seen.add(k)
@@ -279,9 +279,39 @@ def _normalize(brands: list[dict], known: list[str]) -> list[dict]:
 
 
 def extract_brands(text: str, openai_key: str, known: list[str],
-                   method: str = "regex") -> list[dict]:
+                   method: str = "regex", threshold: int = 85) -> list[dict]:
     brands = _brands_llm(text, openai_key) if method == "llm" else _brands_regex(text)
-    return _normalize(brands, known) if known else brands
+    return _normalize(brands, known, threshold) if known else brands
+
+
+def reclassify_brands(
+    risposte: list[dict],
+    openai_key: str,
+    known: list[str],
+    method: str = "regex",
+    threshold: int = 85,
+    progress_cb: Optional[Callable] = None,
+) -> list[dict]:
+    """Ri-estrae i brand dalle risposte già raccolte (in memoria), senza
+    richiamare di nuovo le API degli LLM. Utile per confrontare metodologie
+    di estrazione diverse (regex / LLM) o soglie di normalizzazione diverse
+    sullo stesso dataset di risposte."""
+    valid_rows = [r for r in risposte if r.get("Risposta")]
+    meta_cols = ("Data", "AI Questions", "Keyword", "Cluster", "Subcluster",
+                 "Volume", "Intent", "Tone")
+    brand_rows: list[dict] = []
+    total = len(valid_rows)
+    for i, r in enumerate(valid_rows, 1):
+        meta = {k: r.get(k, "") for k in meta_cols}
+        for b in extract_brands(r["Risposta"], openai_key, known, method, threshold):
+            brand_rows.append({**meta, "LLM": r.get("LLM", ""), "Model": r.get("Model", ""),
+                               "Brand": b["name"], "Position": b["position"]})
+        if progress_cb:
+            try:
+                progress_cb(i, total)
+            except Exception:
+                pass
+    return brand_rows
 
 
 # ─── Main run ────────────────────────────────────────────────────────────────
@@ -295,6 +325,7 @@ def run_monitor(
     language: str,
     country: str,
     progress_cb: Optional[Callable] = None,
+    brand_threshold: int = 85,
 ) -> dict:
     llms       = config.get("llms", [])
     ai_feats   = config.get("ai_features", [])
@@ -328,7 +359,7 @@ def run_monitor(
         risposte.append({**meta, "LLM": llm_label, "Model": model_name,
                          "Risposta": text if valid else ""})
         if valid:
-            for b in extract_brands(text, openai_key, known_brands, brand_method):
+            for b in extract_brands(text, openai_key, known_brands, brand_method, brand_threshold):
                 brand_rows.append({**meta, "LLM": llm_label, "Model": model_name,
                                    "Brand": b["name"], "Position": b["position"]})
             for url in sources:
@@ -521,18 +552,20 @@ _DEFAULTS = {
     "lbm_lang":      "it",
     "lbm_country":   "it",
     "lbm_bmethod":   "regex",
+    "lbm_threshold": 85,
 }
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# Eredita OpenAI key dalla sidebar globale dell'app
-if st.session_state.get("openai_api_key"):
+# Eredita OpenAI key dalla sidebar globale dell'app SOLO se non è stata
+# inserita direttamente in questa pagina (il campo locale ha priorità)
+if not st.session_state.lbm_keys.get("openai") and st.session_state.get("openai_api_key"):
     st.session_state.lbm_keys["openai"] = st.session_state["openai_api_key"]
 
 # ─── Tabs ─────────────────────────────────────────────────────────────────────
-tab_input, tab_cfg, tab_run, tab_export = st.tabs(
-    ["📋 Input", "⚙️ Configurazione", "🚀 Esecuzione", "📥 Export"]
+tab_input, tab_cfg, tab_run, tab_preview, tab_export = st.tabs(
+    ["📋 Input", "⚙️ Configurazione", "🚀 Esecuzione", "🔍 Anteprima & Riclassifica", "📥 Export"]
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -660,26 +693,27 @@ with tab_input:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_cfg:
     st.subheader("🔑 API Keys")
+    st.caption(
+        "La chiave OpenAI può arrivare dalla sidebar globale dell'app oppure "
+        "essere inserita qui sotto: il valore inserito in questa pagina ha sempre la priorità."
+    )
 
-    # OpenAI: mostra stato (viene dalla sidebar globale)
-    oai_key = st.session_state.get("openai_api_key", "")
-    if oai_key:
-        st.success(f"✅ OpenAI (dalla sidebar): `{oai_key[:6]}…{oai_key[-4:]}`")
-    else:
-        st.warning("❌ OpenAI non configurata — inseriscila nella sidebar dell'app.")
-
-    # Altre chiavi
-    OTHER_KEYS = [
-        ("anthropic", "Anthropic (Claude)",         "sk-ant-..."),
+    ALL_KEYS = [
+        ("openai",    "OpenAI (ChatGPT)",            "sk-..."),
+        ("anthropic", "Anthropic (Claude)",          "sk-ant-..."),
         ("google",    "Google AI (Gemini)",          "AIza..."),
         ("pplx",      "Perplexity",                  "pplx-..."),
         ("serpapi",   "SerpAPI (AI Overviews/Mode)", "serpapi_key..."),
     ]
     cfg_key_cols = st.columns(2)
-    for idx, (key, label, ph) in enumerate(OTHER_KEYS):
+    for idx, (key, label, ph) in enumerate(ALL_KEYS):
         with cfg_key_cols[idx % 2]:
             cur = st.session_state.lbm_keys.get(key, "")
-            st.caption(("✅" if cur else "❌") + f" {label}" +
+            source = ""
+            if key == "openai" and not cur and st.session_state.get("openai_api_key"):
+                cur = st.session_state["openai_api_key"]
+                source = " (dalla sidebar)"
+            st.caption(("✅" if cur else "❌") + f" {label}{source}" +
                        (f" `{cur[:6]}…{cur[-4:]}`" if cur else ""))
             val = st.text_input(label, type="password", placeholder=ph,
                                 key=f"lbm_key_{key}")
@@ -727,7 +761,7 @@ with tab_cfg:
 
     st.divider()
     st.subheader("⚙️ Opzioni avanzate")
-    c_a, c_b, c_c = st.columns(3)
+    c_a, c_b, c_c, c_d = st.columns(4)
     with c_a:
         language = st.selectbox("Lingua", ["it", "en", "de", "fr", "es", "ja"],
                                key="lbm_lang")
@@ -740,6 +774,12 @@ with tab_cfg:
             format_func=lambda x: "Regex (gratuito)" if x == "regex"
             else "GPT-4o-mini (~$0.001/risposta)",
             key="lbm_bmethod",
+        )
+    with c_d:
+        brand_threshold = st.slider(
+            "Soglia fuzzy match", min_value=50, max_value=100,
+            key="lbm_threshold",
+            help="Soglia RapidFuzz per normalizzare i brand estratti sulla brand list.",
         )
 
     if st.button("💾 Salva configurazione", type="primary"):
@@ -756,13 +796,15 @@ with tab_run:
     st.subheader("🚀 Esecuzione Run")
 
     questions   = st.session_state.lbm_questions
-    keys_run    = {**st.session_state.lbm_keys,
-                   "openai": st.session_state.get("openai_api_key", "")}
+    keys_run    = dict(st.session_state.lbm_keys)
+    if not keys_run.get("openai"):
+        keys_run["openai"] = st.session_state.get("openai_api_key", "")
     config_run  = st.session_state.lbm_config
     known_run   = st.session_state.lbm_known
     bmethod_run = st.session_state.get("lbm_bmethod", "regex")
     lang_run    = st.session_state.get("lbm_lang", "it")
     ctry_run    = st.session_state.get("lbm_country", "it")
+    thresh_run  = st.session_state.get("lbm_threshold", 85)
 
     warns = []
     if not questions:
@@ -822,7 +864,7 @@ with tab_run:
                 if valid:
                     brands_preview = [b["name"] for b in
                                       extract_brands(r["text"], keys_run.get("openai", ""),
-                                                     known_run, bmethod_run)]
+                                                     known_run, bmethod_run, thresh_run)]
                 table_rows.append({
                     "LLM": r["llm"],
                     "Modello": r["model"],
@@ -847,6 +889,7 @@ with tab_run:
                     language=lang_run,
                     country=ctry_run,
                     progress_cb=_cb,
+                    brand_threshold=thresh_run,
                 )
                 st.session_state.lbm_results = results
                 progress.progress(1.0, text="✅ Completato!")
@@ -866,9 +909,94 @@ with tab_run:
                 status.update(label=f"❌ Errore: {exc}", state="error", expanded=False)
                 st.error(str(exc))
 
-    # Anteprima risultati se già disponibili
     if st.session_state.lbm_results:
+        st.divider()
+        st.caption("👉 Vai al tab **Anteprima & Riclassifica** per esplorare i risultati "
+                   "e provare metodologie di estrazione brand diverse.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — ANTEPRIMA & RICLASSIFICA
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_preview:
+    st.subheader("🔍 Anteprima risultati & Riclassificazione brand")
+
+    if not st.session_state.lbm_results:
+        st.info("Nessun run completato. Vai al tab Esecuzione.")
+    else:
         results_prev = st.session_state.lbm_results
+        n_valid = sum(1 for r in results_prev["risposte"] if r.get("Risposta"))
+
+        st.markdown(
+            "Ri-estrai i brand dalle risposte **già raccolte**, con una metodologia diversa "
+            "(regex vs LLM) o una soglia di normalizzazione diversa, **senza richiamare "
+            "di nuovo le API degli LLM** — stesso principio della re-estrazione usata "
+            "nella dashboard AI Brand Monitoring."
+        )
+
+        rc1, rc2, rc3 = st.columns(3)
+        with rc1:
+            rc_method = st.selectbox(
+                "Metodo estrazione", ["regex", "llm"],
+                format_func=lambda x: "Regex (gratuito)" if x == "regex"
+                else "GPT-4o-mini (~$0.001/risposta)",
+                key="lbm_rc_method",
+            )
+        with rc2:
+            rc_threshold = st.slider(
+                "Soglia fuzzy match", 50, 100,
+                value=st.session_state.get("lbm_threshold", 85),
+                key="lbm_rc_threshold",
+            )
+        with rc3:
+            st.metric("Risposte riclassificabili", n_valid)
+
+        rc_brands_txt = st.text_area(
+            "Brand list per la riclassificazione", height=100,
+            value="\n".join(st.session_state.lbm_known),
+            key="lbm_rc_brands",
+            help="Puoi modificarla qui senza toccare quella salvata nel tab Input.",
+        )
+
+        rc_oai_key = st.session_state.lbm_keys.get("openai", "") or \
+            st.session_state.get("openai_api_key", "")
+        can_rc = rc_method == "regex" or bool(rc_oai_key)
+        if not can_rc:
+            st.warning("⚠️ Metodo LLM selezionato ma nessuna API key OpenAI configurata "
+                       "(tab Configurazione).")
+
+        if st.button("🔄 Riclassifica brand", type="primary", disabled=not can_rc):
+            rc_known = [b.strip() for b in rc_brands_txt.splitlines() if b.strip()]
+            progress = st.progress(0, text="Riclassificazione…")
+
+            def _rc_cb(done: int, total: int):
+                progress.progress(done / max(total, 1), text=f"{done}/{total} risposte")
+
+            new_brand_rows = reclassify_brands(
+                results_prev["risposte"], rc_oai_key, rc_known,
+                rc_method, rc_threshold, progress_cb=_rc_cb,
+            )
+            st.session_state.lbm_results["brand"] = new_brand_rows
+            progress.progress(1.0, text="✅ Completato!")
+            st.success(
+                f"Riclassificati **{len(new_brand_rows)}** brand con metodo "
+                f"**{rc_method}** (soglia {rc_threshold})."
+            )
+            st.rerun()
+
+        st.divider()
+
+        df_b = pd.DataFrame(results_prev["brand"])
+        if not df_b.empty:
+            st.markdown("**Classifica brand — menzioni e posizione media**")
+            rank = (
+                df_b.groupby("Brand")
+                .agg(Menzioni=("Brand", "count"), Posizione_media=("Position", "mean"))
+                .reset_index()
+                .sort_values("Menzioni", ascending=False)
+            )
+            rank["Posizione_media"] = rank["Posizione_media"].round(2)
+            st.dataframe(rank, use_container_width=True, hide_index=True)
+
         st.divider()
         t_r, t_b, t_f = st.tabs([
             f"Risposte ({len(results_prev['risposte'])})",
@@ -889,7 +1017,7 @@ with tab_run:
                          use_container_width=True, hide_index=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — EXPORT
+# TAB 5 — EXPORT
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_export:
     st.subheader("📥 Export Excel")
