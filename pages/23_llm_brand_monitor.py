@@ -218,6 +218,26 @@ BRAND_PROMPT = (
 )
 
 
+BRAND_METHOD_LABELS = {
+    "regex":         "Regex (gratuito)",
+    "llm_openai":    "LLM — GPT-4o-mini (OpenAI)",
+    "llm_anthropic": "LLM — Claude Sonnet (Anthropic)",
+    "ensemble":      "Ensemble regex + LLM (con confidenza)",
+}
+
+
+def _brand_method_options(keys: dict) -> list[str]:
+    """Restituisce i metodi disponibili in base alle key configurate."""
+    opts = ["regex"]
+    if keys.get("openai"):
+        opts.append("llm_openai")
+    if keys.get("anthropic"):
+        opts.append("llm_anthropic")
+    if len(opts) > 1:
+        opts.append("ensemble")
+    return opts
+
+
 def _brands_regex(text: str) -> list[dict]:
     found, seen, pos = [], set(), 1
     for b in re.findall(r'\*\*([A-Z][A-Za-zÀ-ÿ\s\'&\-\.]+?)\*\*', text):
@@ -241,7 +261,7 @@ def _brands_regex(text: str) -> list[dict]:
     return found
 
 
-def _brands_llm(text: str, openai_key: str) -> list[dict]:
+def _brands_llm_openai(text: str, openai_key: str) -> list[dict]:
     if not openai_key:
         return _brands_regex(text)
     try:
@@ -264,6 +284,29 @@ def _brands_llm(text: str, openai_key: str) -> list[dict]:
         return _brands_regex(text)
 
 
+def _brands_llm_anthropic(text: str, anthropic_key: str,
+                          model: str = "claude-sonnet-4-6") -> list[dict]:
+    if not anthropic_key:
+        return _brands_regex(text)
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01",
+                     "Content-Type": "application/json"},
+            json={"model": model, "max_tokens": 1000,
+                  "messages": [{"role": "user",
+                                "content": BRAND_PROMPT.format(text=text[:8000])}]},
+            timeout=30,
+        )
+        r.raise_for_status()
+        raw = re.sub(r'^```(?:json)?\s*|\s*```$', '',
+                     r.json()["content"][0]["text"].strip())
+        return [{"name": b.get("name", ""), "position": b.get("position", i+1)}
+                for i, b in enumerate(json.loads(raw)) if b.get("name")]
+    except Exception:
+        return _brands_regex(text)
+
+
 def _normalize(brands: list[dict], known: list[str], threshold: int = 85) -> list[dict]:
     if not known or not brands:
         return brands
@@ -278,23 +321,78 @@ def _normalize(brands: list[dict], known: list[str], threshold: int = 85) -> lis
     return norm
 
 
-def extract_brands(text: str, openai_key: str, known: list[str],
-                   method: str = "regex", threshold: int = 85) -> list[dict]:
-    brands = _brands_llm(text, openai_key) if method == "llm" else _brands_regex(text)
-    return _normalize(brands, known, threshold) if known else brands
+def _extract_brands_ensemble(
+    text: str, keys: dict, known: list[str], threshold: int = 85,
+    engines: tuple = ("regex", "llm_openai", "llm_anthropic"),
+) -> list[dict]:
+    """Combina più metodi di estrazione sullo stesso testo e assegna a ogni
+    brand un punteggio di confidenza pari al numero di fonti che lo hanno
+    trovato (utile per distinguere estrazioni robuste da falsi positivi)."""
+    found: dict[str, dict] = {}
+    runs: list[tuple[str, list[dict]]] = []
+    if "regex" in engines:
+        runs.append(("regex", _brands_regex(text)))
+    if "llm_openai" in engines and keys.get("openai"):
+        runs.append(("llm_openai", _brands_llm_openai(text, keys["openai"])))
+    if "llm_anthropic" in engines and keys.get("anthropic"):
+        runs.append(("llm_anthropic", _brands_llm_anthropic(text, keys["anthropic"])))
+
+    for source, brands in runs:
+        for b in (_normalize(brands, known, threshold) if known else brands):
+            key = b["name"].lower()
+            if key not in found:
+                found[key] = {"name": b["name"], "positions": [], "sources": set()}
+            found[key]["positions"].append(b["position"])
+            found[key]["sources"].add(source)
+
+    result = [
+        {
+            "name": v["name"],
+            "position": min(v["positions"]),
+            "confidence": len(v["sources"]),
+            "sources": ", ".join(sorted(v["sources"])),
+        }
+        for v in found.values()
+    ]
+    result.sort(key=lambda x: x["position"])
+    return result
+
+
+def extract_brands(
+    text: str, keys: dict, known: list[str],
+    method: str = "regex", threshold: int = 85,
+    engines: tuple = ("regex", "llm_openai", "llm_anthropic"),
+) -> list[dict]:
+    if method == "ensemble":
+        return _extract_brands_ensemble(text, keys, known, threshold, engines)
+
+    if method in ("llm_openai", "llm"):  # "llm" resta come alias retro-compatibile
+        brands = _brands_llm_openai(text, keys.get("openai", ""))
+    elif method == "llm_anthropic":
+        brands = _brands_llm_anthropic(text, keys.get("anthropic", ""))
+    else:
+        brands = _brands_regex(text)
+
+    normalized = _normalize(brands, known, threshold) if known else brands
+    for b in normalized:
+        b.setdefault("confidence", 1)
+        b.setdefault("sources", method)
+    return normalized
 
 
 def reclassify_brands(
     risposte: list[dict],
-    openai_key: str,
+    keys: dict,
     known: list[str],
     method: str = "regex",
     threshold: int = 85,
+    engines: tuple = ("regex", "llm_openai", "llm_anthropic"),
     progress_cb: Optional[Callable] = None,
 ) -> list[dict]:
     """Ri-estrae i brand dalle risposte già raccolte (in memoria), senza
-    richiamare di nuovo le API degli LLM. Utile per confrontare metodologie
-    di estrazione diverse (regex / LLM) o soglie di normalizzazione diverse
+    richiamare di nuovo le API degli LLM che hanno generato le risposte.
+    Utile per confrontare metodologie di estrazione diverse (regex / LLM
+    OpenAI / LLM Anthropic / ensemble) o soglie di normalizzazione diverse
     sullo stesso dataset di risposte."""
     valid_rows = [r for r in risposte if r.get("Risposta")]
     meta_cols = ("Data", "AI Questions", "Keyword", "Cluster", "Subcluster",
@@ -303,9 +401,12 @@ def reclassify_brands(
     total = len(valid_rows)
     for i, r in enumerate(valid_rows, 1):
         meta = {k: r.get(k, "") for k in meta_cols}
-        for b in extract_brands(r["Risposta"], openai_key, known, method, threshold):
-            brand_rows.append({**meta, "LLM": r.get("LLM", ""), "Model": r.get("Model", ""),
-                               "Brand": b["name"], "Position": b["position"]})
+        for b in extract_brands(r["Risposta"], keys, known, method, threshold, engines):
+            brand_rows.append({
+                **meta, "LLM": r.get("LLM", ""), "Model": r.get("Model", ""),
+                "Brand": b["name"], "Position": b["position"],
+                "Confidence": b.get("confidence", 1), "Sources": b.get("sources", method),
+            })
         if progress_cb:
             try:
                 progress_cb(i, total)
@@ -332,7 +433,6 @@ def run_monitor(
     iterations = int(config.get("iterations", 1))
     models     = config.get("models", {})
     today      = date.today().isoformat()
-    openai_key = keys.get("openai", "")
 
     risposte, brand_rows, fonti_rows = [], [], []
     total = len(questions) * (len(llms) * iterations + len(ai_feats))
@@ -359,9 +459,11 @@ def run_monitor(
         risposte.append({**meta, "LLM": llm_label, "Model": model_name,
                          "Risposta": text if valid else ""})
         if valid:
-            for b in extract_brands(text, openai_key, known_brands, brand_method, brand_threshold):
+            for b in extract_brands(text, keys, known_brands, brand_method, brand_threshold):
                 brand_rows.append({**meta, "LLM": llm_label, "Model": model_name,
-                                   "Brand": b["name"], "Position": b["position"]})
+                                   "Brand": b["name"], "Position": b["position"],
+                                   "Confidence": b.get("confidence", 1),
+                                   "Sources": b.get("sources", brand_method)})
             for url in sources:
                 fonti_rows.append({**meta, "LLM": llm_label, "Model": model_name, "URL": url})
 
@@ -769,11 +871,14 @@ with tab_cfg:
         country = st.selectbox("Paese", ["it", "us", "gb", "de", "fr", "jp"],
                                key="lbm_country")
     with c_c:
+        _bm_opts = _brand_method_options(st.session_state.lbm_keys)
+        if st.session_state.get("lbm_bmethod") not in _bm_opts:
+            st.session_state["lbm_bmethod"] = "regex"
         brand_method = st.selectbox(
-            "Estrazione brand", ["regex", "llm"],
-            format_func=lambda x: "Regex (gratuito)" if x == "regex"
-            else "GPT-4o-mini (~$0.001/risposta)",
+            "Estrazione brand", _bm_opts,
+            format_func=lambda x: BRAND_METHOD_LABELS.get(x, x),
             key="lbm_bmethod",
+            help="Le opzioni LLM/ensemble compaiono solo se hai configurato la relativa API key.",
         )
     with c_d:
         brand_threshold = st.slider(
@@ -863,7 +968,7 @@ with tab_run:
                 brands_preview = []
                 if valid:
                     brands_preview = [b["name"] for b in
-                                      extract_brands(r["text"], keys_run.get("openai", ""),
+                                      extract_brands(r["text"], keys_run,
                                                      known_run, bmethod_run, thresh_run)]
                 table_rows.append({
                     "LLM": r["llm"],
@@ -928,18 +1033,25 @@ with tab_preview:
 
         st.markdown(
             "Ri-estrai i brand dalle risposte **già raccolte**, con una metodologia diversa "
-            "(regex vs LLM) o una soglia di normalizzazione diversa, **senza richiamare "
-            "di nuovo le API degli LLM** — stesso principio della re-estrazione usata "
-            "nella dashboard AI Brand Monitoring."
+            "(regex / LLM OpenAI / LLM Anthropic / ensemble con confidenza) o una soglia di "
+            "normalizzazione diversa, **senza richiamare di nuovo le API degli LLM che hanno "
+            "generato le risposte** — stesso principio della re-estrazione usata nella "
+            "dashboard AI Brand Monitoring."
         )
+
+        rc_keys = st.session_state.lbm_keys
+        rc_opts = _brand_method_options(rc_keys)
+        if st.session_state.get("lbm_rc_method") not in rc_opts:
+            st.session_state["lbm_rc_method"] = "regex"
 
         rc1, rc2, rc3 = st.columns(3)
         with rc1:
             rc_method = st.selectbox(
-                "Metodo estrazione", ["regex", "llm"],
-                format_func=lambda x: "Regex (gratuito)" if x == "regex"
-                else "GPT-4o-mini (~$0.001/risposta)",
+                "Metodo estrazione", rc_opts,
+                format_func=lambda x: BRAND_METHOD_LABELS.get(x, x),
                 key="lbm_rc_method",
+                help="Ensemble combina più metodi e assegna un punteggio di confidenza "
+                     "(quante fonti concordano) a ogni brand.",
             )
         with rc2:
             rc_threshold = st.slider(
@@ -957,12 +1069,19 @@ with tab_preview:
             help="Puoi modificarla qui senza toccare quella salvata nel tab Input.",
         )
 
-        rc_oai_key = st.session_state.lbm_keys.get("openai", "") or \
-            st.session_state.get("openai_api_key", "")
-        can_rc = rc_method == "regex" or bool(rc_oai_key)
-        if not can_rc:
-            st.warning("⚠️ Metodo LLM selezionato ma nessuna API key OpenAI configurata "
-                       "(tab Configurazione).")
+        needs_openai = rc_method in ("llm_openai", "ensemble") and not rc_keys.get("openai")
+        needs_anthropic = rc_method in ("llm_anthropic", "ensemble") and not rc_keys.get("anthropic")
+        can_rc = rc_method == "regex" or rc_keys.get("openai") or rc_keys.get("anthropic")
+        if rc_method == "llm_openai" and needs_openai:
+            can_rc = False
+            st.warning("⚠️ Nessuna API key OpenAI configurata (tab Configurazione).")
+        if rc_method == "llm_anthropic" and needs_anthropic:
+            can_rc = False
+            st.warning("⚠️ Nessuna API key Anthropic configurata (tab Configurazione).")
+        if rc_method == "ensemble" and not (rc_keys.get("openai") or rc_keys.get("anthropic")):
+            can_rc = False
+            st.warning("⚠️ L'ensemble richiede almeno una key OpenAI o Anthropic "
+                       "(tab Configurazione) oltre alla regex.")
 
         if st.button("🔄 Riclassifica brand", type="primary", disabled=not can_rc):
             rc_known = [b.strip() for b in rc_brands_txt.splitlines() if b.strip()]
@@ -972,14 +1091,15 @@ with tab_preview:
                 progress.progress(done / max(total, 1), text=f"{done}/{total} risposte")
 
             new_brand_rows = reclassify_brands(
-                results_prev["risposte"], rc_oai_key, rc_known,
+                results_prev["risposte"], rc_keys, rc_known,
                 rc_method, rc_threshold, progress_cb=_rc_cb,
             )
             st.session_state.lbm_results["brand"] = new_brand_rows
             progress.progress(1.0, text="✅ Completato!")
             st.success(
                 f"Riclassificati **{len(new_brand_rows)}** brand con metodo "
-                f"**{rc_method}** (soglia {rc_threshold}). Tabelle aggiornate qui sotto."
+                f"**{BRAND_METHOD_LABELS.get(rc_method, rc_method)}** (soglia {rc_threshold}). "
+                f"Tabelle aggiornate qui sotto."
             )
 
         st.divider()
@@ -987,14 +1107,28 @@ with tab_preview:
         df_b = pd.DataFrame(results_prev["brand"])
         if not df_b.empty:
             st.markdown("**Classifica brand — menzioni e posizione media**")
-            rank = (
-                df_b.groupby("Brand")
-                .agg(Menzioni=("Brand", "count"), Posizione_media=("Position", "mean"))
-                .reset_index()
-                .sort_values("Menzioni", ascending=False)
-            )
+            agg = {"Menzioni": ("Brand", "count"), "Posizione_media": ("Position", "mean")}
+            if "Confidence" in df_b.columns:
+                agg["Confidenza_media"] = ("Confidence", "mean")
+            rank = df_b.groupby("Brand").agg(**agg).reset_index()
             rank["Posizione_media"] = rank["Posizione_media"].round(2)
+            if "Confidenza_media" in rank.columns:
+                rank["Confidenza_media"] = rank["Confidenza_media"].round(2)
+            rank = rank.sort_values("Menzioni", ascending=False)
             st.dataframe(rank, use_container_width=True, hide_index=True)
+
+            st.markdown("**Brand più menzionati per LLM analizzato**")
+            if "LLM" in df_b.columns:
+                pivot = (
+                    df_b.groupby(["Brand", "LLM"]).size()
+                    .unstack(fill_value=0)
+                    .assign(Totale=lambda d: d.sum(axis=1))
+                    .sort_values("Totale", ascending=False)
+                    .reset_index()
+                )
+                st.dataframe(pivot, use_container_width=True, hide_index=True)
+            else:
+                st.caption("Nessuna colonna LLM disponibile nei dati brand.")
 
         st.divider()
         t_r, t_b, t_f = st.tabs([
