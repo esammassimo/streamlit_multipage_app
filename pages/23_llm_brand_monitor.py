@@ -979,9 +979,8 @@ with tab_preview:
             progress.progress(1.0, text="✅ Completato!")
             st.success(
                 f"Riclassificati **{len(new_brand_rows)}** brand con metodo "
-                f"**{rc_method}** (soglia {rc_threshold})."
+                f"**{rc_method}** (soglia {rc_threshold}). Tabelle aggiornate qui sotto."
             )
-            st.rerun()
 
         st.divider()
 
