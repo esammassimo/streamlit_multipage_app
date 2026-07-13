@@ -40,7 +40,7 @@ SYSTEM_PROMPT = (
     "Includi fonti e URL quando possibile."
 )
 
-GEMINI_FALLBACK = ["gemini-2.5-flash", "gemini-2.0-flash"]
+GEMINI_FALLBACK = ["gemini-3.5-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"]
 
 AVAILABLE_MODELS = {
     "ChatGPT":    ["gpt-4o", "gpt-4o-mini", "gpt-5.4", "gpt-5.5"],
