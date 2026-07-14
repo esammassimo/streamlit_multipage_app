@@ -16,8 +16,10 @@ import io
 import re
 import time
 import json
+import hashlib
 import logging
-from datetime import date
+from pathlib import Path
+from datetime import date, datetime
 from typing import Callable, Optional
 
 import pandas as pd
@@ -415,6 +417,74 @@ def reclassify_brands(
     return brand_rows
 
 
+# ─── Cache/checkpoint dei run ───────────────────────────────────────────────
+# Salva su disco lo stato di avanzamento di un run, identificato da un hash
+# della configurazione (domande, LLM, iterazioni, brand list, ecc). In caso di
+# interruzione (chiusura tab, refresh, crash, rerun di Streamlit), la stessa
+# configurazione fa ripartire il run dal punto esatto in cui si era fermato,
+# senza richiamare di nuovo le API già completate con successo.
+
+CACHE_DIR = Path(__file__).resolve().parent / ".lbm_cache"
+
+
+def _make_run_key(questions: list[dict], config: dict, known_brands: list[str],
+                  brand_method: str, language: str, country: str,
+                  brand_threshold: int) -> str:
+    payload = {
+        "questions": [(q.get("question", ""), q.get("keyword", "")) for q in questions],
+        "llms": sorted(config.get("llms", [])),
+        "ai_features": sorted(config.get("ai_features", [])),
+        "iterations": config.get("iterations", 1),
+        "models": config.get("models", {}),
+        "known_brands": sorted(known_brands),
+        "brand_method": brand_method,
+        "language": language,
+        "country": country,
+        "brand_threshold": brand_threshold,
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _cache_path(run_key: str) -> Path:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return CACHE_DIR / f"{run_key}.json"
+
+
+def _load_cache(run_key: str) -> Optional[dict]:
+    p = _cache_path(run_key)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _save_cache(run_key: str, state: dict) -> None:
+    p = _cache_path(run_key)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(p)  # scrittura atomica: evita file corrotti se l'app si ferma a metà
+
+
+def _clear_cache(run_key: str) -> None:
+    p = _cache_path(run_key)
+    if p.exists():
+        p.unlink()
+
+
+def _cache_status(run_key: str) -> Optional[dict]:
+    c = _load_cache(run_key)
+    if not c:
+        return None
+    return {
+        "done": len(c.get("done_ids", [])),
+        "total": c.get("total", 0),
+        "updated_at": c.get("updated_at", ""),
+    }
+
+
 # ─── Main run ────────────────────────────────────────────────────────────────
 
 def run_monitor(
@@ -427,6 +497,7 @@ def run_monitor(
     country: str,
     progress_cb: Optional[Callable] = None,
     brand_threshold: int = 85,
+    cache_key: Optional[str] = None,
 ) -> dict:
     llms       = config.get("llms", [])
     ai_feats   = config.get("ai_features", [])
@@ -435,8 +506,26 @@ def run_monitor(
     today      = date.today().isoformat()
 
     risposte, brand_rows, fonti_rows = [], [], []
+    done_ids: set[str] = set()
+
+    if cache_key:
+        cached = _load_cache(cache_key)
+        if cached:
+            risposte   = cached.get("risposte", [])
+            brand_rows = cached.get("brand", [])
+            fonti_rows = cached.get("fonti", [])
+            done_ids   = set(cached.get("done_ids", []))
+
     total = len(questions) * (len(llms) * iterations + len(ai_feats))
-    done  = 0
+    done  = len(done_ids)
+
+    def _checkpoint():
+        if cache_key:
+            _save_cache(cache_key, {
+                "risposte": risposte, "brand": brand_rows, "fonti": fonti_rows,
+                "done_ids": sorted(done_ids), "total": total,
+                "updated_at": datetime.now().isoformat(),
+            })
 
     def _meta(q: dict) -> dict:
         return {
@@ -450,7 +539,7 @@ def run_monitor(
             "Tone": q.get("tone", ""),
         }
 
-    def _store(q: dict, llm_label: str, model_name: str,
+    def _store(item_id: str, q: dict, llm_label: str, model_name: str,
                text: str, sources: list, elapsed: float):
         nonlocal done
         meta = _meta(q)
@@ -467,7 +556,9 @@ def run_monitor(
             for url in sources:
                 fonti_rows.append({**meta, "LLM": llm_label, "Model": model_name, "URL": url})
 
+        done_ids.add(item_id)
         done += 1
+        _checkpoint()
         if progress_cb:
             try:
                 progress_cb(done, total, {
@@ -479,12 +570,15 @@ def run_monitor(
             except Exception:
                 pass
 
-    for q in questions:
+    for qi, q in enumerate(questions):
         question = q.get("question", "")
 
         for llm_name in llms:
             sel = models.get(llm_name, "")
-            for _ in range(iterations):
+            for it in range(iterations):
+                item_id = f"{qi}|{llm_name}|{it}"
+                if item_id in done_ids:
+                    continue
                 t0 = time.time()
                 try:
                     if llm_name == "ChatGPT":
@@ -499,11 +593,14 @@ def run_monitor(
                         txt, src, mn = f"ERROR: unknown LLM {llm_name}", [], ""
                 except Exception as exc:
                     txt, src, mn = f"ERROR: {exc}", [], sel or ""
-                _store(q, llm_name, mn, txt, src, round(time.time() - t0, 1))
+                _store(item_id, q, llm_name, mn, txt, src, round(time.time() - t0, 1))
                 time.sleep(1)
 
         serp_q = q.get("keyword", "").strip() or question
         for feat in ai_feats:
+            item_id = f"{qi}|FEAT:{feat}"
+            if item_id in done_ids:
+                continue
             t0 = time.time()
             try:
                 if feat == "AI Overviews":
@@ -514,8 +611,11 @@ def run_monitor(
                     txt, src, mn = f"ERROR: unknown feature {feat}", [], ""
             except Exception as exc:
                 txt, src, mn = f"ERROR: {exc}", [], feat
-            _store(q, feat, mn, txt, src, round(time.time() - t0, 1))
+            _store(item_id, q, feat, mn, txt, src, round(time.time() - t0, 1))
             time.sleep(1.5)
+
+    if cache_key:
+        _clear_cache(cache_key)  # run completato: il checkpoint non serve più
 
     return {"risposte": risposte, "brand": brand_rows, "fonti": fonti_rows}
 
@@ -938,8 +1038,36 @@ with tab_run:
             st.caption("Modelli: " +
                        "  ·  ".join(f"{k}: `{v}`" for k, v in mods.items() if k in llms_r))
 
-        if st.button("🚀 Avvia Run", type="primary"):
-            progress = st.progress(0, text="Avvio…")
+        run_key = _make_run_key(questions, config_run, known_run, bmethod_run,
+                                lang_run, ctry_run, thresh_run)
+        cache_info = _cache_status(run_key)
+        resume_clicked = False
+
+        if cache_info and 0 < cache_info["done"] < cache_info["total"]:
+            ts = cache_info["updated_at"][:19].replace("T", " ")
+            st.info(
+                f"🔄 Trovata una sessione interrotta per questa identica configurazione: "
+                f"**{cache_info['done']}/{cache_info['total']}** elementi già completati "
+                f"(ultimo salvataggio: {ts}). Puoi riprendere da dove ti eri fermato "
+                f"senza rifare le chiamate già andate a buon fine."
+            )
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                resume_clicked = st.button("▶️ Riprendi da qui", type="primary",
+                                           use_container_width=True)
+            with rc2:
+                if st.button("🗑️ Scarta e ricomincia da zero", use_container_width=True):
+                    _clear_cache(run_key)
+                    st.rerun()
+            start_clicked = False
+        else:
+            start_clicked = st.button("🚀 Avvia Run", type="primary")
+
+        if start_clicked or resume_clicked:
+            _init_done = cache_info["done"] if resume_clicked and cache_info else 0
+            _init_pct = _init_done / max(total_c, 1)
+            progress = st.progress(_init_pct, text=f"{_init_done}/{total_c} ({_init_pct:.0%})"
+                                    if resume_clicked else "Avvio…")
             status   = st.status("🚀 Run in corso…", expanded=True)
             table_ph = st.empty()
 
@@ -995,6 +1123,7 @@ with tab_run:
                     country=ctry_run,
                     progress_cb=_cb,
                     brand_threshold=thresh_run,
+                    cache_key=run_key,
                 )
                 st.session_state.lbm_results = results
                 progress.progress(1.0, text="✅ Completato!")
@@ -1013,6 +1142,8 @@ with tab_run:
             except Exception as exc:
                 status.update(label=f"❌ Errore: {exc}", state="error", expanded=False)
                 st.error(str(exc))
+                st.info("Il progresso fatto finora resta salvato: ricarica la pagina e "
+                        "torna qui per riprendere da dove ti sei fermato.")
 
     if st.session_state.lbm_results:
         st.divider()
