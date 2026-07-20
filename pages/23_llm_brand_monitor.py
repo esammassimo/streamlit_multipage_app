@@ -20,6 +20,7 @@ import hashlib
 import logging
 from pathlib import Path
 from datetime import date, datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
 import pandas as pd
@@ -30,16 +31,28 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from rapidfuzz import process, fuzz
 
+# TOML parser per l'estrazione brand "dashboard" (stdlib 3.11+ o fallback tomli)
+try:
+    import tomllib  # type: ignore
+except ImportError:
+    try:
+        import tomli as tomllib  # type: ignore
+    except ImportError:
+        tomllib = None  # type: ignore
+
 log = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ENGINE — chiamate API (no DB)
 # ═══════════════════════════════════════════════════════════════════════════════
+# NOTA: stessi prompt/tool di web search usati in navla-aibrandmonitoring
+# (pipeline.py), per garantire risposte "grounded" comparabili tra i due tool.
 
 SYSTEM_PROMPT = (
-    "Sei un esperto del settore. Rispondi in modo dettagliato e completo alla domanda, "
-    "menzionando brand, aziende e servizi specifici quando rilevante. "
-    "Includi fonti e URL quando possibile."
+    "You are a helpful assistant with access to current web search results. "
+    "Provide comprehensive, well-sourced answers based on the latest available information. "
+    "When mentioning brands, companies, or products, be specific and accurate. "
+    "Always base your answer on real, up-to-date information from the web."
 )
 
 GEMINI_FALLBACK = ["gemini-3.5-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"]
@@ -52,39 +65,100 @@ AVAILABLE_MODELS = {
 }
 
 
-def _call_chatgpt(question: str, keys: dict, model: str = "gpt-4o") -> tuple[str, list, str]:
+def _call_chatgpt(question: str, keys: dict, model: str = "gpt-4o",
+                  country: str = "it") -> tuple[str, list, str]:
     k = keys.get("openai", "")
     if not k:
         return "DISABLED", [], model
-    r = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={"Authorization": f"Bearer {k}", "Content-Type": "application/json"},
-        json={"model": model,
-              "messages": [{"role": "system", "content": SYSTEM_PROMPT},
-                           {"role": "user", "content": question}],
-              "max_tokens": 2000, "temperature": 0.7},
-        timeout=60,
-    )
-    r.raise_for_status()
-    text = r.json()["choices"][0]["message"]["content"]
-    return text, re.findall(r'https?://[^\s\)\]\>\"\']+', text), model
+    headers = {"Authorization": f"Bearer {k}", "Content-Type": "application/json"}
+
+    # --- Tentativo 1: Responses API con tool web_search (risposta "grounded") ---
+    payload = {
+        "model": model,
+        "tools": [{
+            "type": "web_search",
+            "user_location": {"type": "approximate", "country": country.upper()},
+        }],
+        "tool_choice": {"type": "web_search"},
+        "include": ["web_search_call.action.sources"],
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]},
+            {"role": "user",   "content": [{"type": "input_text", "text": question}]},
+        ],
+        "temperature": 0.7,
+    }
+    try:
+        r = requests.post("https://api.openai.com/v1/responses",
+                          headers=headers, json=payload, timeout=60)
+        if r.status_code == 200:
+            data = r.json()
+            texts, sources = [], []
+            for block in data.get("output", []):
+                for content in block.get("content", []):
+                    if content.get("type") in ("output_text", "text"):
+                        texts.append(content.get("text", ""))
+                    for ann in content.get("annotations", []):
+                        if ann.get("type") == "url_citation" and ann.get("url"):
+                            sources.append(ann["url"])
+            result_text = "\n".join(texts).strip()
+            if result_text:
+                return result_text, sources, model
+            log.warning("ChatGPT Responses API: 200 ma testo vuoto — fallback")
+    except Exception as exc:
+        log.warning("ChatGPT Responses API error: %s", exc)
+
+    # --- Fallback: Chat Completions (senza web search) ---
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json={"model": model,
+                  "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                               {"role": "user", "content": question}],
+                  "max_tokens": 2000, "temperature": 0.7},
+            timeout=60,
+        )
+        r.raise_for_status()
+        text = r.json()["choices"][0]["message"]["content"]
+        return text, re.findall(r'https?://[^\s\)\]\>\"\']+', text), model
+    except Exception as exc:
+        return f"ERROR: {exc}", [], model
 
 
 def _call_claude(question: str, keys: dict, model: str = "claude-sonnet-4-6") -> tuple[str, list, str]:
     k = keys.get("anthropic", "")
     if not k:
         return "DISABLED", [], model
-    r = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={"x-api-key": k, "anthropic-version": "2023-06-01",
-                 "Content-Type": "application/json"},
-        json={"model": model, "max_tokens": 2000, "system": SYSTEM_PROMPT,
-              "messages": [{"role": "user", "content": question}]},
-        timeout=60,
-    )
-    r.raise_for_status()
-    text = r.json()["content"][0]["text"]
-    return text, re.findall(r'https?://[^\s\)\]\>\"\']+', text), model
+    headers = {
+        "x-api-key": k, "anthropic-version": "2023-06-01",
+        "anthropic-beta": "web-search-2025-03-05",
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": model, "max_tokens": 4096, "system": SYSTEM_PROMPT,
+        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+        "messages": [{"role": "user", "content": question}],
+    }
+    try:
+        r = requests.post("https://api.anthropic.com/v1/messages",
+                          headers=headers, json=payload, timeout=90)
+        r.raise_for_status()
+        data = r.json()
+        texts = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
+        text = "\n".join(texts).strip()
+        sources = re.findall(r'https?://[^\s\)\]\>\"\']+', text)
+        return text, sources, model
+    except Exception as exc:
+        return f"ERROR: {exc}", [], model
+
+
+def _resolve_redirect(url: str, timeout: int = 5) -> str:
+    """Segue i redirect HTTP e ritorna l'URL finale (per link Vertex AI search)."""
+    try:
+        resp = requests.head(url, allow_redirects=True, timeout=timeout)
+        return resp.url
+    except Exception:
+        return url
 
 
 def _call_gemini(question: str, keys: dict, model: str | None = None) -> tuple[str, list, str]:
@@ -113,8 +187,14 @@ def _call_gemini(question: str, keys: dict, model: str | None = None) -> tuple[s
             chunks = (data.get("candidates", [{}])[0]
                       .get("groundingMetadata", {})
                       .get("groundingChunks", []))
-            sources = [c.get("web", {}).get("uri", "") for c in chunks
-                       if c.get("web", {}).get("uri")]
+            sources = []
+            for c in chunks:
+                web = c.get("web", {})
+                url = web.get("uri") or web.get("url", "")
+                if url:
+                    if "vertexaisearch.cloud.google.com" in url:
+                        url = _resolve_redirect(url)
+                    sources.append(url)
             return text, sources, m
         except Exception as exc:
             last_exc = exc
@@ -125,20 +205,24 @@ def _call_perplexity(question: str, keys: dict, model: str = "sonar-pro") -> tup
     k = keys.get("pplx", "")
     if not k:
         return "DISABLED", [], model
-    r = requests.post(
-        "https://api.perplexity.ai/chat/completions",
-        headers={"Authorization": f"Bearer {k}", "Content-Type": "application/json"},
-        json={"model": model,
-              "messages": [{"role": "system", "content": SYSTEM_PROMPT},
-                           {"role": "user", "content": question}],
-              "max_tokens": 2000},
-        timeout=60,
-    )
-    r.raise_for_status()
-    data = r.json()
-    text = data["choices"][0]["message"]["content"]
-    sources = data.get("citations", []) or re.findall(r'https?://[^\s\)\]\>\"\']+', text)
-    return text, sources, model
+    try:
+        r = requests.post(
+            "https://api.perplexity.ai/chat/completions",
+            headers={"Authorization": f"Bearer {k}", "Content-Type": "application/json"},
+            json={"model": model,
+                  "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                               {"role": "user", "content": question}],
+                  "max_tokens": 4096, "temperature": 0.7,
+                  "web_search_options": {"search_context_size": "high"}},
+            timeout=60,
+        )
+        r.raise_for_status()
+        data = r.json()
+        text = data["choices"][0]["message"]["content"]
+        sources = data.get("citations", []) or re.findall(r'https?://[^\s\)\]\>\"\']+', text)
+        return text, sources, model
+    except Exception as exc:
+        return f"ERROR: {exc}", [], model
 
 
 def _parse_blocks(blocks: list) -> str:
@@ -219,25 +303,68 @@ BRAND_PROMPT = (
     "Example: [{\"name\": \"Nike\", \"position\": 1}]\nText:\n{text}"
 )
 
+# Prompt e formato output (TOML) identici a BRAND_EXTRACTION_PROMPT in
+# navla-aibrandmonitoring/pipeline.py — è il metodo canonico usato lì.
+DASHBOARD_BRAND_PROMPT = """\
+You are a brand extraction assistant.
+Extract all brand names, company names, and product names mentioned in the text below.
+
+Normalization rules:
+- Use Title Case for each brand name, but keep prepositions and conjunctions \
+(by, di, de, of, and, &, the) in lowercase unless they are the first word \
+(e.g. "Nike by Adidas" → "Nike by Adidas", "the North Face" → "The North Face").
+- Normalize each name to its most common short form (e.g. "Nike Inc." → "Nike").
+- Return each brand only once, even if it appears multiple times in the text.
+- If the same brand appears in slightly different forms, pick the most complete \
+and canonical form.
+
+Assign position as the ordinal of first mention (1 = first brand mentioned).
+If no brands are found, return an empty list.
+Respond ONLY in TOML format, no markdown, no extra text.
+
+Required TOML format:
+[[brands]]
+name = "Brand Name"
+position = 1
+
+[[brands]]
+name = "Another Brand"
+position = 2
+
+Text:
+{text}
+"""
+
 
 BRAND_METHOD_LABELS = {
+    "dashboard":     "Dashboard — GPT-4o-mini + TOML (default, come navla-aibrandmonitoring)",
     "regex":         "Regex (gratuito)",
-    "llm_openai":    "LLM — GPT-4o-mini (OpenAI)",
+    "llm_openai":    "LLM — GPT-4o-mini, output JSON (legacy)",
     "llm_anthropic": "LLM — Claude Sonnet (Anthropic)",
     "ensemble":      "Ensemble regex + LLM (con confidenza)",
 }
 
 
 def _brand_method_options(keys: dict) -> list[str]:
-    """Restituisce i metodi disponibili in base alle key configurate."""
-    opts = ["regex"]
+    """Restituisce i metodi disponibili in base alle key configurate.
+    'dashboard' (GPT-4o-mini + TOML) è il metodo di default quando la key
+    OpenAI è configurata, per parità con navla-aibrandmonitoring."""
+    opts = []
+    if keys.get("openai"):
+        opts.append("dashboard")
+    opts.append("regex")
     if keys.get("openai"):
         opts.append("llm_openai")
     if keys.get("anthropic"):
         opts.append("llm_anthropic")
-    if len(opts) > 1:
+    if len(opts) > 2:
         opts.append("ensemble")
     return opts
+
+
+def _default_brand_method(keys: dict) -> str:
+    opts = _brand_method_options(keys)
+    return "dashboard" if "dashboard" in opts else "regex"
 
 
 def _brands_regex(text: str) -> list[dict]:
@@ -309,6 +436,52 @@ def _brands_llm_anthropic(text: str, anthropic_key: str,
         return _brands_regex(text)
 
 
+def _dedup_brands(brands: list[dict]) -> list[dict]:
+    """Dedup case-insensitive: mantiene la prima occorrenza per ogni brand
+    (stessa logica di _dedup_brands in pipeline.py)."""
+    seen: dict[str, dict] = {}
+    for b in brands:
+        key = b.get("name", "").lower().strip()
+        if not key:
+            continue
+        if key not in seen:
+            b["name"] = " ".join(b["name"].strip().split())
+            seen[key] = b
+    return list(seen.values())
+
+
+def _brands_dashboard(text: str, openai_key: str) -> list[dict]:
+    """Estrazione brand identica al metodo primario di navla-aibrandmonitoring:
+    GPT-4o-mini con output TOML, poi dedup case-insensitive."""
+    if not openai_key or not tomllib:
+        return _brands_regex(text)
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {openai_key}",
+                     "Content-Type": "application/json"},
+            json={"model": "gpt-4o-mini",
+                  "messages": [{"role": "user",
+                                "content": DASHBOARD_BRAND_PROMPT.format(text=text[:8000])}],
+                  "max_tokens": 1000, "temperature": 0},
+            timeout=30,
+        )
+        r.raise_for_status()
+        toml_str = r.json()["choices"][0]["message"]["content"].strip()
+        toml_str = re.sub(r"^```[a-z]*\n?", "", toml_str, flags=re.MULTILINE)
+        toml_str = re.sub(r"\n?```$", "", toml_str, flags=re.MULTILINE)
+        data = tomllib.loads(toml_str.strip())
+        brands = [
+            {"name": b["name"], "position": b.get("position", idx + 1)}
+            for idx, b in enumerate(data.get("brands", []))
+            if b.get("name")
+        ]
+        return _dedup_brands(brands)
+    except Exception as exc:
+        log.error("Brand extraction (dashboard/TOML) failed: %s", exc)
+        return _brands_regex(text)
+
+
 def _normalize(brands: list[dict], known: list[str], threshold: int = 85) -> list[dict]:
     if not known or not brands:
         return brands
@@ -368,7 +541,9 @@ def extract_brands(
     if method == "ensemble":
         return _extract_brands_ensemble(text, keys, known, threshold, engines)
 
-    if method in ("llm_openai", "llm"):  # "llm" resta come alias retro-compatibile
+    if method == "dashboard":
+        brands = _brands_dashboard(text, keys.get("openai", ""))
+    elif method in ("llm_openai", "llm"):  # "llm" resta come alias retro-compatibile
         brands = _brands_llm_openai(text, keys.get("openai", ""))
     elif method == "llm_anthropic":
         brands = _brands_llm_anthropic(text, keys.get("anthropic", ""))
@@ -429,7 +604,8 @@ CACHE_DIR = Path(__file__).resolve().parent / ".lbm_cache"
 
 def _make_run_key(questions: list[dict], config: dict, known_brands: list[str],
                   brand_method: str, language: str, country: str,
-                  brand_threshold: int) -> str:
+                  brand_threshold: int, collect: str = "both",
+                  aio_input: str = "keyword", aim_input: str = "question") -> str:
     payload = {
         "questions": [(q.get("question", ""), q.get("keyword", "")) for q in questions],
         "llms": sorted(config.get("llms", [])),
@@ -441,6 +617,9 @@ def _make_run_key(questions: list[dict], config: dict, known_brands: list[str],
         "language": language,
         "country": country,
         "brand_threshold": brand_threshold,
+        "collect": collect,
+        "aio_input": aio_input,
+        "aim_input": aim_input,
     }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
@@ -498,6 +677,11 @@ def run_monitor(
     progress_cb: Optional[Callable] = None,
     brand_threshold: int = 85,
     cache_key: Optional[str] = None,
+    collect: str = "both",              # "brands" | "sources" | "both" — come pipeline.py
+    aio_input: str = "keyword",         # "keyword" | "question" — come pipeline.py
+    aim_input: str = "question",        # "keyword" | "question" — come pipeline.py
+    max_workers: int = 4,               # come pipeline.max_workers nella dashboard
+    delay: float = 1.0,                 # come pipeline.request_delay_seconds nella dashboard
 ) -> dict:
     llms       = config.get("llms", [])
     ai_feats   = config.get("ai_features", [])
@@ -539,37 +723,11 @@ def run_monitor(
             "Tone": q.get("tone", ""),
         }
 
-    def _store(item_id: str, q: dict, llm_label: str, model_name: str,
-               text: str, sources: list, elapsed: float):
-        nonlocal done
-        meta = _meta(q)
-        valid = _is_valid(text)
-
-        risposte.append({**meta, "LLM": llm_label, "Model": model_name,
-                         "Risposta": text if valid else ""})
-        if valid:
-            for b in extract_brands(text, keys, known_brands, brand_method, brand_threshold):
-                brand_rows.append({**meta, "LLM": llm_label, "Model": model_name,
-                                   "Brand": b["name"], "Position": b["position"],
-                                   "Confidence": b.get("confidence", 1),
-                                   "Sources": b.get("sources", brand_method)})
-            for url in sources:
-                fonti_rows.append({**meta, "LLM": llm_label, "Model": model_name, "URL": url})
-
-        done_ids.add(item_id)
-        done += 1
-        _checkpoint()
-        if progress_cb:
-            try:
-                progress_cb(done, total, {
-                    "llm": llm_label, "model": model_name,
-                    "question": q.get("question", "")[:70],
-                    "valid": valid, "text": text,
-                    "sources": sources, "elapsed": elapsed,
-                })
-            except Exception:
-                pass
-
+    # --- Costruzione lista task (question × llm × iterazione, question × ai_feature) ---
+    # aio_input/aim_input: cosa inviare a AI Overviews/AI Mode ("keyword" o
+    # "question"), come in pipeline.py — fallback sulla domanda se la keyword
+    # è vuota.
+    tasks: list[dict] = []
     for qi, q in enumerate(questions):
         question = q.get("question", "")
 
@@ -579,40 +737,117 @@ def run_monitor(
                 item_id = f"{qi}|{llm_name}|{it}"
                 if item_id in done_ids:
                     continue
-                t0 = time.time()
-                try:
-                    if llm_name == "ChatGPT":
-                        txt, src, mn = _call_chatgpt(question, keys, sel or "gpt-4o")
-                    elif llm_name == "Claude":
-                        txt, src, mn = _call_claude(question, keys, sel or "claude-sonnet-4-6")
-                    elif llm_name == "Gemini":
-                        txt, src, mn = _call_gemini(question, keys, sel or None)
-                    elif llm_name == "Perplexity":
-                        txt, src, mn = _call_perplexity(question, keys, sel or "sonar-pro")
-                    else:
-                        txt, src, mn = f"ERROR: unknown LLM {llm_name}", [], ""
-                except Exception as exc:
-                    txt, src, mn = f"ERROR: {exc}", [], sel or ""
-                _store(item_id, q, llm_name, mn, txt, src, round(time.time() - t0, 1))
-                time.sleep(1)
+                tasks.append({"item_id": item_id, "kind": "llm", "q": q,
+                             "question": question, "name": llm_name, "sel": sel})
 
-        serp_q = q.get("keyword", "").strip() or question
+        keyword = q.get("keyword", "").strip()
+        aio_q = keyword if (aio_input == "keyword" and keyword) else question
+        aim_q = keyword if (aim_input == "keyword" and keyword) else question
         for feat in ai_feats:
             item_id = f"{qi}|FEAT:{feat}"
             if item_id in done_ids:
                 continue
-            t0 = time.time()
-            try:
-                if feat == "AI Overviews":
-                    txt, src, mn = _call_aio(serp_q, keys, language, country)
-                elif feat == "AI Mode":
-                    txt, src, mn = _call_aim(serp_q, keys, language, country)
+            query_text = aio_q if feat == "AI Overviews" else aim_q
+            tasks.append({"item_id": item_id, "kind": "feat", "q": q,
+                         "question": query_text, "name": feat, "sel": None})
+
+    def _execute(task: dict) -> dict:
+        """Eseguito in un worker thread: solo chiamate API + estrazione brand
+        (entrambe pure I/O, nessuna chiamata Streamlit — Streamlit non è
+        thread-safe, per questo tutte le scritture condivise restano nel
+        thread principale, vedi il ciclo as_completed più sotto)."""
+        t0 = time.time()
+        name = task["name"]
+        try:
+            if task["kind"] == "llm":
+                question = task["question"]
+                sel = task["sel"]
+                if name == "ChatGPT":
+                    txt, src, mn = _call_chatgpt(question, keys, sel or "gpt-4o", country)
+                elif name == "Claude":
+                    txt, src, mn = _call_claude(question, keys, sel or "claude-sonnet-4-6")
+                elif name == "Gemini":
+                    txt, src, mn = _call_gemini(question, keys, sel or None)
+                elif name == "Perplexity":
+                    txt, src, mn = _call_perplexity(question, keys, sel or "sonar-pro")
                 else:
-                    txt, src, mn = f"ERROR: unknown feature {feat}", [], ""
+                    txt, src, mn = f"ERROR: unknown LLM {name}", [], ""
+            else:
+                if name == "AI Overviews":
+                    txt, src, mn = _call_aio(task["question"], keys, language, country)
+                elif name == "AI Mode":
+                    txt, src, mn = _call_aim(task["question"], keys, language, country)
+                else:
+                    txt, src, mn = f"ERROR: unknown feature {name}", [], ""
+        except Exception as exc:
+            txt, src, mn = f"ERROR: {exc}", [], task.get("sel") or ""
+
+        brands: list[dict] = []
+        if _is_valid(txt) and collect in ("brands", "both"):
+            try:
+                brands = extract_brands(txt, keys, known_brands, brand_method, brand_threshold)
             except Exception as exc:
-                txt, src, mn = f"ERROR: {exc}", [], feat
-            _store(item_id, q, feat, mn, txt, src, round(time.time() - t0, 1))
-            time.sleep(1.5)
+                log.error("Estrazione brand fallita per task %s: %s", task["item_id"], exc)
+
+        if delay > 0:
+            time.sleep(delay)
+
+        return {
+            "item_id": task["item_id"], "q": task["q"], "label": name,
+            "model_name": mn, "text": txt, "sources": src, "brands": brands,
+            "elapsed": round(time.time() - t0, 1),
+        }
+
+    def _store(result: dict):
+        nonlocal done
+        q = result["q"]
+        meta = _meta(q)
+        text = result["text"]
+        valid = _is_valid(text)
+
+        risposte.append({**meta, "LLM": result["label"], "Model": result["model_name"],
+                         "Risposta": text if valid else ""})
+        if valid:
+            if collect in ("brands", "both"):
+                for b in result["brands"]:
+                    brand_rows.append({**meta, "LLM": result["label"], "Model": result["model_name"],
+                                       "Brand": b["name"], "Position": b["position"],
+                                       "Confidence": b.get("confidence", 1),
+                                       "Sources": b.get("sources", brand_method)})
+            if collect in ("sources", "both"):
+                for url in result["sources"]:
+                    fonti_rows.append({**meta, "LLM": result["label"],
+                                       "Model": result["model_name"], "URL": url})
+
+        done_ids.add(result["item_id"])
+        done += 1
+        _checkpoint()
+        if progress_cb:
+            try:
+                progress_cb(done, total, {
+                    "llm": result["label"], "model": result["model_name"],
+                    "question": q.get("question", "")[:70],
+                    "valid": valid, "text": text,
+                    "sources": result["sources"], "elapsed": result["elapsed"],
+                })
+            except Exception:
+                pass
+
+    # --- Esecuzione parallela ---
+    # Le chiamate API girano nei worker thread (_execute); tutte le scritture
+    # su liste condivise, cache su disco e callback verso la UI avvengono
+    # SOLO nel thread principale (qui, nel ciclo as_completed) — nessun lock
+    # esplicito necessario perché le liste sono mutate da un solo thread.
+    if tasks:
+        with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as executor:
+            futures = {executor.submit(_execute, t): t["item_id"] for t in tasks}
+            for fut in as_completed(futures):
+                try:
+                    result = fut.result()
+                except Exception as exc:
+                    log.error("Task %s fallito: %s", futures[fut], exc)
+                    continue
+                _store(result)
 
     if cache_key:
         _clear_cache(cache_key)  # run completato: il checkpoint non serve più
@@ -755,6 +990,11 @@ _DEFAULTS = {
     "lbm_country":   "it",
     "lbm_bmethod":   "regex",
     "lbm_threshold": 85,
+    "lbm_collect":   "both",       # "brands" | "sources" | "both" — come pipeline.py
+    "lbm_aio_input": "keyword",    # come pipeline.py (default consigliato per AIO)
+    "lbm_aim_input": "question",   # come pipeline.py (default consigliato per AIM)
+    "lbm_max_workers": 4,          # come pipeline.max_workers nella dashboard
+    "lbm_delay":     1.0,          # come pipeline.request_delay_seconds nella dashboard
 }
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
@@ -973,18 +1213,72 @@ with tab_cfg:
     with c_c:
         _bm_opts = _brand_method_options(st.session_state.lbm_keys)
         if st.session_state.get("lbm_bmethod") not in _bm_opts:
-            st.session_state["lbm_bmethod"] = "regex"
+            st.session_state["lbm_bmethod"] = _default_brand_method(st.session_state.lbm_keys)
         brand_method = st.selectbox(
             "Estrazione brand", _bm_opts,
             format_func=lambda x: BRAND_METHOD_LABELS.get(x, x),
             key="lbm_bmethod",
-            help="Le opzioni LLM/ensemble compaiono solo se hai configurato la relativa API key.",
+            help="'Dashboard' (GPT-4o-mini + TOML) è il metodo usato in "
+                 "navla-aibrandmonitoring ed è il default consigliato per coerenza "
+                 "tra i due tool. Le altre opzioni compaiono solo se hai configurato "
+                 "la relativa API key.",
         )
     with c_d:
         brand_threshold = st.slider(
             "Soglia fuzzy match", min_value=50, max_value=100,
             key="lbm_threshold",
-            help="Soglia RapidFuzz per normalizzare i brand estratti sulla brand list.",
+            help="Soglia RapidFuzz per normalizzare i brand estratti sulla brand list "
+                 "(la dashboard usa una soglia fissa di 85).",
+        )
+
+    c_e, c_f, c_g = st.columns(3)
+    with c_e:
+        collect = st.selectbox(
+            "Cosa estrarre", ["both", "brands", "sources"],
+            format_func=lambda x: {"both": "Brand + Fonti", "brands": "Solo Brand",
+                                   "sources": "Solo Fonti"}[x],
+            key="lbm_collect",
+            help="Come 'collect' in navla-aibrandmonitoring: puoi limitare "
+                 "l'estrazione a sole citazioni brand o sole fonti per velocizzare il run.",
+        )
+    with c_f:
+        aio_input = st.selectbox(
+            "Query per AI Overviews", ["keyword", "question"],
+            format_func=lambda x: {"keyword": "Keyword", "question": "Domanda"}[x],
+            key="lbm_aio_input",
+            help="AI Overviews risponde meglio a query brevi: 'Keyword' è il default "
+                 "consigliato (come in navla-aibrandmonitoring).",
+        )
+    with c_g:
+        aim_input = st.selectbox(
+            "Query per AI Mode", ["keyword", "question"],
+            format_func=lambda x: {"keyword": "Keyword", "question": "Domanda"}[x],
+            key="lbm_aim_input",
+            help="AI Mode è conversazionale: 'Domanda' è il default consigliato "
+                 "(come in navla-aibrandmonitoring).",
+        )
+
+    st.divider()
+    st.subheader("⚡ Esecuzione parallela")
+    st.caption(
+        "Come in navla-aibrandmonitoring: le chiamate girano in parallelo su più "
+        "thread invece che una alla volta. Un valore più alto velocizza il run "
+        "ma aumenta il rischio di rate limit sulle API."
+    )
+    c_h, c_i = st.columns(2)
+    with c_h:
+        max_workers = st.slider(
+            "Chiamate parallele (worker)", min_value=1, max_value=10,
+            key="lbm_max_workers",
+            help="Numero di chiamate API eseguite contemporaneamente. "
+                 "Il default della dashboard è 4.",
+        )
+    with c_i:
+        run_delay = st.number_input(
+            "Ritardo per chiamata (secondi)", min_value=0.0, max_value=10.0,
+            step=0.5, key="lbm_delay",
+            help="Pausa applicata da ogni worker dopo la propria chiamata, per "
+                 "restare sotto i rate limit dei provider.",
         )
 
     if st.button("💾 Salva configurazione", type="primary"):
@@ -1010,6 +1304,11 @@ with tab_run:
     lang_run    = st.session_state.get("lbm_lang", "it")
     ctry_run    = st.session_state.get("lbm_country", "it")
     thresh_run  = st.session_state.get("lbm_threshold", 85)
+    collect_run = st.session_state.get("lbm_collect", "both")
+    aio_in_run  = st.session_state.get("lbm_aio_input", "keyword")
+    aim_in_run  = st.session_state.get("lbm_aim_input", "question")
+    max_workers_run = st.session_state.get("lbm_max_workers", 4)
+    delay_run   = st.session_state.get("lbm_delay", 1.0)
 
     warns = []
     if not questions:
@@ -1026,20 +1325,28 @@ with tab_run:
         mods   = config_run.get("models", {})
         total_c = len(questions) * (len(llms_r) * iters + len(ai_r))
 
+        _collect_label = {"both": "Brand + Fonti", "brands": "Solo Brand",
+                          "sources": "Solo Fonti"}.get(collect_run, collect_run)
         st.markdown(
             f"**Riepilogo:**  \n"
             f"- Domande: **{len(questions)}** · "
             f"LLM: **{', '.join(llms_r) or '—'}** × {iters} iter · "
             f"AI Features: **{', '.join(ai_r) or '—'}** × 1  \n"
             f"- Totale chiamate: **{total_c}** · "
-            f"Brand list: **{len(known_run)}** brand"
+            f"Brand list: **{len(known_run)}** brand  \n"
+            f"- Estrazione: **{BRAND_METHOD_LABELS.get(bmethod_run, bmethod_run)}** · "
+            f"Raccolta: **{_collect_label}** · "
+            f"AIO da: **{aio_in_run}** · AIM da: **{aim_in_run}**  \n"
+            f"- Esecuzione parallela: **{max_workers_run}** worker · "
+            f"Ritardo per chiamata: **{delay_run}s**"
         )
         if mods and llms_r:
             st.caption("Modelli: " +
                        "  ·  ".join(f"{k}: `{v}`" for k, v in mods.items() if k in llms_r))
 
         run_key = _make_run_key(questions, config_run, known_run, bmethod_run,
-                                lang_run, ctry_run, thresh_run)
+                                lang_run, ctry_run, thresh_run,
+                                collect_run, aio_in_run, aim_in_run)
         cache_info = _cache_status(run_key)
         resume_clicked = False
 
@@ -1124,6 +1431,11 @@ with tab_run:
                     progress_cb=_cb,
                     brand_threshold=thresh_run,
                     cache_key=run_key,
+                    collect=collect_run,
+                    aio_input=aio_in_run,
+                    aim_input=aim_in_run,
+                    max_workers=max_workers_run,
+                    delay=delay_run,
                 )
                 st.session_state.lbm_results = results
                 progress.progress(1.0, text="✅ Completato!")
@@ -1173,7 +1485,7 @@ with tab_preview:
         rc_keys = st.session_state.lbm_keys
         rc_opts = _brand_method_options(rc_keys)
         if st.session_state.get("lbm_rc_method") not in rc_opts:
-            st.session_state["lbm_rc_method"] = "regex"
+            st.session_state["lbm_rc_method"] = _default_brand_method(rc_keys)
 
         rc1, rc2, rc3 = st.columns(3)
         with rc1:
@@ -1200,10 +1512,10 @@ with tab_preview:
             help="Puoi modificarla qui senza toccare quella salvata nel tab Input.",
         )
 
-        needs_openai = rc_method in ("llm_openai", "ensemble") and not rc_keys.get("openai")
+        needs_openai = rc_method in ("dashboard", "llm_openai", "ensemble") and not rc_keys.get("openai")
         needs_anthropic = rc_method in ("llm_anthropic", "ensemble") and not rc_keys.get("anthropic")
         can_rc = rc_method == "regex" or rc_keys.get("openai") or rc_keys.get("anthropic")
-        if rc_method == "llm_openai" and needs_openai:
+        if rc_method in ("dashboard", "llm_openai") and needs_openai:
             can_rc = False
             st.warning("⚠️ Nessuna API key OpenAI configurata (tab Configurazione).")
         if rc_method == "llm_anthropic" and needs_anthropic:
