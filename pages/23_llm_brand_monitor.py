@@ -1208,7 +1208,7 @@ with tab_cfg:
         language = st.selectbox("Lingua", ["it", "en", "de", "fr", "es", "ja"],
                                key="lbm_lang")
     with c_b:
-        country = st.selectbox("Paese", ["it", "us", "gb", "de", "fr", "jp"],
+        country = st.selectbox("Paese", ["it", "us", "gb", "de", "fr", "es", "jp"],
                                key="lbm_country")
     with c_c:
         _bm_opts = _brand_method_options(st.session_state.lbm_keys)
