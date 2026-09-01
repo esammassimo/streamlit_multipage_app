@@ -12,6 +12,8 @@ import os
 import json as _json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import requests
+from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from core_4cast import (
     normalize_url, canonical_url,
@@ -142,7 +144,7 @@ for key in [
     # T — Technical
     'tech_df', 'tech_result_df',
     # ALL — Recommendations (registro cross-CAST)
-    'rec_files', 'rec_all_df',
+    'rec_files', 'rec_all_df', 'rec_tags_df',
     # LLM config (persisted across tabs)
     'llm_provider', 'llm_key', 'llm_model', 'llm_mode',
 ]:
@@ -558,6 +560,32 @@ METRIC_CATALOG: Dict[str, dict] = {
 }
 
 
+# ── Alias colonne raccomandazione ─────────────────────────────────────────────
+#  Nell'export WSX il nome della colonna score e quello della colonna
+#  raccomandazione non sempre coincidono: 'Meta Tags - Score' ma
+#  'Meta Tags Optimisation - Recommendation'.
+REC_COL_ALIAS: Dict[str, str] = {
+    'Meta Tags':      'Meta Tags Optimisation',
+    'Relevance':      'Relevance & UX',
+    'Heading':        'Heading Structure',
+    'Grammar':        'Grammar & Spelling',
+}
+
+#  Sentinella WSX: la metrica non richiede intervento anche se lo score < 100.
+ALREADY_OK = 'already optimized'
+
+#  Metriche il cui intervento modifica testo o contenuto visibile in pagina:
+#  per queste il registro può ospitare un suggerimento concreto e pubblicabile.
+FRONTEND_METRICS = {
+    'Meta Tags',        # title + meta description
+    'Relevance',        # struttura e copy del contenuto
+    'Heading',          # H1 e gerarchia heading
+    'Grammar',          # correzioni ortografiche puntuali
+    'Unique Content',   # UVP e paragrafo differenziante
+    'FAQ',              # coppie domanda/risposta visibili in pagina
+}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  CATALOGO → DataFrame
 # ══════════════════════════════════════════════════════════════════════════════
@@ -573,6 +601,7 @@ def catalog_dataframe() -> pd.DataFrame:
             'Pilastro':         p['name'],
             'Metrica WSX':      metric,
             'Tipo intervento':  meta['kind'],
+            'Front-end':        'Sì' if metric in FRONTEND_METRICS else 'No',
             'Owner':            meta['owner'],
             'Peso':             meta['weight'],
             'Page type attesi': ', '.join(meta['applies_to']) if meta['applies_to'] else 'Tutti',
@@ -631,7 +660,7 @@ def detect_brand(df: pd.DataFrame, filename: str = '') -> str:
 
 def score_columns(df: pd.DataFrame, pillar: str) -> Dict[str, str]:
     """
-    Mappa {nome metrica catalogo → nome reale colonna} per le sotto-metriche
+    Mappa {nome metrica catalogo → nome reale colonna score} per le sotto-metriche
     del pilastro presenti nel DataFrame. Gestisce sia il formato 2026
     ('Meta Tags - Score') sia quello legacy ('Meta Tags').
     """
@@ -647,6 +676,53 @@ def score_columns(df: pd.DataFrame, pillar: str) -> Dict[str, str]:
                 out[metric] = real
                 break
     return out
+
+
+def text_columns(df: pd.DataFrame, pillar: str) -> Dict[str, dict]:
+    """
+    Mappa {metrica → {'rec', 'nice', 'jsonld'}} con i nomi reali delle colonne
+    testuali dell'export. Chiavi assenti se la colonna non esiste nel file.
+
+    Gli export precedenti al rilascio di settembre 2026 non hanno queste
+    colonne: in quel caso il dizionario torna vuoto e l'estrazione ricade
+    sulla sola soglia di score.
+    """
+    out: Dict[str, dict] = {}
+    lookup = {str(c).strip().lower(): c for c in df.columns}
+    for metric, meta in METRIC_CATALOG.items():
+        if meta['pillar'] != pillar:
+            continue
+        base = REC_COL_ALIAS.get(metric, metric)
+        found = {}
+        for key, suffixes in (
+            ('rec',    [' - Recommendation']),
+            ('nice',   [' - Nice to Have Recommendation']),
+            ('jsonld', [' - JSON-LD Template']),
+        ):
+            for name in {base, metric}:
+                for suf in suffixes:
+                    real = lookup.get(f'{name}{suf}'.strip().lower())
+                    if real:
+                        found[key] = real
+                        break
+                if key in found:
+                    break
+        if found:
+            out[metric] = found
+    return out
+
+
+def _clean_text(v) -> str:
+    """Normalizza una cella testuale WSX: NaN e 'nan' diventano stringa vuota."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ''
+    s = str(v).replace('\u200b', '').strip()
+    return '' if s.lower() in ('nan', 'none', '') else s
+
+
+def is_already_ok(text: str) -> bool:
+    """True se WSX dichiara la metrica già a posto per quella URL."""
+    return _clean_text(text).lower() == ALREADY_OK
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -764,14 +840,21 @@ def explode_recommendations(df: pd.DataFrame, pillar: Optional[str] = None,
                             filename: str = '',
                             threshold: float = DEFAULT_THRESHOLD,
                             include_compliant: bool = False,
-                            include_na: bool = False) -> pd.DataFrame:
+                            include_na: bool = False,
+                            trust_wsx_text: bool = True) -> pd.DataFrame:
     """
     Trasforma un export WSX (1 riga = 1 URL) in formato long:
-    1 riga = 1 raccomandazione (URL × sotto-metrica sotto soglia).
+    1 riga = 1 raccomandazione (URL × sotto-metrica).
 
-    threshold          : score sotto il quale la metrica diventa raccomandazione
-    include_compliant  : include anche le metriche già conformi (per audit completo)
-    include_na         : include le metriche non applicabili al page type (score NaN)
+    Criterio di inclusione, in ordine di precedenza:
+
+    1. **Colonna `<metrica> - Recommendation` presente** (export ≥ set. 2026):
+       fa fede il verdetto di WSX. Testo valorizzato e diverso da
+       "Already optimized" → raccomandazione. Vale anche con score 100,
+       e non vale con score basso ma testo "Already optimized".
+    2. **Colonna assente** (export legacy): ricade sulla soglia di score.
+
+    trust_wsx_text=False forza il criterio 2 anche quando il testo c'è.
     """
     pillar = pillar or detect_pillar(df, filename)
     if not pillar:
@@ -780,14 +863,17 @@ def explode_recommendations(df: pd.DataFrame, pillar: Optional[str] = None,
     brand_fb = detect_brand(df, filename)
     pmeta    = PILLARS[pillar]
     smap     = score_columns(df, pillar)
-    if not smap:
+    tmap     = text_columns(df, pillar) if trust_wsx_text else {}
+    if not smap and not tmap:
         return pd.DataFrame()
 
     overall_col = pmeta['score_col'] if pmeta['score_col'] in df.columns else None
     mom_col     = pmeta['mom_col']   if pmeta['mom_col']   in df.columns else None
+    seo_col     = 'SEO Impressions (Google Search Console)'
+    sess_col    = 'All Sessions (Google Analytics)'
 
-    seo_col  = 'SEO Impressions (Google Search Console)'
-    sess_col = 'All Sessions (Google Analytics)'
+    metrics = sorted(set(smap) | set(tmap),
+                     key=lambda m: METRIC_CATALOG[m]['id'])
 
     rows: List[dict] = []
     for _, r in df.iterrows():
@@ -798,26 +884,55 @@ def explode_recommendations(df: pd.DataFrame, pillar: Optional[str] = None,
         mom       = _num(r.get(mom_col)) if mom_col else None
         overall   = _num(r.get(overall_col)) if overall_col else None
 
-        for metric, col in smap.items():
-            score = _num(r.get(col))
+        for metric in metrics:
             meta  = METRIC_CATALOG[metric]
+            score = _num(r.get(smap[metric])) if metric in smap else None
+            cols  = tmap.get(metric, {})
 
-            if score is None:
-                if not include_na:
-                    continue
-                sev, prio, pscore = '— N/A', '— N/A', 0
-                act = (f'Metrica {metric} non rilevata da WSX per il page type '
-                       f'{page_type or "n/d"}. Verificare se applicabile.')
-            elif score >= threshold and not include_compliant:
-                continue
-            elif score >= threshold:
-                sev, act = '✅ Conforme', f'{metric} conforme. Mantenere e monitorare nel tempo.'
-                prio, pscore = '🟢 Bassa', 0
+            wsx_rec  = _clean_text(r.get(cols['rec']))    if 'rec'    in cols else ''
+            wsx_nice = _clean_text(r.get(cols['nice']))   if 'nice'   in cols else ''
+            jsonld   = _clean_text(r.get(cols['jsonld'])) if 'jsonld' in cols else ''
+
+            has_text_col = 'rec' in cols
+            already_ok   = is_already_ok(wsx_rec)
+
+            # ── decide se la riga è una raccomandazione ─────────────────────
+            if has_text_col:
+                fonte = 'WSX Recommendation'
+                if already_ok:
+                    if not include_compliant:
+                        continue
+                    sev, prio, pscore = '✅ Conforme', '🟢 Bassa', 0
+                    act = f'{metric}: WSX dichiara la metrica già ottimizzata. Monitorare.'
+                elif not wsx_rec:
+                    if not include_na:
+                        continue
+                    sev, prio, pscore = '— N/A', '— N/A', 0
+                    act = (f'Metrica {metric} non valutata da WSX per il page type '
+                           f'{page_type or "n/d"}. Verificare se applicabile.')
+                else:
+                    sev = severity_of(score) if score is not None else '🟠 Da valutare'
+                    prio, pscore = priority_of(score if score is not None else 50,
+                                               metric, page_type, seo_impr, sessions, mom)
+                    act = action_text(metric, score, page_type)
             else:
-                sev = severity_of(score)
-                prio, pscore = priority_of(score, metric, page_type,
-                                           seo_impr, sessions, mom)
-                act = action_text(metric, score, page_type)
+                fonte = 'Score < soglia'
+                if score is None:
+                    if not include_na:
+                        continue
+                    sev, prio, pscore = '— N/A', '— N/A', 0
+                    act = (f'Metrica {metric} non rilevata da WSX per il page type '
+                           f'{page_type or "n/d"}. Verificare se applicabile.')
+                elif score >= threshold and not include_compliant:
+                    continue
+                elif score >= threshold:
+                    sev, prio, pscore = '✅ Conforme', '🟢 Bassa', 0
+                    act = f'{metric} conforme. Mantenere e monitorare nel tempo.'
+                else:
+                    sev = severity_of(score)
+                    prio, pscore = priority_of(score, metric, page_type,
+                                               seo_impr, sessions, mom)
+                    act = action_text(metric, score, page_type)
 
             rows.append({
                 'CAST':               pillar,
@@ -829,15 +944,21 @@ def explode_recommendations(df: pd.DataFrame, pillar: Optional[str] = None,
                 'URL':                url,
                 'Page Type':          page_type,
                 'Metrica':            metric,
+                'Front-end':          'Sì' if metric in FRONTEND_METRICS else 'No',
                 'Tipo intervento':    meta['kind'],
                 'Owner':              meta['owner'],
                 'Score metrica':      score,
                 'Gap (100-score)':    None if score is None else round(100 - score, 2),
                 'Score pilastro':     overall,
                 'Δ MoM pilastro':     mom,
+                'Fonte':              fonte,
                 'Severità':           sev,
                 'Priorità':           prio,
                 'Priority Score':     pscore,
+                'Raccomandazione WSX': wsx_rec,
+                'Nice to Have WSX':    wsx_nice,
+                'JSON-LD Template':    jsonld,
+                'Suggerimento':        '',
                 'Azione consigliata': act,
                 'Goal':               meta['goal'],
                 'Must Have':          meta['must_have'],
@@ -858,7 +979,8 @@ def explode_recommendations(df: pd.DataFrame, pillar: Optional[str] = None,
 def build_all_recommendations(files: List[Tuple[str, pd.DataFrame]],
                               threshold: float = DEFAULT_THRESHOLD,
                               include_compliant: bool = False,
-                              include_na: bool = False) -> pd.DataFrame:
+                              include_na: bool = False,
+                              trust_wsx_text: bool = True) -> pd.DataFrame:
     """
     Esplode e concatena più export WSX (brand × pilastro) in un unico
     registro di raccomandazioni.
@@ -871,7 +993,8 @@ def build_all_recommendations(files: List[Tuple[str, pd.DataFrame]],
             continue
         ex = explode_recommendations(df, filename=fname, threshold=threshold,
                                      include_compliant=include_compliant,
-                                     include_na=include_na)
+                                     include_na=include_na,
+                                     trust_wsx_text=trust_wsx_text)
         if not ex.empty:
             parts.append(ex)
     if not parts:
@@ -940,6 +1063,458 @@ def to_excel_workbook(sheets: Dict[str, pd.DataFrame]) -> bytes:
                     width = 18
                 ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = width
     return buf.getvalue()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FRONT-END SUGGESTION GENERATOR
+# ══════════════════════════════════════════════════════════════════════════════
+#  Per le metriche che richiedono una modifica al testo o al contenuto visibile
+#  della pagina (FRONTEND_METRICS) il registro non si limita a riportare la
+#  raccomandazione WSX: produce il valore già scritto, pronto da pubblicare.
+#
+#  Input della generazione:
+#    · la raccomandazione WSX per quella URL e quella metrica (specifica,
+#      in inglese, con riferimenti al contenuto reale della pagina)
+#    · il Nice to Have WSX, quando presente
+#    · i valori attualmente in pagina, letti col crawl (opzionale ma consigliato)
+#
+#  Output per metrica:
+#    Meta Tags       → title + meta description
+#    Heading         → H1 + outline H2/H3
+#    Relevance       → paragrafo di apertura + sezioni con bullet
+#    Grammar         → tabella di correzioni da → a
+#    Unique Content  → UVP + paragrafo differenziante
+#    FAQ             → coppie domanda/risposta
+#
+#  Le metriche non front-end restano con la sola raccomandazione WSX.
+# ══════════════════════════════════════════════════════════════════════════════
+
+H1_MIN, H1_MAX = 30, 70
+
+_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+       '(KHTML, like Gecko) Chrome/124.0 Safari/537.36')
+
+
+def fetch_page_tags(url: str, timeout: int = 15) -> dict:
+    """
+    Legge dalla pagina live i contenuti on-page utili alla riscrittura.
+    Non solleva eccezioni: in caso di errore valorizza 'http_status', così la
+    riga resta nel report invece di sparire.
+    """
+    out = {'http_status': '', 'title_now': '', 'desc_now': '', 'h1_now': '',
+           'h1_count': 0, 'outline_now': '', 'body_excerpt': '',
+           'lang_attr': '', 'canonical': ''}
+    if not url:
+        out['http_status'] = 'URL mancante'
+        return out
+    try:
+        r = requests.get(url, timeout=timeout, headers={'User-Agent': _UA},
+                         allow_redirects=True)
+        out['http_status'] = str(r.status_code)
+        if r.status_code != 200:
+            return out
+        r.encoding = r.encoding or 'utf-8'
+        soup = BeautifulSoup(r.text, 'html.parser')
+
+        if soup.title and soup.title.string:
+            out['title_now'] = soup.title.string.strip()
+
+        md = (soup.find('meta', attrs={'name': 'description'})
+              or soup.find('meta', attrs={'property': 'og:description'}))
+        if md and md.get('content'):
+            out['desc_now'] = md['content'].strip()
+
+        h1s = [h.get_text(' ', strip=True) for h in soup.find_all('h1')]
+        h1s = [h for h in h1s if h]
+        out['h1_count'] = len(h1s)
+        out['h1_now'] = ' ⏐ '.join(h1s[:3])
+
+        outline = []
+        for tag in soup.find_all(['h1', 'h2', 'h3']):
+            txt = tag.get_text(' ', strip=True)
+            if txt:
+                outline.append(f'{tag.name.upper()}: {txt}')
+        out['outline_now'] = '\n'.join(outline[:40])
+
+        for junk in soup(['script', 'style', 'noscript', 'nav', 'footer']):
+            junk.decompose()
+        body = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+        out['body_excerpt'] = body[:3000]
+
+        html_tag = soup.find('html')
+        if html_tag and html_tag.get('lang'):
+            out['lang_attr'] = html_tag['lang']
+
+        can = soup.find('link', attrs={'rel': 'canonical'})
+        if can and can.get('href'):
+            out['canonical'] = can['href']
+
+    except requests.Timeout:
+        out['http_status'] = 'timeout'
+    except Exception as exc:
+        out['http_status'] = f'errore: {type(exc).__name__}'
+    return out
+
+
+# ─── Prompt per metrica ───────────────────────────────────────────────────────
+
+_COMMON_RULES = (
+    "- Non inventare proprietà, ingredienti, percentuali, prezzi, promozioni o "
+    "certificazioni che non compaiano già nei contenuti forniti.\n"
+    "- Mantieni invariati nome prodotto, formato, concentrazione e claim "
+    "regolamentati.\n"
+    "- Nessuna parola in inglese salvo nomi prodotto, brand e termini tecnici "
+    "consolidati (SPF, INCI, retinolo)."
+)
+
+
+def _ctx_block(url, brand, market, page_type, score, page) -> str:
+    lines = [
+        f"URL: {url}",
+        f"Brand: {brand or 'n/d'} · Mercato: {market or 'n/d'} · "
+        f"Tipo pagina: {page_type or 'n/d'}",
+    ]
+    if score is not None and pd.notna(score):
+        lines.append(f"Score WSX della metrica: {float(score):.0f}/100")
+    if page.get('http_status') == '200':
+        lines += ['', 'CONTENUTI ATTUALI IN PAGINA:',
+                  f"Title: {page.get('title_now') or '(assente)'}",
+                  f"Meta description: {page.get('desc_now') or '(assente)'}",
+                  f"H1 ({page.get('h1_count', 0)}): {page.get('h1_now') or '(nessuno)'}"]
+        if page.get('outline_now'):
+            lines += ['Struttura heading:', page['outline_now'][:1500]]
+        if page.get('body_excerpt'):
+            lines += ['Estratto del testo:', page['body_excerpt'][:1800]]
+    else:
+        lines += ['', '(pagina non letta: lavora sulla sola raccomandazione WSX '
+                  'e sullo slug URL, restando prudente)']
+    return '\n'.join(lines)
+
+
+def _prompt_frontend(metric, url, target_lang, brand, market, page_type,
+                     score, wsx_rec, wsx_nice, page) -> str:
+    """Costruisce il prompt di riscrittura per una metrica front-end."""
+    spec = {
+        'Meta Tags': (
+            f"- Title: {TITLE_MIN}-{TITLE_MAX} caratteri, keyword principale nelle "
+            f"prime 3 parole, separatore | prima del brand.\n"
+            f"- Description: {DESC_MIN}-{DESC_MAX} caratteri, con call to action "
+            f"finale.\n"
+            "- Il testo deve essere unico rispetto alle altre pagine dello stesso tipo.",
+            '{"title": "...", "description": "..."}',
+        ),
+        'Heading': (
+            f"- H1: uno solo, {H1_MIN}-{H1_MAX} caratteri, con la keyword "
+            "principale, senza call to action, non identico al meta title.\n"
+            "- Outline: sequenza logica di H2/H3 che sostituisce quella attuale, "
+            "eliminando heading di servizio (privacy, cookie) e duplicati.\n"
+            "- Massimo 12 voci di outline.",
+            '{"h1": "...", "outline": [{"level": "H2", "text": "..."}]}',
+        ),
+        'Relevance': (
+            "- Paragrafo di apertura: risponde all'intento primario nelle prime "
+            "due frasi, con dati concreti se disponibili nei contenuti forniti.\n"
+            "- Sezioni: da 2 a 5, ciascuna con titolo e 2-4 bullet.\n"
+            "- Riordina e riformula i contenuti già presenti; non aggiungerne di nuovi.",
+            '{"intro": "...", "sections": [{"heading": "...", "bullets": ["..."]}]}',
+        ),
+        'Grammar': (
+            "- Elenca solo correzioni puntuali e verificabili nei contenuti forniti.\n"
+            "- Ogni voce ha il testo errato esatto e la sua correzione.\n"
+            "- Se non trovi errori certi, restituisci una lista vuota.",
+            '{"corrections": [{"from": "...", "to": "...", "note": "..."}]}',
+        ),
+        'Unique Content': (
+            "- UVP: una frase che dichiara perché questa pagina esiste e in cosa "
+            "differisce dalle pagine simili del sito.\n"
+            "- Paragrafo: 60-100 parole di contenuto differenziante, da inserire "
+            "sopra la piega.",
+            '{"uvp": "...", "paragraph": "..."}',
+        ),
+        'FAQ': (
+            "- Da 3 a 5 coppie domanda/risposta pertinenti alla pagina.\n"
+            "- Risposte di 40-60 parole, con la risposta nella prima frase.\n"
+            "- Le domande devono essere formulate come le porrebbe un utente.",
+            '{"faqs": [{"q": "...", "a": "..."}]}',
+        ),
+    }
+    rules, schema = spec.get(metric, ('', '{"suggerimento": "..."}'))
+
+    lines = [
+        f"Sei un consulente SEO senior. Applica a questa pagina la "
+        f"raccomandazione WSX sulla metrica «{metric}», scrivendo il contenuto "
+        f"definitivo in {target_lang}.",
+        '',
+        _ctx_block(url, brand, market, page_type, score, page),
+        '',
+        'RACCOMANDAZIONE WSX DA APPLICARE:',
+        (wsx_rec or '(non fornita)')[:1500],
+    ]
+    if wsx_nice:
+        lines += ['', 'NICE TO HAVE WSX:', wsx_nice[:600]]
+    lines += [
+        '', 'REGOLE:',
+        f"- Scrivi interamente in {target_lang}.",
+        rules,
+        _COMMON_RULES,
+        '',
+        'Restituisci SOLO un oggetto JSON valido, senza backtick e senza commenti:',
+        schema,
+    ]
+    return '\n'.join(l for l in lines if l)
+
+
+def _parse_json_reply(raw: str) -> dict:
+    """Estrae un oggetto JSON dalla risposta LLM, tollerando fence e preamboli."""
+    if not raw:
+        return {}
+    txt = re.sub(r'^```(?:json)?|```$', '', str(raw).strip(), flags=re.M).strip()
+    try:
+        return _json.loads(txt)
+    except Exception:
+        pass
+    m = re.search(r'\{.*\}', txt, re.S)
+    if m:
+        try:
+            return _json.loads(m.group(0))
+        except Exception:
+            pass
+    return {}
+
+
+def _flatten_suggestion(metric: str, data: dict) -> str:
+    """Rende leggibile in una cella di foglio il suggerimento strutturato."""
+    if not data:
+        return ''
+    try:
+        if metric == 'Meta Tags':
+            return (f"TITLE: {data.get('title','')}\n"
+                    f"DESCRIPTION: {data.get('description','')}")
+        if metric == 'Heading':
+            out = [f"H1: {data.get('h1','')}"]
+            for h in data.get('outline', []):
+                out.append(f"{h.get('level','H2')}: {h.get('text','')}")
+            return '\n'.join(out)
+        if metric == 'Relevance':
+            out = [f"APERTURA: {data.get('intro','')}"]
+            for s in data.get('sections', []):
+                out.append(f"\n{s.get('heading','')}")
+                out += [f"  · {b}" for b in s.get('bullets', [])]
+            return '\n'.join(out)
+        if metric == 'Grammar':
+            return '\n'.join(
+                f"«{c.get('from','')}» → «{c.get('to','')}»"
+                + (f"  ({c.get('note')})" if c.get('note') else '')
+                for c in data.get('corrections', [])) or 'Nessuna correzione certa individuata'
+        if metric == 'Unique Content':
+            return f"UVP: {data.get('uvp','')}\n\n{data.get('paragraph','')}"
+        if metric == 'FAQ':
+            return '\n\n'.join(f"D: {f.get('q','')}\nR: {f.get('a','')}"
+                               for f in data.get('faqs', []))
+    except Exception:
+        pass
+    return _json.dumps(data, ensure_ascii=False)
+
+
+def _faq_jsonld(data: dict) -> str:
+    """Costruisce il JSON-LD FAQPage dalle coppie generate."""
+    faqs = data.get('faqs') or []
+    if not faqs:
+        return ''
+    return _json.dumps({
+        '@context': 'https://schema.org',
+        '@type': 'FAQPage',
+        'mainEntity': [{
+            '@type': 'Question', 'name': f.get('q', ''),
+            'acceptedAnswer': {'@type': 'Answer', 'text': f.get('a', '')},
+        } for f in faqs],
+    }, ensure_ascii=False, indent=2)
+
+
+def _frontend_row_worker(args: dict) -> tuple:
+    """
+    Elabora UNA url: crawl (una volta sola) + generazione per ciascuna
+    metrica front-end con raccomandazione aperta. Thread-safe.
+    """
+    url  = args['url']
+    page = (fetch_page_tags(url, timeout=args.get('timeout', 15))
+            if args['do_crawl'] else {'http_status': 'non crawlata'})
+
+    results, notes = {}, []
+
+    for metric, item in args['items'].items():
+        if not args['use_llm']:
+            continue
+        try:
+            reply = _call_llm(
+                _prompt_frontend(
+                    metric=metric, url=url, target_lang=args['target_lang'],
+                    brand=args['brand'], market=args['market'],
+                    page_type=args['page_type'], score=item.get('score'),
+                    wsx_rec=item.get('rec', ''), wsx_nice=item.get('nice', ''),
+                    page=page),
+                provider=args['provider'], api_key=args['api_key'],
+                model=args['model'], max_tokens=1500)
+            data = _parse_json_reply(reply)
+            if not data:
+                notes.append(f'{metric}: risposta LLM non parsabile')
+            results[metric] = data
+        except Exception as exc:
+            notes.append(f'{metric}: {type(exc).__name__}')
+            results[metric] = {}
+
+    if args['do_crawl'] and page.get('http_status') == '200':
+        if page.get('h1_count', 0) > 1:
+            notes.append(f"{page['h1_count']} H1 in pagina — rimuovere i duplicati")
+        if page.get('h1_count', 0) == 0:
+            notes.append('nessun H1 in pagina')
+        if not page.get('desc_now'):
+            notes.append('meta description assente')
+
+    meta_d = results.get('Meta Tags', {}) or {}
+    head_d = results.get('Heading', {}) or {}
+    faq_d  = results.get('FAQ', {}) or {}
+
+    title_new = str(meta_d.get('title', '') or '').strip()
+    desc_new  = str(meta_d.get('description', '') or '').strip()
+    h1_new    = str(head_d.get('h1', '') or '').strip().strip('"\u201c\u201d')
+
+    row = {
+        'Brand':      args['brand'],
+        'Market':     args['market'],
+        'Language':   args['language'],
+        'URL':        url,
+        'Page Type':  args['page_type'],
+        'Metriche front-end': ' · '.join(sorted(args['items'])),
+        'Priority Score':     args['priority'],
+        'HTTP':               page.get('http_status', ''),
+        # Meta tags
+        'Title attuale':      page.get('title_now', ''),
+        'Len title now':      clen(page.get('title_now', '')),
+        'Title suggerito':    title_new,
+        'Len title new':      clen(title_new),
+        'Title status':       len_status(clen(title_new), TITLE_MIN, TITLE_MAX),
+        'Description attuale':   page.get('desc_now', ''),
+        'Len desc now':          clen(page.get('desc_now', '')),
+        'Description suggerita': desc_new,
+        'Len desc new':          clen(desc_new),
+        'Desc status':           len_status(clen(desc_new), DESC_MIN, DESC_MAX),
+        # Heading
+        'H1 attuale':     page.get('h1_now', ''),
+        'N. H1':          page.get('h1_count', 0),
+        'H1 suggerito':   h1_new,
+        'Len h1 new':     clen(h1_new),
+        'H1 status':      len_status(clen(h1_new), H1_MIN, H1_MAX),
+        'Outline suggerito': _flatten_suggestion('Heading', head_d).split('\n', 1)[-1]
+                             if head_d.get('outline') else '',
+        # Altre metriche front-end
+        'Relevance — copy suggerito':   _flatten_suggestion('Relevance', results.get('Relevance', {})),
+        'Grammar — correzioni':         _flatten_suggestion('Grammar', results.get('Grammar', {})),
+        'Unique Content — suggerito':   _flatten_suggestion('Unique Content', results.get('Unique Content', {})),
+        'FAQ — coppie suggerite':       _flatten_suggestion('FAQ', faq_d),
+        'FAQ — JSON-LD pronto':         _faq_jsonld(faq_d),
+        # Contesto
+        'lang attr':  page.get('lang_attr', ''),
+        'Canonical':  page.get('canonical', ''),
+        'Note':       ' ; '.join(notes),
+        '_raw':       {m: d for m, d in results.items()},
+    }
+    return args['idx'], row
+
+
+def build_frontend_suggestions(recs: pd.DataFrame, limit: int = 30,
+                               metrics: Optional[List[str]] = None,
+                               do_crawl: bool = True, use_llm: bool = True,
+                               provider: str = 'anthropic', api_key: str = None,
+                               model: str = None, n_workers: int = 4,
+                               timeout: int = 15,
+                               target_lang_override: str = '') -> pd.DataFrame:
+    """
+    Genera i contenuti pronti da pubblicare per le URL che hanno almeno una
+    raccomandazione aperta su una metrica front-end.
+
+    Una URL viene crawlata UNA volta sola, poi si genera solo per le metriche
+    che per quella URL hanno effettivamente una raccomandazione WSX aperta.
+    """
+    if recs is None or recs.empty:
+        return pd.DataFrame()
+
+    wanted = set(metrics) if metrics else set(FRONTEND_METRICS)
+    sub = recs[recs['Metrica'].isin(wanted)]
+    if 'Front-end' in sub.columns:
+        sub = sub[sub['Front-end'] == 'Sì']
+    if sub.empty:
+        return pd.DataFrame()
+
+    grouped = []
+    for (url, brand), g in sub.groupby(['URL', 'Brand'], dropna=False):
+        r0 = g.iloc[0]
+        items = {}
+        for _, rr in g.iterrows():
+            items[rr['Metrica']] = {
+                'score': rr.get('Score metrica'),
+                'rec':   rr.get('Raccomandazione WSX', '') or '',
+                'nice':  rr.get('Nice to Have WSX', '') or '',
+            }
+        grouped.append({
+            'url': url, 'brand': brand, 'items': items,
+            'market':    r0.get('Market', ''),
+            'language':  r0.get('Language', ''),
+            'page_type': r0.get('Page Type', ''),
+            'priority':  int(g['Priority Score'].max()),
+        })
+
+    grouped.sort(key=lambda d: d['priority'], reverse=True)
+    if limit:
+        grouped = grouped[:limit]
+
+    jobs = []
+    for i, d in enumerate(grouped):
+        tgt = target_lang_override or page_language(d['language']) or 'italiano'
+        jobs.append({'idx': i, **d, 'target_lang': tgt,
+                     'do_crawl': do_crawl, 'use_llm': use_llm,
+                     'provider': provider, 'api_key': api_key,
+                     'model': model, 'timeout': timeout})
+
+    rows = _run_parallel(_frontend_row_worker, jobs, n_workers,
+                         progress_label='Generazione suggerimenti')
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out.drop(columns=['_raw'], errors='ignore')
+    return out.sort_values('Priority Score', ascending=False).reset_index(drop=True)
+
+
+def merge_suggestions_into_register(recs: pd.DataFrame,
+                                    sugg: pd.DataFrame) -> pd.DataFrame:
+    """Riporta i suggerimenti generati nella colonna 'Suggerimento' del registro."""
+    if recs is None or recs.empty or sugg is None or sugg.empty:
+        return recs
+    col_by_metric = {
+        'Meta Tags':      lambda r: (f"TITLE: {r['Title suggerito']}\\n"
+                                     f"DESCRIPTION: {r['Description suggerita']}"
+                                     if r['Title suggerito'] or r['Description suggerita'] else ''),
+        'Heading':        lambda r: (f"H1: {r['H1 suggerito']}\\n{r['Outline suggerito']}"
+                                     if r['H1 suggerito'] else ''),
+        'Relevance':      lambda r: r['Relevance — copy suggerito'],
+        'Grammar':        lambda r: r['Grammar — correzioni'],
+        'Unique Content': lambda r: r['Unique Content — suggerito'],
+        'FAQ':            lambda r: r['FAQ — coppie suggerite'],
+    }
+    out = recs.copy()
+    idx = {(r['URL'], r['Brand']): r for _, r in sugg.iterrows()}
+    for i, row in out.iterrows():
+        m = row['Metrica']
+        if m not in col_by_metric:
+            continue
+        s = idx.get((row['URL'], row['Brand']))
+        if s is None:
+            continue
+        try:
+            out.at[i, 'Suggerimento'] = col_by_metric[m](s) or ''
+        except Exception:
+            pass
+    return out
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROW WORKERS  —  funzioni pure (no Streamlit), eseguibili in thread pool
@@ -3320,10 +3895,11 @@ with _tab_t:
 
 with _tab_all:
 
-    _r_setup, _r_reg, _r_cat = st.tabs([
+    _r_setup, _r_reg, _r_tag, _r_cat = st.tabs([
         '01 · Caricamento & Registro',
         '02 · Analisi per CAST',
-        '03 · Catalogo raccomandazioni',
+        '03 · Suggerimenti front-end',
+        '04 · Catalogo raccomandazioni',
     ])
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -3417,6 +3993,12 @@ applicabili al page type e vengono escluse, salvo diversa impostazione.
                 _inc_na = st.toggle('Includi N/A', value=False, key='rec_na',
                                     help='Aggiunge le metriche non applicabili al '
                                          'page type (score assente).')
+                _trust = st.toggle(
+                    'Usa il verdetto WSX', value=True, key='rec_trust',
+                    help='Attivo: fa fede la colonna <metrica> - Recommendation, '
+                         'ignorando le righe marcate "Already optimized". '
+                         'Disattivo: usa solo la soglia di score (comportamento '
+                         'necessario sugli export privi di quelle colonne).')
 
             if st.button('▶ Estrai tutte le raccomandazioni', key='rec_run',
                          type='primary'):
@@ -3424,6 +4006,7 @@ applicabili al page type e vengono escluse, salvo diversa impostazione.
                     st.session_state['rec_all_df'] = build_all_recommendations(
                         _files, threshold=_thr,
                         include_compliant=_inc_ok, include_na=_inc_na,
+                        trust_wsx_text=_trust,
                     )
 
         _recs = st.session_state.get('rec_all_df')
@@ -3437,7 +4020,7 @@ applicabili al page type e vengono escluse, salvo diversa impostazione.
             metrics_row(_recs, {
                 'Raccomandazioni': len(_recs),
                 'URL coinvolte':   _recs['URL'].nunique(),
-                'Brand':           _recs['Brand'].nunique(),
+                'Front-end':       int((_recs['Front-end'] == 'Sì').sum()),
                 'Metriche':        _recs['Metrica'].nunique(),
                 'Critiche':        int(_pc.get('🔴 Critica', 0)),
                 'Alte':            int(_pc.get('🟠 Alta', 0)),
@@ -3484,6 +4067,7 @@ applicabili al page type e vengono escluse, salvo diversa impostazione.
             with _f6:
                 _fmin = st.number_input('Priority Score minimo', 0, 100, 0, 5,
                                         key='rec_fmin')
+                _ffe = st.checkbox('Solo metriche front-end', key='rec_ffe')
 
             _flt = _recs.copy()
             if _fb:  _flt = _flt[_flt['Brand'].isin(_fb)]
@@ -3492,13 +4076,14 @@ applicabili al page type e vengono escluse, salvo diversa impostazione.
             if _fpr: _flt = _flt[_flt['Priorità'].isin(_fpr)]
             if _fm:  _flt = _flt[_flt['Metrica'].isin(_fm)]
             if _fmin: _flt = _flt[_flt['Priority Score'] >= _fmin]
+            if _ffe:  _flt = _flt[_flt['Front-end'] == 'Sì']
 
             st.caption(f'{len(_flt)} raccomandazioni su {len(_recs)} · '
                        f"{_flt['URL'].nunique()} URL distinte")
 
-            _show = ['CAST', 'ID', 'Brand', 'Page Type', 'Metrica', 'Score metrica',
-                     'Gap (100-score)', 'Severità', 'Priorità', 'Priority Score',
-                     'URL', 'Azione consigliata']
+            _show = ['CAST', 'ID', 'Brand', 'Page Type', 'Metrica', 'Front-end',
+                     'Score metrica', 'Severità', 'Priorità', 'Priority Score',
+                     'URL', 'Raccomandazione WSX', 'Azione consigliata']
             st.dataframe(_flt[_show], use_container_width=True, hide_index=True,
                          height=460)
 
@@ -3521,6 +4106,7 @@ applicabili al page type e vengono escluse, salvo diversa impostazione.
                     'A - Authority':   _recs[_recs['CAST'] == 'A'],
                     'S - Structure':   _recs[_recs['CAST'] == 'S'],
                     'T - Technicals':  _recs[_recs['CAST'] == 'T'],
+                    'Front-end':       _recs[_recs['Front-end'] == 'Sì'],
                     'Metrica x PageType': pivot_metric_by_pagetype(_recs),
                     'Catalogo':        catalog_dataframe(),
                 }
@@ -3618,8 +4204,227 @@ applicabili al page type e vengono escluse, salvo diversa impostazione.
                         st.markdown(f"*Must Have:* {_meta['must_have']}")
                         st.divider()
 
+
     # ──────────────────────────────────────────────────────────────────────────
-    #  03 · CATALOGO RACCOMANDAZIONI
+    #  03 · SUGGERIMENTI FRONT-END
+    # ──────────────────────────────────────────────────────────────────────────
+    with _r_tag:
+        _recs = st.session_state.get('rec_all_df')
+
+        with st.expander('ℹ️ Come funziona', expanded=False):
+            st.markdown("""
+Per le metriche che richiedono una modifica al **testo o al contenuto visibile**
+della pagina, il registro non si ferma alla raccomandazione WSX: produce il
+contenuto già scritto nella lingua della pagina, pronto da pubblicare.
+
+| Metrica | Output generato |
+|---|---|
+| **C01 Meta Tags** | Title + Meta Description |
+| **C02 Relevance** | Paragrafo di apertura + sezioni con bullet |
+| **C03 Heading** | H1 + outline H2/H3 |
+| **C04 Grammar** | Tabella di correzioni «da → a» |
+| **C05 Unique Content** | UVP + paragrafo differenziante |
+| **S10 FAQ** | Coppie D/R + JSON-LD FAQPage pronto |
+
+Tutte le altre metriche (backlink, sitemap, page speed, schema Product…)
+restano con la raccomandazione WSX: l'intervento non è testuale.
+
+La generazione parte dalla **raccomandazione WSX di quella specifica URL**, che
+negli export da settembre 2026 è puntuale e cita il contenuto reale della
+pagina. Il **crawl** aggiunge i valori attualmente pubblicati: senza, il modello
+lavora solo sulla raccomandazione e va riletto tutto a mano.
+
+⚠️ Il crawl richiede che le URL siano raggiungibili dalla macchina su cui gira
+l'app. In caso di 403 sistematici (bot protection su CDN) esegui l'app in locale.
+""")
+
+        if _recs is None or _recs.empty:
+            st.info('Nessun registro in memoria: esegui prima l\'estrazione '
+                    'nella tab «01 · Caricamento & Registro».')
+        else:
+            _cand = _recs[_recs['Metrica'].isin(FRONTEND_METRICS)]
+            if 'Front-end' in _cand.columns:
+                _cand = _cand[_cand['Front-end'] == 'Sì']
+
+            _has_wsx_text = (_recs['Raccomandazione WSX'].astype(str).str.len() > 0).any()
+            if not _has_wsx_text:
+                st.warning(
+                    'I file caricati non contengono le colonne '
+                    '`<metrica> - Recommendation`: sono export precedenti a '
+                    'settembre 2026. I suggerimenti verranno generati dal solo '
+                    'contenuto della pagina, con qualità inferiore.')
+
+            if _cand.empty:
+                st.warning('Nessuna raccomandazione front-end aperta nel registro attuale.')
+            else:
+                _n_url = _cand['URL'].nunique()
+                _by_m = _cand['Metrica'].value_counts()
+                metrics_row(_cand, {
+                    'URL candidate':  _n_url,
+                    'Meta Tags':      int(_by_m.get('Meta Tags', 0)),
+                    'Heading':        int(_by_m.get('Heading', 0)),
+                    'Relevance':      int(_by_m.get('Relevance', 0)),
+                    'FAQ':            int(_by_m.get('FAQ', 0)),
+                    'Altre':          int(_by_m.get('Grammar', 0) + _by_m.get('Unique Content', 0)),
+                })
+                st.markdown('<br>', unsafe_allow_html=True)
+
+                st.markdown('<div class="section-label">Parametri</div>',
+                            unsafe_allow_html=True)
+
+                _sel_m = st.multiselect(
+                    'Metriche da generare',
+                    sorted(_cand['Metrica'].unique()),
+                    default=sorted(_cand['Metrica'].unique()),
+                    key='fe_metrics',
+                    help='Ogni metrica selezionata costa una chiamata LLM per URL.')
+
+                _t1, _t2, _t3, _t4 = st.columns([1.3, 1, 1, 1])
+                with _t1:
+                    _lim = st.number_input(
+                        'URL da elaborare (per priorità)', 1, int(_n_url),
+                        min(30, int(_n_url)), 10, key='fe_lim')
+                with _t2:
+                    _crawl = st.toggle('Crawl pagine', value=True, key='fe_crawl')
+                with _t3:
+                    _tllm = st.toggle('Genera con LLM', value=True, key='fe_llm')
+                with _t4:
+                    _tto = st.number_input('Timeout (s)', 5, 60, 15, 5, key='fe_to')
+
+                _l1, _l2 = st.columns([1, 2])
+                with _l1:
+                    _lang_ovr = st.text_input(
+                        'Forza lingua output', value='', key='fe_lang',
+                        placeholder='es. italiano — vuoto = lingua della pagina')
+                with _l2:
+                    _tbrand = st.multiselect(
+                        'Limita ai brand', sorted(_cand['Brand'].dropna().unique()),
+                        key='fe_brand')
+
+                _cand_f = _cand[_cand['Brand'].isin(_tbrand)] if _tbrand else _cand
+                if _sel_m:
+                    _cand_f = _cand_f[_cand_f['Metrica'].isin(_sel_m)]
+
+                _n_calls = len(_cand_f[_cand_f['URL'].isin(
+                    _cand_f.drop_duplicates('URL')['URL'].head(int(_lim)))])
+                st.caption(f'Stima: ~{_n_calls} chiamate LLM '
+                           f'({int(_lim)} URL × metriche aperte su ciascuna)')
+
+                if _tllm and not _API_KEY and not os.getenv(
+                        'ANTHROPIC_API_KEY' if _PROVIDER == 'anthropic' else 'OPENAI_API_KEY'):
+                    st.warning('Nessuna API key rilevata per il provider selezionato: '
+                               'inseriscila nella sidebar o disattiva «Genera con LLM».')
+
+                if st.button('▶ Genera suggerimenti', key='fe_run', type='primary'):
+                    with st.spinner('Crawl e generazione in corso…'):
+                        st.session_state['rec_tags_df'] = build_frontend_suggestions(
+                            _cand_f, limit=int(_lim), metrics=_sel_m or None,
+                            do_crawl=_crawl, use_llm=_tllm,
+                            provider=_PROVIDER, api_key=_API_KEY, model=_MODEL,
+                            n_workers=_N_WORKERS, timeout=int(_tto),
+                            target_lang_override=_lang_ovr.strip())
+
+            _tags = st.session_state.get('rec_tags_df')
+
+            if _tags is not None and not _tags.empty:
+                st.markdown('<br>', unsafe_allow_html=True)
+                st.markdown('<div class="section-label">Esito</div>',
+                            unsafe_allow_html=True)
+
+                def _filled(col):
+                    return int((_tags[col].astype(str).str.len() > 0).sum()) \
+                        if col in _tags.columns else 0
+
+                _ok_http = int((_tags['HTTP'] == '200').sum())
+                metrics_row(_tags, {
+                    'URL elaborate':  len(_tags),
+                    'Crawl OK':       _ok_http,
+                    'Title':          _filled('Title suggerito'),
+                    'H1':             _filled('H1 suggerito'),
+                    'Copy Relevance': _filled('Relevance — copy suggerito'),
+                    'FAQ':            _filled('FAQ — coppie suggerite'),
+                })
+                st.markdown('<br>', unsafe_allow_html=True)
+
+                if _ok_http < len(_tags):
+                    _bad = _tags[_tags['HTTP'] != '200']['HTTP'].value_counts().to_dict()
+                    st.warning(f'Crawl non riuscito su {len(_tags) - _ok_http} URL: {_bad}. '
+                               'I suggerimenti di queste righe nascono dalla sola '
+                               'raccomandazione WSX e vanno verificati uno a uno.')
+
+                _vw = st.radio(
+                    'Vista',
+                    ['Meta tags', 'Heading', 'Relevance', 'Grammar & Unique', 'FAQ', 'Completa'],
+                    horizontal=True, key='fe_view')
+                _views = {
+                    'Meta tags': ['Brand', 'Page Type', 'URL', 'HTTP',
+                                  'Title attuale', 'Len title now', 'Title suggerito',
+                                  'Len title new', 'Title status',
+                                  'Description attuale', 'Description suggerita',
+                                  'Len desc new', 'Desc status'],
+                    'Heading':   ['Brand', 'Page Type', 'URL', 'N. H1', 'H1 attuale',
+                                  'H1 suggerito', 'Len h1 new', 'H1 status',
+                                  'Outline suggerito', 'Note'],
+                    'Relevance': ['Brand', 'Page Type', 'URL', 'Relevance — copy suggerito'],
+                    'Grammar & Unique': ['Brand', 'URL', 'Grammar — correzioni',
+                                         'Unique Content — suggerito'],
+                    'FAQ':       ['Brand', 'Page Type', 'URL', 'FAQ — coppie suggerite',
+                                  'FAQ — JSON-LD pronto'],
+                    'Completa':  list(_tags.columns),
+                }
+                _cols = [c for c in _views[_vw] if c in _tags.columns]
+                st.dataframe(_tags[_cols], use_container_width=True,
+                             hide_index=True, height=480)
+
+                if 'Title status' in _tags.columns:
+                    _fuori = _tags[
+                        (_tags['Title status'].isin(['TOO SHORT', 'TOO LONG'])) |
+                        (_tags['Desc status'].isin(['TOO SHORT', 'TOO LONG']))]
+                    if len(_fuori):
+                        with st.expander(f'⚠️ {len(_fuori)} meta tag fuori dai limiti '
+                                         f'di lunghezza — correggere prima di pubblicare'):
+                            st.dataframe(
+                                _fuori[['URL', 'Title suggerito', 'Len title new',
+                                        'Title status', 'Description suggerita',
+                                        'Len desc new', 'Desc status']],
+                                use_container_width=True, hide_index=True)
+
+                st.markdown('<div class="section-label">Export</div>',
+                            unsafe_allow_html=True)
+                _x1, _x2, _x3 = st.columns(3)
+                with _x1:
+                    _up = _tags[[c for c in
+                                 ['URL', 'Title suggerito', 'Description suggerita',
+                                  'H1 suggerito'] if c in _tags.columns]].copy()
+                    _up.columns = ['URL', 'Title', 'Meta Description', 'H1'][:len(_up.columns)]
+                    st.download_button(
+                        '⬇ Tracciato CMS (.xlsx)', data=to_excel_bytes(_up),
+                        file_name='suggerimenti_meta_h1.xlsx',
+                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                        type='primary', use_container_width=True)
+                with _x2:
+                    st.download_button(
+                        '⬇ Report completo (.xlsx)', data=to_excel_bytes(_tags),
+                        file_name='suggerimenti_frontend_report.xlsx',
+                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                        use_container_width=True)
+                with _x3:
+                    _merged = merge_suggestions_into_register(_recs, _tags)
+                    st.download_button(
+                        '⬇ Registro + suggerimenti (.xlsx)',
+                        data=to_excel_workbook({
+                            'Riepilogo CAST': summarize_by_cast(_merged),
+                            'Tutte le racc.': _merged,
+                            'Front-end':      _merged[_merged['Front-end'] == 'Sì'],
+                            'Suggerimenti':   _tags,
+                            'Catalogo':       catalog_dataframe(),
+                        }),
+                        file_name='wsx_registro_con_suggerimenti.xlsx',
+                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                        use_container_width=True)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  04 · CATALOGO RACCOMANDAZIONI
     # ──────────────────────────────────────────────────────────────────────────
     with _r_cat:
         st.markdown('<div class="section-label">Catalogo delle raccomandazioni WSX per tipo CAST</div>',
