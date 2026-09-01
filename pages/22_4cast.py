@@ -11,6 +11,7 @@ import io
 import os
 import json as _json
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from core_4cast import (
     normalize_url, canonical_url,
@@ -140,6 +141,8 @@ for key in [
     'struct_df', 'struct_result_df',
     # T — Technical
     'tech_df', 'tech_result_df',
+    # ALL — Recommendations (registro cross-CAST)
+    'rec_files', 'rec_all_df',
     # LLM config (persisted across tabs)
     'llm_provider', 'llm_key', 'llm_model', 'llm_mode',
 ]:
@@ -171,6 +174,772 @@ def _wsx_score(row, col):
         return int(float(v)) if v is not None and pd.notna(v) else None
     except (ValueError, TypeError):
         return None
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  RECOMMENDATION ENGINE  —  esplosione di TUTTE le raccomandazioni WSX
+# ══════════════════════════════════════════════════════════════════════════════
+#  Il formato export WSX 2026 non contiene più le colonne
+#  `Top Recommendation - *` (una sola raccomandazione per URL): contiene
+#  invece lo score di OGNI sotto-metrica del pilastro. Ogni sotto-metrica
+#  sotto soglia è a tutti gli effetti una raccomandazione.
+#
+#  Questo blocco trasforma il formato wide (1 riga = 1 URL, N colonne score)
+#  in formato long (1 riga = 1 raccomandazione), calcola severità e priorità
+#  e genera il testo dell'azione consigliata.
+#
+#  Funzioni pure: nessuna chiamata Streamlit, eseguibili anche in thread pool.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PILASTRI CAST
+# ══════════════════════════════════════════════════════════════════════════════
+
+PILLARS: Dict[str, dict] = {
+    'C': {
+        'code': 'C', 'name': 'Context',
+        'label': 'C — Context',
+        'score_col': 'Context - Score',
+        'mom_col': 'Context MoM',
+        'file_token': 'Context',
+        'icon': '📝',
+        'desc': 'Qualità e pertinenza del contenuto on-page: meta tag, '
+                'heading, rilevanza, unicità, correttezza linguistica.',
+    },
+    'A': {
+        'code': 'A', 'name': 'Authority',
+        'label': 'A — Authority',
+        'score_col': 'Authority - Score',
+        'mom_col': 'Authority MoM',
+        'file_token': 'Authority',
+        'icon': '🔗',
+        'desc': "Autorevolezza della pagina: link interni, profilo backlink, "
+                "segnali di fiducia (recensioni, rating) e freschezza.",
+    },
+    'S': {
+        'code': 'S', 'name': 'Structure',
+        'label': 'S — Structure',
+        'score_col': 'Structure - Score',
+        'mom_col': 'Structure MoM',
+        'file_token': 'Structure',
+        'icon': '🏗️',
+        'desc': 'Dati strutturati JSON-LD: copertura e completezza degli '
+                'schema richiesti dal page type.',
+    },
+    'T': {
+        'code': 'T', 'name': 'Technicals',
+        'label': 'T — Technicals',
+        'score_col': 'Technicals - Score',
+        'mom_col': 'Technicals MoM',
+        'file_token': 'Technicals',
+        'icon': '⚙️',
+        'desc': 'Salute tecnica dell’URL: presenza in sitemap, performance '
+                'di caricamento, validità dei link in ingresso.',
+    },
+}
+
+# Prefissi file → brand (estendibile)
+BRAND_PREFIX: Dict[str, str] = {
+    'BIO': 'Biotherm',
+    'VIC': 'Vichy',
+    'LRP': 'La Roche-Posay',
+    'CER': 'CeraVe',
+    'SKC': 'SkinCeuticals',
+    'LAN': 'Lancôme',
+    'KIE': 'Kiehl’s',
+}
+
+# Prefisso file → pilastro
+PILLAR_PREFIX: Dict[str, str] = {'C': 'C', 'A': 'A', 'S': 'S', 'T': 'T'}
+
+# Peso del page type sulla priorità (0-100)
+PAGETYPE_WEIGHT: Dict[str, int] = {
+    'Homepage':     40,
+    'PDP':          35,
+    'PLP':          30,
+    'Landing Page': 20,
+    'Content Page': 15,
+}
+PAGETYPE_WEIGHT_DEFAULT = 10
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CATALOGO RACCOMANDAZIONI  —  24 metriche WSX classificate per CAST
+# ══════════════════════════════════════════════════════════════════════════════
+#  Ogni voce:
+#    pillar      : C | A | S | T
+#    id          : codice raccomandazione stabile (es. C01)
+#    weight      : peso della metrica nel calcolo di priorità (0-100)
+#    kind        : 'content' | 'link' | 'schema' | 'tech'  (tipo di intervento)
+#    owner       : team che esegue l'intervento
+#    applies_to  : page type per cui la metrica è attesa ([] = tutti)
+#    goal        : obiettivo WSX della metrica
+#    must_have   : criterio di conformità WSX
+#    action      : template azione consigliata; supporta {score} {gap}
+#                  {page_type} {url} {status}
+# ══════════════════════════════════════════════════════════════════════════════
+
+METRIC_CATALOG: Dict[str, dict] = {
+
+    # ─────────────────────────────── C — CONTEXT ──────────────────────────────
+    'Meta Tags': {
+        'pillar': 'C', 'id': 'C01', 'weight': 30, 'kind': 'content',
+        'owner': 'SEO / Content',
+        'applies_to': [],
+        'goal': 'Title e meta description unici, di lunghezza corretta e '
+                'allineati alla keyword primaria della pagina.',
+        'must_have': 'Title 50-60 caratteri, Meta Description 140-155 caratteri, '
+                     'keyword primaria presente, nessun duplicato nel sito.',
+        'action': 'Riscrivere Title e Meta Description (score {score}/100). '
+                  'Portare il Title a 50-60 caratteri e la Description a 140-155, '
+                  'inserire la keyword primaria in apertura ed evitare duplicazioni '
+                  'con le altre {page_type}.',
+    },
+    'Relevance': {
+        'pillar': 'C', 'id': 'C02', 'weight': 25, 'kind': 'content',
+        'owner': 'Content',
+        'applies_to': [],
+        'goal': 'Il contenuto della pagina copre in modo esaustivo l’intento '
+                'di ricerca della keyword primaria.',
+        'must_have': 'Keyword primaria e varianti semantiche nel body, copertura '
+                     'delle domande correlate, volume di testo utile adeguato al page type.',
+        'action': 'Ampliare e riallineare il contenuto all’intento di ricerca '
+                  '(score {score}/100, gap {gap} punti). Integrare varianti semantiche, '
+                  'sezioni FAQ e copy descrittivo sopra la fold della {page_type}.',
+    },
+    'Heading': {
+        'pillar': 'C', 'id': 'C03', 'weight': 20, 'kind': 'content',
+        'owner': 'SEO / Front-end',
+        'applies_to': [],
+        'goal': 'Gerarchia dei titoli corretta e semanticamente descrittiva.',
+        'must_have': 'Un solo H1 per pagina, gerarchia H1→H2→H3 senza salti di livello, '
+                     'keyword primaria nell’H1 e varianti negli H2.',
+        'action': 'Correggere la struttura degli heading (score {score}/100). '
+                  'Verificare la presenza di un unico H1, eliminare i salti di livello '
+                  'e rendere gli H2 descrittivi rispetto alle sezioni di contenuto.',
+    },
+    'Grammar': {
+        'pillar': 'C', 'id': 'C04', 'weight': 10, 'kind': 'content',
+        'owner': 'Content / Copy',
+        'applies_to': [],
+        'goal': 'Testo privo di errori ortografici, grammaticali e di refusi.',
+        'must_have': 'Nessun errore rilevato dal controllo linguistico WSX sulla '
+                     'lingua dichiarata nella pagina.',
+        'action': 'Revisione linguistica del copy (score {score}/100). '
+                  'Correggere refusi ed errori grammaticali; verificare che la lingua '
+                  'del testo coincida con quella dichiarata nell’attributo lang.',
+    },
+    'Unique Content': {
+        'pillar': 'C', 'id': 'C05', 'weight': 15, 'kind': 'content',
+        'owner': 'Content / SEO',
+        'applies_to': [],
+        'goal': 'Contenuto originale, non duplicato rispetto ad altre URL del dominio.',
+        'must_have': 'Nessuna sovrapposizione sostanziale di testo con altre pagine '
+                     'del sito o con la scheda prodotto di partenza.',
+        'action': 'Riscrivere il contenuto duplicato (score {score}/100). '
+                  'Differenziare descrizione e copy rispetto alle pagine simili; '
+                  'in alternativa valutare canonical o consolidamento dell’URL.',
+    },
+
+    # ────────────────────────────── A — AUTHORITY ─────────────────────────────
+    'Internal Linking': {
+        'pillar': 'A', 'id': 'A01', 'weight': 30, 'kind': 'link',
+        'owner': 'SEO',
+        'applies_to': [],
+        'goal': 'La pagina riceve un numero adeguato di link interni con anchor pertinenti.',
+        'must_have': 'Inlink da pagine tematicamente affini, anchor text descrittiva '
+                     'e non generica, profondità di click contenuta rispetto alla home.',
+        'action': 'Rafforzare il link interno verso l’URL (score {score}/100, '
+                  'gap {gap} punti). Aggiungere link contestuali da PLP, articoli e hub '
+                  'di territorio correlati, con anchor descrittive e non generiche.',
+    },
+    'Backlinking Quality': {
+        'pillar': 'A', 'id': 'A02', 'weight': 20, 'kind': 'link',
+        'owner': 'SEO / Digital PR',
+        'applies_to': [],
+        'goal': 'Il profilo backlink della pagina proviene da domini autorevoli e pertinenti.',
+        'must_have': 'Domini referenti con autorevolezza e affinità tematica adeguate, '
+                     'assenza di pattern di link a basso valore.',
+        'action': 'Migliorare la qualità del profilo backlink (score {score}/100). '
+                  'Pianificare attività di digital PR su domini autorevoli del settore '
+                  'beauty/skincare e disconoscere i referenti a basso valore.',
+    },
+    'Backlinking Quantity': {
+        'pillar': 'A', 'id': 'A03', 'weight': 15, 'kind': 'link',
+        'owner': 'SEO / Digital PR',
+        'applies_to': [],
+        'goal': 'La pagina dispone di un numero di domini referenti adeguato alla concorrenza.',
+        'must_have': 'Numero di referring domain in linea con le pagine competitor '
+                     'posizionate sulle stesse keyword.',
+        'action': 'Aumentare il numero di domini referenti (score {score}/100). '
+                  'Inserire l’URL nei piani di link earning e nelle citazioni di prodotto; '
+                  'valutare redirect e consolidamento dei link storici.',
+    },
+    'Reviews Count': {
+        'pillar': 'A', 'id': 'A04', 'weight': 15, 'kind': 'content',
+        'owner': 'E-commerce / CRM',
+        'applies_to': ['PDP'],
+        'goal': 'La scheda prodotto raccoglie un volume di recensioni sufficiente '
+                'a generare segnali di fiducia e rich result.',
+        'must_have': 'Recensioni verificate visibili in pagina e dichiarate '
+                     'in AggregateRating nel JSON-LD.',
+        'action': 'Incrementare la raccolta recensioni sulla scheda (score {score}/100). '
+                  'Attivare i flussi post-acquisto di sollecito e verificare che le '
+                  'recensioni raccolte siano esposte anche nel markup AggregateRating.',
+    },
+    'Rating Value': {
+        'pillar': 'A', 'id': 'A05', 'weight': 10, 'kind': 'content',
+        'owner': 'E-commerce',
+        'applies_to': ['PDP'],
+        'goal': 'Il rating medio del prodotto è competitivo e correttamente esposto.',
+        'must_have': 'Valore medio del rating presente in pagina e coerente con '
+                     'il valore dichiarato nello structured data.',
+        'action': 'Verificare ed esporre il rating medio (score {score}/100). '
+                  'Controllare la coerenza tra il valore mostrato in pagina e '
+                  'ratingValue nel JSON-LD; presidiare i prodotti con media bassa.',
+    },
+    'Content Freshness': {
+        'pillar': 'A', 'id': 'A06', 'weight': 10, 'kind': 'content',
+        'owner': 'Content',
+        'applies_to': ['Content Page', 'Landing Page'],
+        'goal': 'Il contenuto è aggiornato di recente e ne è dichiarata la data.',
+        'must_have': 'dateModified valorizzato e coerente, aggiornamento sostanziale '
+                     'del contenuto entro l’orizzonte previsto per la tipologia.',
+        'action': 'Aggiornare il contenuto e la data di modifica (score {score}/100). '
+                  'Rivedere dati, immagini e riferimenti stagionali, poi valorizzare '
+                  'dateModified nel JSON-LD e nel CMS.',
+    },
+
+    # ────────────────────────────── S — STRUCTURE ─────────────────────────────
+    'Organization': {
+        'pillar': 'S', 'id': 'S01', 'weight': 20, 'kind': 'schema',
+        'owner': 'Front-end / SEO',
+        'applies_to': ['Homepage'],
+        'goal': 'Entità di brand dichiarata a motori e LLM tramite schema Organization.',
+        'must_have': 'JSON-LD Organization con name, url, logo, sameAs dei profili '
+                     'ufficiali e contactPoint.',
+        'action': 'Implementare o completare il JSON-LD Organization (score {score}/100). '
+                  'Valorizzare name, url, logo, contactPoint e sameAs verso i profili '
+                  'social e le property ufficiali del brand.',
+    },
+    'Collection Page': {
+        'pillar': 'S', 'id': 'S02', 'weight': 20, 'kind': 'schema',
+        'owner': 'Front-end / SEO',
+        'applies_to': ['PLP'],
+        'goal': 'Le pagine di listing sono dichiarate come CollectionPage/ItemList.',
+        'must_have': 'JSON-LD CollectionPage con ItemList degli elementi in listing, '
+                     'position e url di ciascun item.',
+        'action': 'Implementare il JSON-LD CollectionPage sulla {page_type} '
+                  '(score {score}/100). Includere ItemList con position e url '
+                  'dei prodotti esposti nel listing.',
+    },
+    'Breadcrumb': {
+        'pillar': 'S', 'id': 'S03', 'weight': 25, 'kind': 'schema',
+        'owner': 'Front-end',
+        'applies_to': [],
+        'goal': 'Il percorso di navigazione è dichiarato e mostrabile nei rich result.',
+        'must_have': 'JSON-LD BreadcrumbList con itemListElement ordinati, '
+                     'coerenti con il percorso reale e con URL assoluti.',
+        'action': 'Implementare il JSON-LD BreadcrumbList (score {score}/100). '
+                  'Dichiarare itemListElement ordinati con URL assoluti, coerenti '
+                  'con la struttura di navigazione visibile in pagina.',
+    },
+    'Product Basic': {
+        'pillar': 'S', 'id': 'S04', 'weight': 35, 'kind': 'schema',
+        'owner': 'Front-end / E-commerce',
+        'applies_to': ['PDP'],
+        'goal': 'Il prodotto è dichiarato con le proprietà base dello schema Product.',
+        'must_have': 'JSON-LD Product con name, image, description, sku, brand.',
+        'action': 'Completare le proprietà base dello schema Product '
+                  '(score {score}/100). Verificare name, image, description, sku e brand '
+                  'e la loro coerenza con il contenuto visibile della PDP.',
+    },
+    'Product Advanced': {
+        'pillar': 'S', 'id': 'S05', 'weight': 30, 'kind': 'schema',
+        'owner': 'Front-end / E-commerce',
+        'applies_to': ['PDP'],
+        'goal': 'Il prodotto espone anche le proprietà avanzate utili ai rich result.',
+        'must_have': 'gtin/mpn, color, size, material, additionalProperty e '
+                     'isVariantOf/hasVariant quando applicabile.',
+        'action': 'Estendere lo schema Product alle proprietà avanzate '
+                  '(score {score}/100). Aggiungere gtin/mpn, attributi di variante '
+                  'e additionalProperty per formato e INCI.',
+    },
+    'Rating & Values': {
+        'pillar': 'S', 'id': 'S06', 'weight': 20, 'kind': 'schema',
+        'owner': 'Front-end / E-commerce',
+        'applies_to': ['PDP'],
+        'goal': 'Recensioni e valutazioni sono dichiarate in modo idoneo ai rich result.',
+        'must_have': 'AggregateRating con ratingValue, reviewCount, bestRating, '
+                     'coerenti con le recensioni visibili in pagina.',
+        'action': 'Implementare AggregateRating nel JSON-LD (score {score}/100). '
+                  'Dichiarare ratingValue, reviewCount e bestRating allineati alle '
+                  'recensioni realmente mostrate nella PDP.',
+    },
+    'Offer': {
+        'pillar': 'S', 'id': 'S07', 'weight': 25, 'kind': 'schema',
+        'owner': 'Front-end / E-commerce',
+        'applies_to': ['PDP'],
+        'goal': 'Prezzo e disponibilità sono dichiarati e aggiornati.',
+        'must_have': 'Offer con price, priceCurrency, availability, priceValidUntil '
+                     'e url, coerenti con il prezzo esposto.',
+        'action': 'Implementare il nodo Offer nello schema Product '
+                  '(score {score}/100). Valorizzare price, priceCurrency, availability '
+                  'e priceValidUntil, sincronizzati con il feed e-commerce.',
+    },
+    'Article': {
+        'pillar': 'S', 'id': 'S08', 'weight': 20, 'kind': 'schema',
+        'owner': 'Front-end / Content',
+        'applies_to': ['Content Page'],
+        'goal': 'I contenuti editoriali sono dichiarati come Article.',
+        'must_have': 'JSON-LD Article con headline, image, datePublished, '
+                     'dateModified e publisher.',
+        'action': 'Implementare il JSON-LD Article sulla {page_type} '
+                  '(score {score}/100). Valorizzare headline, image, datePublished, '
+                  'dateModified e publisher.',
+    },
+    'Author': {
+        'pillar': 'S', 'id': 'S09', 'weight': 15, 'kind': 'schema',
+        'owner': 'Front-end / Content',
+        'applies_to': ['Content Page'],
+        'goal': 'La paternità del contenuto è dichiarata — segnale E-E-A-T rilevante '
+                'anche per la citazione da parte degli LLM.',
+        'must_have': 'Nodo author di tipo Person con name, url e, dove disponibile, '
+                     'jobTitle e sameAs verso una pagina autore.',
+        'action': 'Dichiarare l’autore nello structured data (score {score}/100). '
+                  'Aggiungere author di tipo Person con name, url della pagina autore '
+                  'e sameAs; creare la pagina autore se assente.',
+    },
+    'FAQ': {
+        'pillar': 'S', 'id': 'S10', 'weight': 15, 'kind': 'schema',
+        'owner': 'Front-end / Content',
+        'applies_to': [],
+        'goal': 'Le domande frequenti sono dichiarate e utilizzabili come risposta '
+                'diretta da motori e assistenti generativi.',
+        'must_have': 'JSON-LD FAQPage con coppie Question/acceptedAnswer '
+                     'realmente visibili in pagina.',
+        'action': 'Implementare il JSON-LD FAQPage (score {score}/100). '
+                  'Pubblicare in pagina almeno tre coppie domanda/risposta pertinenti '
+                  'e dichiararle in mainEntity.',
+    },
+
+    # ───────────────────────────── T — TECHNICALS ─────────────────────────────
+    'Sitemap Declaration': {
+        'pillar': 'T', 'id': 'T01', 'weight': 30, 'kind': 'tech',
+        'owner': 'SEO / IT',
+        'applies_to': [],
+        'goal': 'Ogni URL indicizzabile è dichiarata nella sitemap XML.',
+        'must_have': 'URL presente in sitemap, status 200, nessun redirect 301, '
+                     'nessuna 404, coerenza con il canonical.',
+        'action': 'Inserire l’URL nella sitemap XML (score {score}/100). '
+                  'Verificare che restituisca 200 senza redirect, che il canonical '
+                  'sia autoreferenziale e risottomettere la sitemap in Search Console.',
+    },
+    'Page Speed': {
+        'pillar': 'T', 'id': 'T02', 'weight': 40, 'kind': 'tech',
+        'owner': 'Front-end / IT',
+        'applies_to': [],
+        'goal': 'La pagina rispetta le soglie Core Web Vitals su mobile.',
+        'must_have': 'LCP ≤ 2,5 s, INP ≤ 200 ms, CLS ≤ 0,1 su dati field mobile.',
+        'action': 'Intervenire sulle performance di caricamento (score {score}/100). '
+                  'Ottimizzare LCP (immagine hero, preload, formati next-gen), '
+                  'ridurre il JS bloccante e stabilizzare il layout per il CLS.',
+    },
+    'Valid Inlinks': {
+        'pillar': 'T', 'id': 'T03', 'weight': 30, 'kind': 'tech',
+        'owner': 'SEO / IT',
+        'applies_to': [],
+        'goal': 'I link in ingresso puntano a URL valide, senza catene di redirect.',
+        'must_have': 'Inlink verso URL con status 200, senza 301/302 intermedi '
+                     'e senza destinazioni 404.',
+        'action': 'Bonificare i link interni in ingresso (score {score}/100). '
+                  'Aggiornare gli href che passano da redirect o puntano a 404, '
+                  'sostituendoli con l’URL finale canonica.',
+    },
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CATALOGO → DataFrame
+# ══════════════════════════════════════════════════════════════════════════════
+
+def catalog_dataframe() -> pd.DataFrame:
+    """Elenco completo delle raccomandazioni WSX classificate per tipo CAST."""
+    rows = []
+    for metric, meta in METRIC_CATALOG.items():
+        p = PILLARS[meta['pillar']]
+        rows.append({
+            'ID':               meta['id'],
+            'CAST':             meta['pillar'],
+            'Pilastro':         p['name'],
+            'Metrica WSX':      metric,
+            'Tipo intervento':  meta['kind'],
+            'Owner':            meta['owner'],
+            'Peso':             meta['weight'],
+            'Page type attesi': ', '.join(meta['applies_to']) if meta['applies_to'] else 'Tutti',
+            'Goal':             meta['goal'],
+            'Must Have':        meta['must_have'],
+            'Azione tipo':      re.sub(r'\s*\(score \{score\}/100(, gap \{gap\} punti)?\)', '',
+                                       meta['action']).replace('{page_type}', 'pagina'),
+        })
+    df = pd.DataFrame(rows)
+    order = {'C': 0, 'A': 1, 'S': 2, 'T': 3}
+    df['_o'] = df['CAST'].map(order)
+    return df.sort_values(['_o', 'ID']).drop(columns='_o').reset_index(drop=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DETECTION  —  pilastro e brand
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_pillar(df: pd.DataFrame, filename: str = '') -> Optional[str]:
+    """
+    Determina il pilastro CAST di un export WSX.
+    Priorità: colonna score di pilastro → token nel nome file → prefisso file.
+    """
+    cols = {str(c).strip().lower() for c in df.columns}
+    for code, meta in PILLARS.items():
+        if meta['score_col'].lower() in cols:
+            return code
+    # fallback: nome del pilastro senza suffisso (formato export legacy)
+    for code, meta in PILLARS.items():
+        if meta['name'].lower() in cols:
+            return code
+
+    base = os.path.basename(str(filename or ''))
+    for code, meta in PILLARS.items():
+        if meta['file_token'].lower() in base.lower():
+            return code
+
+    m = re.match(r'^[A-Z]{2,4}_([CAST])_', base)
+    if m:
+        return PILLAR_PREFIX.get(m.group(1))
+    return None
+
+
+def detect_brand(df: pd.DataFrame, filename: str = '') -> str:
+    """Brand dal contenuto del file; in fallback dal prefisso del nome file."""
+    if 'Brand' in df.columns:
+        vals = df['Brand'].dropna().astype(str)
+        if len(vals):
+            return vals.mode().iloc[0]
+    base = os.path.basename(str(filename or ''))
+    m = re.match(r'^([A-Z]{2,4})_', base)
+    if m:
+        return BRAND_PREFIX.get(m.group(1), m.group(1))
+    return '—'
+
+
+def score_columns(df: pd.DataFrame, pillar: str) -> Dict[str, str]:
+    """
+    Mappa {nome metrica catalogo → nome reale colonna} per le sotto-metriche
+    del pilastro presenti nel DataFrame. Gestisce sia il formato 2026
+    ('Meta Tags - Score') sia quello legacy ('Meta Tags').
+    """
+    out: Dict[str, str] = {}
+    overall = PILLARS[pillar]['score_col']
+    lookup = {str(c).strip().lower(): c for c in df.columns}
+    for metric, meta in METRIC_CATALOG.items():
+        if meta['pillar'] != pillar:
+            continue
+        for cand in (f'{metric} - Score', metric, f'{metric} Score'):
+            real = lookup.get(cand.strip().lower())
+            if real and real != overall:
+                out[metric] = real
+                break
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SEVERITÀ  E  PRIORITÀ
+# ══════════════════════════════════════════════════════════════════════════════
+
+# soglia sotto la quale una sotto-metrica genera raccomandazione
+DEFAULT_THRESHOLD = 100
+
+SEVERITY_BANDS: List[Tuple[float, float, str, str]] = [
+    #  min,   max,  label,                 badge
+    (0,     0.001, '❌ Assente',           'critical'),
+    (0.001, 50,    '🔴 Insufficiente',     'high'),
+    (50,    80,    '🟠 Da migliorare',     'medium'),
+    (80,    100,   '🟡 Quasi ottimale',    'low'),
+    (100,   1e9,   '✅ Conforme',          'ok'),
+]
+
+
+def severity_of(score: Optional[float]) -> str:
+    """Etichetta di severità a partire dallo score 0-100."""
+    if score is None or pd.isna(score):
+        return '— N/A'
+    s = float(score)
+    for lo, hi, label, _ in SEVERITY_BANDS:
+        if lo <= s < hi:
+            return label
+    return '✅ Conforme'
+
+
+def _traffic_weight(seo_impr, sessions) -> float:
+    """Peso 0-100 del valore di business dell’URL, da impression e sessioni."""
+    def _num(v):
+        try:
+            return float(v) if v is not None and pd.notna(v) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+    tot = _num(seo_impr) + _num(sessions) * 3  # le sessioni pesano di più
+    if tot <= 0:    return 0.0
+    if tot < 10:    return 15.0
+    if tot < 100:   return 35.0
+    if tot < 1000:  return 60.0
+    if tot < 10000: return 80.0
+    return 100.0
+
+
+def priority_of(score: Optional[float], metric: str, page_type: str,
+                seo_impr=None, sessions=None, mom=None) -> Tuple[str, int]:
+    """
+    Priorità di intervento.
+      45%  gap rispetto a 100, pesato per l’importanza della metrica
+      25%  peso del page type
+      30%  valore di traffico dell’URL
+      ±    correzione per trend MoM negativo
+    Ritorna (label, score 0-100).
+    """
+    if score is None or pd.isna(score):
+        return '— N/A', 0
+
+    gap = max(0.0, 100.0 - float(score)) / 100.0
+    mw  = METRIC_CATALOG.get(metric, {}).get('weight', 15) / 40.0   # normalizza su max 40
+    pw  = PAGETYPE_WEIGHT.get(str(page_type), PAGETYPE_WEIGHT_DEFAULT) / 40.0
+    tw  = _traffic_weight(seo_impr, sessions) / 100.0
+
+    raw = 100.0 * (0.45 * gap * min(mw, 1.0) + 0.25 * min(pw, 1.0) + 0.30 * tw)
+
+    # trend in peggioramento → priorità più alta
+    try:
+        if mom is not None and pd.notna(mom) and float(mom) < 0:
+            raw += min(abs(float(mom)), 10.0)
+    except (TypeError, ValueError):
+        pass
+
+    raw = max(0.0, min(100.0, raw))
+    if   raw >= 55: label = '🔴 Critica'
+    elif raw >= 38: label = '🟠 Alta'
+    elif raw >= 22: label = '🟡 Media'
+    else:           label = '🟢 Bassa'
+    return label, int(round(raw))
+
+
+def action_text(metric: str, score: Optional[float], page_type: str) -> str:
+    """Testo dell’azione consigliata per la coppia (metrica, score)."""
+    meta = METRIC_CATALOG.get(metric)
+    if not meta:
+        return f'Verificare la metrica {metric} (score {score}).'
+    gap = '' if score is None or pd.isna(score) else str(int(round(100 - float(score))))
+    sc  = '—' if score is None or pd.isna(score) else f'{float(score):.0f}'
+    return meta['action'].format(score=sc, gap=gap, page_type=page_type or 'pagina')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ESPLOSIONE  wide → long
+# ══════════════════════════════════════════════════════════════════════════════
+
+_META_COLS = [
+    'Brand', 'Market', 'Language', 'URL', 'Page Type',
+    'Territories', 'Core Territories',
+    'SEO Impressions (Google Search Console)',
+    'SEA Impressions (Google Ads)',
+    'All Sessions (Google Analytics)',
+    'Engaged Sessions (Google Analytics)',
+    'Engagement Rate (Google Analytics)',
+]
+
+
+def _num(v):
+    try:
+        return float(v) if v is not None and pd.notna(v) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def explode_recommendations(df: pd.DataFrame, pillar: Optional[str] = None,
+                            filename: str = '',
+                            threshold: float = DEFAULT_THRESHOLD,
+                            include_compliant: bool = False,
+                            include_na: bool = False) -> pd.DataFrame:
+    """
+    Trasforma un export WSX (1 riga = 1 URL) in formato long:
+    1 riga = 1 raccomandazione (URL × sotto-metrica sotto soglia).
+
+    threshold          : score sotto il quale la metrica diventa raccomandazione
+    include_compliant  : include anche le metriche già conformi (per audit completo)
+    include_na         : include le metriche non applicabili al page type (score NaN)
+    """
+    pillar = pillar or detect_pillar(df, filename)
+    if not pillar:
+        return pd.DataFrame()
+
+    brand_fb = detect_brand(df, filename)
+    pmeta    = PILLARS[pillar]
+    smap     = score_columns(df, pillar)
+    if not smap:
+        return pd.DataFrame()
+
+    overall_col = pmeta['score_col'] if pmeta['score_col'] in df.columns else None
+    mom_col     = pmeta['mom_col']   if pmeta['mom_col']   in df.columns else None
+
+    seo_col  = 'SEO Impressions (Google Search Console)'
+    sess_col = 'All Sessions (Google Analytics)'
+
+    rows: List[dict] = []
+    for _, r in df.iterrows():
+        url       = str(r.get('URL', '') or '').strip()
+        page_type = str(r.get('Page Type', '') or '').strip()
+        seo_impr  = r.get(seo_col)  if seo_col  in df.columns else None
+        sessions  = r.get(sess_col) if sess_col in df.columns else None
+        mom       = _num(r.get(mom_col)) if mom_col else None
+        overall   = _num(r.get(overall_col)) if overall_col else None
+
+        for metric, col in smap.items():
+            score = _num(r.get(col))
+            meta  = METRIC_CATALOG[metric]
+
+            if score is None:
+                if not include_na:
+                    continue
+                sev, prio, pscore = '— N/A', '— N/A', 0
+                act = (f'Metrica {metric} non rilevata da WSX per il page type '
+                       f'{page_type or "n/d"}. Verificare se applicabile.')
+            elif score >= threshold and not include_compliant:
+                continue
+            elif score >= threshold:
+                sev, act = '✅ Conforme', f'{metric} conforme. Mantenere e monitorare nel tempo.'
+                prio, pscore = '🟢 Bassa', 0
+            else:
+                sev = severity_of(score)
+                prio, pscore = priority_of(score, metric, page_type,
+                                           seo_impr, sessions, mom)
+                act = action_text(metric, score, page_type)
+
+            rows.append({
+                'CAST':               pillar,
+                'Pilastro':           pmeta['name'],
+                'ID':                 meta['id'],
+                'Brand':              r.get('Brand', brand_fb) or brand_fb,
+                'Market':             r.get('Market', ''),
+                'Language':           r.get('Language', ''),
+                'URL':                url,
+                'Page Type':          page_type,
+                'Metrica':            metric,
+                'Tipo intervento':    meta['kind'],
+                'Owner':              meta['owner'],
+                'Score metrica':      score,
+                'Gap (100-score)':    None if score is None else round(100 - score, 2),
+                'Score pilastro':     overall,
+                'Δ MoM pilastro':     mom,
+                'Severità':           sev,
+                'Priorità':           prio,
+                'Priority Score':     pscore,
+                'Azione consigliata': act,
+                'Goal':               meta['goal'],
+                'Must Have':          meta['must_have'],
+                'SEO Impressions':    seo_impr,
+                'All Sessions':       sessions,
+                'Territories':        r.get('Territories', ''),
+                'Core Territories':   r.get('Core Territories', ''),
+                'Source file':        os.path.basename(str(filename or '')),
+            })
+
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    return out.sort_values(['Priority Score', 'Gap (100-score)'],
+                           ascending=[False, False]).reset_index(drop=True)
+
+
+def build_all_recommendations(files: List[Tuple[str, pd.DataFrame]],
+                              threshold: float = DEFAULT_THRESHOLD,
+                              include_compliant: bool = False,
+                              include_na: bool = False) -> pd.DataFrame:
+    """
+    Esplode e concatena più export WSX (brand × pilastro) in un unico
+    registro di raccomandazioni.
+
+    files : lista di tuple (filename, DataFrame)
+    """
+    parts = []
+    for fname, df in files:
+        if df is None or df.empty:
+            continue
+        ex = explode_recommendations(df, filename=fname, threshold=threshold,
+                                     include_compliant=include_compliant,
+                                     include_na=include_na)
+        if not ex.empty:
+            parts.append(ex)
+    if not parts:
+        return pd.DataFrame()
+    allr = pd.concat(parts, ignore_index=True)
+    order = {'C': 0, 'A': 1, 'S': 2, 'T': 3}
+    allr['_o'] = allr['CAST'].map(order)
+    allr = (allr.sort_values(['Priority Score', '_o', 'Gap (100-score)'],
+                             ascending=[False, True, False])
+                .drop(columns='_o').reset_index(drop=True))
+    return allr
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AGGREGAZIONI
+# ══════════════════════════════════════════════════════════════════════════════
+
+def summarize_by_cast(recs: pd.DataFrame) -> pd.DataFrame:
+    """Riepilogo raccomandazioni per pilastro CAST e metrica."""
+    if recs.empty:
+        return pd.DataFrame()
+    g = (recs.groupby(['CAST', 'Pilastro', 'ID', 'Metrica'], dropna=False)
+             .agg(**{
+                 'Raccomandazioni': ('URL', 'count'),
+                 'URL distinte':    ('URL', 'nunique'),
+                 'Score medio':     ('Score metrica', 'mean'),
+                 'Gap medio':       ('Gap (100-score)', 'mean'),
+                 'Priority medio':  ('Priority Score', 'mean'),
+                 'Critiche':        ('Priorità', lambda s: int((s == '🔴 Critica').sum())),
+                 'Alte':            ('Priorità', lambda s: int((s == '🟠 Alta').sum())),
+             })
+             .reset_index())
+    for c in ('Score medio', 'Gap medio', 'Priority medio'):
+        g[c] = g[c].round(1)
+    order = {'C': 0, 'A': 1, 'S': 2, 'T': 3}
+    g['_o'] = g['CAST'].map(order)
+    return (g.sort_values(['_o', 'Raccomandazioni'], ascending=[True, False])
+             .drop(columns='_o').reset_index(drop=True))
+
+
+def pivot_metric_by_pagetype(recs: pd.DataFrame) -> pd.DataFrame:
+    """Matrice metrica × page type con il conteggio delle raccomandazioni."""
+    if recs.empty:
+        return pd.DataFrame()
+    p = pd.pivot_table(recs, index=['CAST', 'Metrica'], columns='Page Type',
+                       values='URL', aggfunc='count', fill_value=0)
+    p['Totale'] = p.sum(axis=1)
+    return p.sort_values('Totale', ascending=False).reset_index()
+
+
+def to_excel_workbook(sheets: Dict[str, pd.DataFrame]) -> bytes:
+    """Serializza più DataFrame in un unico workbook .xlsx."""
+    import io
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as w:
+        for name, d in sheets.items():
+            if d is None or (hasattr(d, 'empty') and d.empty):
+                continue
+            d.to_excel(w, sheet_name=str(name)[:31], index=False)
+            ws = w.sheets[str(name)[:31]]
+            ws.freeze_panes = 'A2'
+            for i, col in enumerate(d.columns, start=1):
+                try:
+                    width = min(max(12, int(d[col].astype(str).str.len().quantile(0.9)) + 3), 60)
+                except Exception:
+                    width = 18
+                ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = width
+    return buf.getvalue()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROW WORKERS  —  funzioni pure (no Streamlit), eseguibili in thread pool
@@ -1416,11 +2185,12 @@ def build_technical_analysis(df: pd.DataFrame, use_llm: bool = False,
 # ══════════════════════════════════════════════════════════════════════════════
 #  CAST FRAMEWORK
 # ══════════════════════════════════════════════════════════════════════════════
-_tab_c, _tab_a, _tab_s, _tab_t = st.tabs([
+_tab_c, _tab_a, _tab_s, _tab_t, _tab_all = st.tabs([
     '📝 C — Content',
     '🔗 A — Authority',
     '🏗️ S — Structured',
     '⚙️ T — Technical',
+    '📋 ALL — Recommendations',
 ])
 
 with _tab_c:
@@ -2538,3 +3308,350 @@ with _tab_t:
     else:
         st.info("Carica il file WSX Technical export per procedere all'analisi.")
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ALL — RECOMMENDATIONS  ·  registro completo cross-CAST
+# ══════════════════════════════════════════════════════════════════════════════
+#  Estrae TUTTE le raccomandazioni presenti negli export WSX, non solo la
+#  "Top Recommendation": ogni sotto-metrica sotto soglia diventa una riga.
+#  Accetta N file di N brand contemporaneamente; pilastro e brand sono
+#  riconosciuti automaticamente da colonne e nome file.
+# ══════════════════════════════════════════════════════════════════════════════
+
+with _tab_all:
+
+    _r_setup, _r_reg, _r_cat = st.tabs([
+        '01 · Caricamento & Registro',
+        '02 · Analisi per CAST',
+        '03 · Catalogo raccomandazioni',
+    ])
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  01 · CARICAMENTO & REGISTRO
+    # ──────────────────────────────────────────────────────────────────────────
+    with _r_setup:
+        with st.expander('ℹ️ File accettati', expanded=False):
+            st.markdown("""
+Carica **tutti** gli export WSX *URL Performance / recommendations* che vuoi
+consolidare, anche di brand diversi e in un'unica volta.
+
+| Pilastro | Token nel nome file | Colonna riconosciuta |
+|---|---|---|
+| **C** — Context | `_C_` · `Context` | `Context - Score` |
+| **A** — Authority | `_A_` · `Authority` | `Authority - Score` |
+| **S** — Structure | `_S_` · `Structure` | `Structure - Score` |
+| **T** — Technicals | `_T_` · `Technicals` | `Technicals - Score` |
+
+Il brand viene letto dalla colonna `Brand`; in mancanza, dal prefisso del nome
+file (`BIO_` → Biotherm, `VIC_` → Vichy, …).
+
+**Cosa conta come raccomandazione:** ogni sotto-metrica del pilastro con score
+inferiore alla soglia. Le metriche con score assente (`NaN`) non sono
+applicabili al page type e vengono escluse, salvo diversa impostazione.
+""")
+
+        st.markdown('<div class="section-label">Input</div>', unsafe_allow_html=True)
+
+        _rec_uploads = st.file_uploader(
+            'Export WSX (.xlsx) — selezione multipla',
+            type='xlsx', accept_multiple_files=True, key='rec_up',
+            help='Puoi caricare insieme i 4 file CAST di più brand.',
+        )
+
+        if _rec_uploads:
+            _loaded = []
+            for _f in _rec_uploads:
+                try:
+                    _d = pd.read_excel(_f)
+                    _loaded.append((_f.name, _d))
+                except Exception as _e:
+                    st.error(f'Errore nella lettura di {_f.name}: {_e}')
+            st.session_state['rec_files'] = _loaded
+
+        _files = st.session_state.get('rec_files') or []
+
+        if _files:
+            # ── Riconoscimento file ───────────────────────────────────────────
+            st.markdown('<div class="section-label">File riconosciuti</div>',
+                        unsafe_allow_html=True)
+            _rows = []
+            for _n, _d in _files:
+                _p = detect_pillar(_d, _n)
+                _rows.append({
+                    'File':     _n,
+                    'Brand':    detect_brand(_d, _n),
+                    'CAST':     _p or '⚠️ non riconosciuto',
+                    'Pilastro': PILLARS[_p]['name'] if _p else '—',
+                    'URL':      len(_d),
+                    'Colonne':  len(_d.columns),
+                })
+            _recog = pd.DataFrame(_rows)
+            st.dataframe(_recog, use_container_width=True, hide_index=True)
+
+            if (_recog['CAST'] == '⚠️ non riconosciuto').any():
+                st.warning(
+                    'Alcuni file non sono stati associati a un pilastro CAST: '
+                    'verifica che contengano la colonna di score del pilastro '
+                    'o che il nome file rispetti la convenzione `BRAND_X_...`.'
+                )
+
+            st.markdown('<br>', unsafe_allow_html=True)
+
+            # ── Parametri di estrazione ───────────────────────────────────────
+            st.markdown('<div class="section-label">Parametri</div>',
+                        unsafe_allow_html=True)
+            _p1, _p2, _p3 = st.columns([1.4, 1, 1])
+            with _p1:
+                _thr = st.slider(
+                    'Soglia score', min_value=50, max_value=100, value=100, step=5,
+                    key='rec_thr',
+                    help='Una sotto-metrica genera raccomandazione se il suo score '
+                         'è inferiore a questo valore. 100 = tutto ciò che non è '
+                         'pienamente conforme.',
+                )
+            with _p2:
+                _inc_ok = st.toggle('Includi conformi', value=False, key='rec_ok',
+                                    help='Aggiunge anche le metriche già a norma, '
+                                         'per un audit di copertura completo.')
+            with _p3:
+                _inc_na = st.toggle('Includi N/A', value=False, key='rec_na',
+                                    help='Aggiunge le metriche non applicabili al '
+                                         'page type (score assente).')
+
+            if st.button('▶ Estrai tutte le raccomandazioni', key='rec_run',
+                         type='primary'):
+                with st.spinner('Esplosione delle metriche in corso…'):
+                    st.session_state['rec_all_df'] = build_all_recommendations(
+                        _files, threshold=_thr,
+                        include_compliant=_inc_ok, include_na=_inc_na,
+                    )
+
+        _recs = st.session_state.get('rec_all_df')
+
+        if _recs is not None and not _recs.empty:
+            st.markdown('<br>', unsafe_allow_html=True)
+            st.markdown('<div class="section-label">Riepilogo</div>',
+                        unsafe_allow_html=True)
+
+            _pc = _recs['Priorità'].value_counts()
+            metrics_row(_recs, {
+                'Raccomandazioni': len(_recs),
+                'URL coinvolte':   _recs['URL'].nunique(),
+                'Brand':           _recs['Brand'].nunique(),
+                'Metriche':        _recs['Metrica'].nunique(),
+                'Critiche':        int(_pc.get('🔴 Critica', 0)),
+                'Alte':            int(_pc.get('🟠 Alta', 0)),
+            })
+            st.markdown('<br>', unsafe_allow_html=True)
+
+            # ── Distribuzione per CAST ────────────────────────────────────────
+            st.markdown('<div class="section-label">Distribuzione per pilastro CAST</div>',
+                        unsafe_allow_html=True)
+            _cc = st.columns(4)
+            for _i, _code in enumerate(['C', 'A', 'S', 'T']):
+                _sub = _recs[_recs['CAST'] == _code]
+                _pm  = PILLARS[_code]
+                with _cc[_i]:
+                    st.markdown(f"""
+                    <div class="metric-card">
+                        <div class="val">{len(_sub)}</div>
+                        <div class="lbl">{_pm['icon']} {_pm['label']}</div>
+                    </div>""", unsafe_allow_html=True)
+            st.markdown('<br>', unsafe_allow_html=True)
+
+            # ── Filtri ────────────────────────────────────────────────────────
+            st.markdown('<div class="section-label">Filtri</div>',
+                        unsafe_allow_html=True)
+            _f1, _f2, _f3, _f4 = st.columns(4)
+            with _f1:
+                _fb = st.multiselect('Brand', sorted(_recs['Brand'].dropna().unique()),
+                                     key='rec_fb')
+            with _f2:
+                _fc = st.multiselect('CAST', ['C', 'A', 'S', 'T'], key='rec_fc')
+            with _f3:
+                _fp = st.multiselect('Page Type',
+                                     sorted(_recs['Page Type'].dropna().unique()),
+                                     key='rec_fp')
+            with _f4:
+                _fpr = st.multiselect('Priorità',
+                                      ['🔴 Critica', '🟠 Alta', '🟡 Media', '🟢 Bassa'],
+                                      key='rec_fpr')
+
+            _f5, _f6 = st.columns([2, 1])
+            with _f5:
+                _fm = st.multiselect('Metrica', sorted(_recs['Metrica'].unique()),
+                                     key='rec_fm')
+            with _f6:
+                _fmin = st.number_input('Priority Score minimo', 0, 100, 0, 5,
+                                        key='rec_fmin')
+
+            _flt = _recs.copy()
+            if _fb:  _flt = _flt[_flt['Brand'].isin(_fb)]
+            if _fc:  _flt = _flt[_flt['CAST'].isin(_fc)]
+            if _fp:  _flt = _flt[_flt['Page Type'].isin(_fp)]
+            if _fpr: _flt = _flt[_flt['Priorità'].isin(_fpr)]
+            if _fm:  _flt = _flt[_flt['Metrica'].isin(_fm)]
+            if _fmin: _flt = _flt[_flt['Priority Score'] >= _fmin]
+
+            st.caption(f'{len(_flt)} raccomandazioni su {len(_recs)} · '
+                       f"{_flt['URL'].nunique()} URL distinte")
+
+            _show = ['CAST', 'ID', 'Brand', 'Page Type', 'Metrica', 'Score metrica',
+                     'Gap (100-score)', 'Severità', 'Priorità', 'Priority Score',
+                     'URL', 'Azione consigliata']
+            st.dataframe(_flt[_show], use_container_width=True, hide_index=True,
+                         height=460)
+
+            # ── Export ────────────────────────────────────────────────────────
+            st.markdown('<div class="section-label">Export</div>',
+                        unsafe_allow_html=True)
+            _e1, _e2 = st.columns(2)
+            with _e1:
+                st.download_button(
+                    '⬇ Vista filtrata (.xlsx)',
+                    data=to_excel_bytes(_flt),
+                    file_name='wsx_recommendations_filtered.xlsx',
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    use_container_width=True)
+            with _e2:
+                _book = {
+                    'Riepilogo CAST':  summarize_by_cast(_recs),
+                    'Tutte le racc.':  _recs,
+                    'C - Context':     _recs[_recs['CAST'] == 'C'],
+                    'A - Authority':   _recs[_recs['CAST'] == 'A'],
+                    'S - Structure':   _recs[_recs['CAST'] == 'S'],
+                    'T - Technicals':  _recs[_recs['CAST'] == 'T'],
+                    'Metrica x PageType': pivot_metric_by_pagetype(_recs),
+                    'Catalogo':        catalog_dataframe(),
+                }
+                st.download_button(
+                    '⬇ Registro completo multi-foglio (.xlsx)',
+                    data=to_excel_workbook(_book),
+                    file_name='wsx_all_recommendations.xlsx',
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    type='primary', use_container_width=True)
+
+        elif _files:
+            st.info('Imposta i parametri e avvia l’estrazione per generare il registro.')
+        else:
+            st.info('Carica uno o più export WSX per costruire il registro '
+                    'completo delle raccomandazioni.')
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  02 · ANALISI PER CAST
+    # ──────────────────────────────────────────────────────────────────────────
+    with _r_reg:
+        _recs = st.session_state.get('rec_all_df')
+
+        if _recs is None or _recs.empty:
+            st.info('Nessun registro in memoria: esegui prima l’estrazione '
+                    'nella tab «01 · Caricamento & Registro».')
+        else:
+            st.markdown('<div class="section-label">Raccomandazioni per pilastro e metrica</div>',
+                        unsafe_allow_html=True)
+            _summary = summarize_by_cast(_recs)
+            st.dataframe(_summary, use_container_width=True, hide_index=True)
+
+            st.markdown('<br>', unsafe_allow_html=True)
+
+            # ── Brand × CAST ──────────────────────────────────────────────────
+            _b1, _b2 = st.columns(2)
+            with _b1:
+                st.markdown('<div class="section-label">Brand × CAST</div>',
+                            unsafe_allow_html=True)
+                _bx = pd.crosstab(_recs['Brand'], _recs['CAST'], margins=True,
+                                  margins_name='Totale')
+                st.dataframe(_bx, use_container_width=True)
+            with _b2:
+                st.markdown('<div class="section-label">Priorità × CAST</div>',
+                            unsafe_allow_html=True)
+                _px = pd.crosstab(_recs['Priorità'], _recs['CAST'], margins=True,
+                                  margins_name='Totale')
+                st.dataframe(_px, use_container_width=True)
+
+            st.markdown('<br>', unsafe_allow_html=True)
+
+            # ── Matrice metrica × page type ───────────────────────────────────
+            st.markdown('<div class="section-label">Metrica × Page Type</div>',
+                        unsafe_allow_html=True)
+            st.dataframe(pivot_metric_by_pagetype(_recs),
+                         use_container_width=True, hide_index=True)
+
+            st.markdown('<br>', unsafe_allow_html=True)
+
+            # ── Top URL per carico di intervento ──────────────────────────────
+            st.markdown('<div class="section-label">URL con il maggior carico di intervento</div>',
+                        unsafe_allow_html=True)
+            _top = (_recs.groupby(['Brand', 'URL', 'Page Type'], dropna=False)
+                         .agg(**{
+                             'Raccomandazioni': ('Metrica', 'count'),
+                             'CAST coinvolti':  ('CAST', lambda s: ' · '.join(sorted(set(s)))),
+                             'Priority totale': ('Priority Score', 'sum'),
+                             'Gap medio':       ('Gap (100-score)', 'mean'),
+                         })
+                         .reset_index()
+                         .sort_values('Priority totale', ascending=False)
+                         .head(50))
+            _top['Gap medio'] = _top['Gap medio'].round(1)
+            st.dataframe(_top, use_container_width=True, hide_index=True)
+
+            # ── Dettaglio per pilastro ────────────────────────────────────────
+            st.markdown('<br>', unsafe_allow_html=True)
+            st.markdown('<div class="section-label">Dettaglio per pilastro</div>',
+                        unsafe_allow_html=True)
+            for _code in ['C', 'A', 'S', 'T']:
+                _sub = _recs[_recs['CAST'] == _code]
+                if _sub.empty:
+                    continue
+                _pm = PILLARS[_code]
+                with st.expander(f"{_pm['icon']} {_pm['label']} — {len(_sub)} raccomandazioni"):
+                    st.caption(_pm['desc'])
+                    for _mn in _sub['Metrica'].value_counts().index:
+                        _ms = _sub[_sub['Metrica'] == _mn]
+                        _meta = METRIC_CATALOG[_mn]
+                        st.markdown(
+                            f"**{_meta['id']} · {_mn}** — {len(_ms)} URL · "
+                            f"score medio {_ms['Score metrica'].mean():.0f}/100 · "
+                            f"owner: {_meta['owner']}"
+                        )
+                        st.markdown(f"*Goal:* {_meta['goal']}")
+                        st.markdown(f"*Must Have:* {_meta['must_have']}")
+                        st.divider()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  03 · CATALOGO RACCOMANDAZIONI
+    # ──────────────────────────────────────────────────────────────────────────
+    with _r_cat:
+        st.markdown('<div class="section-label">Catalogo delle raccomandazioni WSX per tipo CAST</div>',
+                    unsafe_allow_html=True)
+        st.caption(
+            'Tassonomia di riferimento: tutte le sotto-metriche rilevate dagli '
+            'export WSX, con obiettivo, criterio di conformità e azione tipo. '
+            'Indipendente dai file caricati.'
+        )
+
+        _cat = catalog_dataframe()
+
+        _k = st.columns(4)
+        for _i, _code in enumerate(['C', 'A', 'S', 'T']):
+            _n = int((_cat['CAST'] == _code).sum())
+            _pm = PILLARS[_code]
+            with _k[_i]:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="val">{_n}</div>
+                    <div class="lbl">{_pm['icon']} {_pm['label']}</div>
+                </div>""", unsafe_allow_html=True)
+        st.markdown('<br>', unsafe_allow_html=True)
+
+        _cf = st.multiselect('Filtra per pilastro', ['C', 'A', 'S', 'T'],
+                             key='rec_catf')
+        _cat_v = _cat[_cat['CAST'].isin(_cf)] if _cf else _cat
+
+        st.dataframe(_cat_v, use_container_width=True, hide_index=True, height=560)
+
+        st.download_button(
+            '⬇ Scarica catalogo (.xlsx)',
+            data=to_excel_bytes(_cat),
+            file_name='wsx_recommendation_catalog.xlsx',
+            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
