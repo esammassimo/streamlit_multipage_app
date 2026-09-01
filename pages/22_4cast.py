@@ -587,6 +587,140 @@ FRONTEND_METRICS = {
 }
 
 
+# ── Valori già proposti da WSX ───────────────────────────────────────────────
+#  Il testo della raccomandazione contiene spesso il valore pronto, scritto in
+#  lingua e citato fra virgolette ("Change the meta description to ... e.g.,
+#  'Scopri Day Control Protection 48h, ...'"). Estrarlo costa zero: niente
+#  crawl, niente LLM. Va usato come punto di partenza, non come verità: WSX
+#  non garantisce lunghezza né unicità.
+#
+#  L'apostrofo italiano (dell', l', un') NON è un delimitatore: l'apice
+#  aprente deve essere preceduto da spazio o punteggiatura e il chiudente
+#  seguito da spazio, punteggiatura o fine stringa.
+
+_PROP_OPEN  = r"(?<=[\s(:\[,])"
+_PROP_CLOSE = r"(?=[\s,.;:)\]]|$)"
+_PROP_PATTERNS = [
+    re.compile(r'[\u201c]([^\u201c\u201d]{8,300})[\u201d]'),
+    re.compile(r'"([^"]{8,300})"'),
+    re.compile(_PROP_OPEN + r"'([^']{8,300})'" + _PROP_CLOSE),
+    re.compile(_PROP_OPEN + r'\u2018([^\u2018\u2019]{8,300})\u2019' + _PROP_CLOSE),
+]
+#  Frammenti di istruzione inglese finiti dentro le virgolette
+_PROP_JUNK = re.compile(
+    r'^(with|to |and |or |s |the |a |an |for |such as|e\.g|i\.e|that|which|'
+    r'this|these|it |its )', re.I)
+
+
+#  Cue che introducono un valore PROPOSTO. Senza uno di questi prima delle
+#  virgolette, la stringa citata è quasi sempre il valore ATTUALE portato come
+#  esempio del problema ("Replace 'Centro preferenze sulla privacy' with…").
+_PROP_CUE = re.compile(
+    r"(such as|for example|e\.g\.,?|i\.e\.,?|replace .{0,60}? with|rename .{0,60}? to|"
+    r"rewrite .{0,60}? (?:as|to)|change .{0,60}? to|update .{0,60}? to|use|add|"
+    r"introduce|consider|propose[d]?|suggest(?:ed)?|like|with a|to a)\s*[:,]?\s*$",
+    re.I)
+
+#  Cue negativi: la citazione è il PROBLEMA, non la proposta
+_PROP_NEGCUE = re.compile(
+    r"(remove|duplicate[d]?|repeat(?:s|ed)?|appears? \d+ times|generic|vague|"
+    r"non-content|redundant|relocate|merge|eliminate|avoid|delete)"
+    r"[^'\"\u2018\u201c]{0,60}$", re.I)
+
+#  Arredo di sito: mai un valore proposto, sempre il problema da rimuovere
+_PROP_FURNITURE = re.compile(
+    r'privacy|cookie|consent|preferenz|newsletter|carrello|accedi|login|'
+    r'sembra che sei in|elenco dei cookie', re.I)
+
+
+def extract_wsx_proposals(text: str, cued_only: bool = True) -> List[str]:
+    """
+    Valori concreti già proposti dalla raccomandazione WSX.
+
+    WSX cita fra virgolette sia il valore ATTUALE (come esempio del problema)
+    sia quello PROPOSTO. Si distinguono dal contesto che precede le virgolette:
+    "Replace 'X' with a descriptive H2 such as 'Y'" → X è il problema, Y la
+    proposta. Con cued_only=True vengono restituiti solo i candidati
+    introdotti da un cue di proposta; se non ce n'è nessuno si ricade su
+    tutti i candidati, esclusi quelli di arredo di sito.
+    """
+    t = _clean_text(text)
+    if not t or is_already_ok(t):
+        return []
+
+    cand = []          # (posizione, testo, è_proposta)
+    for pat in _PROP_PATTERNS:
+        for m in pat.finditer(t):
+            c = m.group(1).strip(' .,;:')
+            if len(c) < 8 or _PROP_JUNK.match(c) or _PROP_FURNITURE.search(c):
+                continue
+            before = t[max(0, m.start() - 70):m.start()]
+            if _PROP_NEGCUE.search(before) and not _PROP_CUE.search(before):
+                continue          # citazione del problema, non una proposta
+            cand.append((m.start(), c, bool(_PROP_CUE.search(before))))
+
+    if not cand:
+        return []
+    cand.sort(key=lambda x: x[0])
+
+    cued = [c for _, c, ok in cand if ok]
+    pool = cued if (cued and cued_only) else [c for _, c, _ in cand]
+
+    seen, out = set(), []
+    for c in pool:
+        if c.lower() not in seen:
+            seen.add(c.lower())
+            out.append(c)
+    return out
+
+
+def classify_proposals(metric: str, proposals: List[str]) -> dict:
+    """
+    Assegna i valori proposti al campo giusto in base a metrica e lunghezza.
+    Le soglie sono quelle WSX, con tolleranza: un title fuori range resta un
+    title, va solo segnalato.
+    """
+    out = {'title': '', 'description': '', 'h1': '', 'headings': [], 'altro': []}
+    if not proposals:
+        return out
+    if metric == 'Meta Tags':
+        for c in proposals:
+            n = clen(c)
+            if not out['description'] and n >= 100:
+                out['description'] = c
+            elif not out['title'] and 20 <= n < 100:
+                out['title'] = c
+            else:
+                out['altro'].append(c)
+    elif metric == 'Heading':
+        # il primo candidato lungo con separatore di brand è tipicamente un H1
+        for c in proposals:
+            if not out['h1'] and (clen(c) >= 30 or '|' in c):
+                out['h1'] = c
+            else:
+                out['headings'].append(c)
+    else:
+        out['altro'] = list(proposals)
+    return out
+
+
+def proposals_digest(metric: str, text: str) -> str:
+    """Versione leggibile in cella dei valori proposti da WSX."""
+    p = classify_proposals(metric, extract_wsx_proposals(text))
+    parts = []
+    if p['title']:
+        parts.append(f"TITLE: {p['title']}  [{clen(p['title'])} car.]")
+    if p['description']:
+        parts.append(f"DESCRIPTION: {p['description']}  [{clen(p['description'])} car.]")
+    if p['h1']:
+        parts.append(f"H1: {p['h1']}")
+    if p['headings']:
+        parts.append('HEADING: ' + ' | '.join(p['headings'][:10]))
+    if p['altro']:
+        parts.append('ALTRO: ' + ' | '.join(p['altro'][:6]))
+    return '\n'.join(parts)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  CATALOGO → DataFrame
 # ══════════════════════════════════════════════════════════════════════════════
@@ -896,6 +1030,9 @@ def explode_recommendations(df: pd.DataFrame, pillar: Optional[str] = None,
 
             has_text_col = 'rec' in cols
             already_ok   = is_already_ok(wsx_rec)
+            _prop = (classify_proposals(metric, extract_wsx_proposals(wsx_rec))
+                     if wsx_rec and not already_ok
+                     else {'title': '', 'description': '', 'h1': ''})
 
             # ── decide se la riga è una raccomandazione ─────────────────────
             if has_text_col:
@@ -957,6 +1094,10 @@ def explode_recommendations(df: pd.DataFrame, pillar: Optional[str] = None,
                 'Priorità':           prio,
                 'Priority Score':     pscore,
                 'Raccomandazione WSX': wsx_rec,
+                'Valore proposto da WSX': proposals_digest(metric, wsx_rec),
+                'Title proposto WSX':     _prop.get('title', ''),
+                'Description proposta WSX': _prop.get('description', ''),
+                'H1 proposto WSX':        _prop.get('h1', ''),
                 'Nice to Have WSX':    wsx_nice,
                 'JSON-LD Template':    jsonld,
                 'Suggerimento':        '',
@@ -1012,6 +1153,20 @@ def build_all_recommendations(files: List[Tuple[str, pd.DataFrame]],
 # ══════════════════════════════════════════════════════════════════════════════
 #  AGGREGAZIONI
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _drop_empty_suggestion(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Toglie la colonna 'Suggerimento' quando nessuna riga è valorizzata.
+    Una colonna vuota in un export sembra un guasto: i suggerimenti generati
+    arrivano dalla tab «03 · Suggerimenti front-end», non da questa.
+    """
+    if df is None or df.empty or 'Suggerimento' not in df.columns:
+        return df
+    if df['Suggerimento'].astype(str).str.strip().replace(
+            {'nan': '', 'None': '', '<NA>': ''}).eq('').all():
+        return df.drop(columns='Suggerimento')
+    return df
+
 
 def summarize_by_cast(recs: pd.DataFrame) -> pd.DataFrame:
     """Riepilogo raccomandazioni per pilastro CAST e metrica."""
@@ -1252,9 +1407,15 @@ def _prompt_frontend(metric, url, target_lang, brand, market, page_type,
     ]
     if wsx_nice:
         lines += ['', 'NICE TO HAVE WSX:', wsx_nice[:600]]
+    _prop = proposals_digest(metric, wsx_rec)
+    if _prop:
+        lines += ['', 'VALORI GIÀ PROPOSTI DA WSX (punto di partenza, da '
+                  'verificare e correggere su lunghezza e unicità):', _prop[:900]]
     lines += [
         '', 'REGOLE:',
         f"- Scrivi interamente in {target_lang}.",
+        "- Se i valori proposti da WSX sono validi, riusali correggendo solo "
+        "quel che non rispetta i limiti; non riscrivere da zero senza motivo.",
         rules,
         _COMMON_RULES,
         '',
@@ -1379,6 +1540,30 @@ def _frontend_row_worker(args: dict) -> tuple:
     desc_new  = str(meta_d.get('description', '') or '').strip()
     h1_new    = str(head_d.get('h1', '') or '').strip().strip('"\u201c\u201d')
 
+    # Fallback sui valori già proposti da WSX: copre il caso LLM spento e
+    # quello di una generazione fallita. La colonna 'Origine' dice sempre da
+    # dove arriva ciascun valore, perché la qualità non è la stessa.
+    _origine = []
+    for _m, _key, _cur in (('Meta Tags', 'title', title_new),
+                           ('Meta Tags', 'description', desc_new),
+                           ('Heading', 'h1', h1_new)):
+        if _cur or _m not in args['items']:
+            continue
+        _p = classify_proposals(_m, extract_wsx_proposals(
+            args['items'][_m].get('rec', '')))
+        if _p.get(_key):
+            if _key == 'title':        title_new = _p['title']
+            elif _key == 'description': desc_new = _p['description']
+            else:                       h1_new   = _p['h1']
+            _origine.append(f'{_key} da WSX')
+    if _origine:
+        notes.append('valori ripresi da WSX: ' + ', '.join(
+            o.split(' da ')[0] for o in _origine))
+
+    # heading proposti da WSX, utili anche quando l'outline LLM manca
+    _head_props = classify_proposals(
+        'Heading', extract_wsx_proposals(args['items'].get('Heading', {}).get('rec', '')))
+
     row = {
         'Brand':      args['brand'],
         'Market':     args['market'],
@@ -1407,6 +1592,7 @@ def _frontend_row_worker(args: dict) -> tuple:
         'H1 status':      len_status(clen(h1_new), H1_MIN, H1_MAX),
         'Outline suggerito': _flatten_suggestion('Heading', head_d).split('\n', 1)[-1]
                              if head_d.get('outline') else '',
+        'Heading proposti da WSX': ' | '.join(_head_props.get('headings', [])[:12]),
         # Altre metriche front-end
         'Relevance — copy suggerito':   _flatten_suggestion('Relevance', results.get('Relevance', {})),
         'Grammar — correzioni':         _flatten_suggestion('Grammar', results.get('Grammar', {})),
@@ -4222,8 +4408,9 @@ applicabili al page type e vengono escluse, salvo diversa impostazione.
                 'URL coinvolte':   _recs['URL'].nunique(),
                 'Front-end':       int((_recs['Front-end'] == 'Sì').sum()),
                 'Metriche':        _recs['Metrica'].nunique(),
+                'Con valore WSX':  int((_recs['Valore proposto da WSX']
+                                        .astype(str).str.len() > 0).sum()),
                 'Critiche':        int(_pc.get('🔴 Critica', 0)),
-                'Alte':            int(_pc.get('🟠 Alta', 0)),
             })
             st.markdown('<br>', unsafe_allow_html=True)
 
@@ -4283,7 +4470,8 @@ applicabili al page type e vengono escluse, salvo diversa impostazione.
 
             _show = ['CAST', 'ID', 'Brand', 'Page Type', 'Metrica', 'Front-end',
                      'Score metrica', 'Severità', 'Priorità', 'Priority Score',
-                     'URL', 'Raccomandazione WSX', 'Azione consigliata']
+                     'URL', 'Raccomandazione WSX', 'Valore proposto da WSX',
+                     'Azione consigliata']
             st.dataframe(_flt[_show], use_container_width=True, hide_index=True,
                          height=460)
 
@@ -4294,19 +4482,20 @@ applicabili al page type e vengono escluse, salvo diversa impostazione.
             with _e1:
                 st.download_button(
                     '⬇ Vista filtrata (.xlsx)',
-                    data=to_excel_bytes(_flt),
+                    data=to_excel_bytes(_drop_empty_suggestion(_flt)),
                     file_name='wsx_recommendations_filtered.xlsx',
                     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                     use_container_width=True)
             with _e2:
+                _exp = _drop_empty_suggestion(_recs)
                 _book = {
-                    'Riepilogo CAST':  summarize_by_cast(_recs),
-                    'Tutte le racc.':  _recs,
-                    'C - Context':     _recs[_recs['CAST'] == 'C'],
-                    'A - Authority':   _recs[_recs['CAST'] == 'A'],
-                    'S - Structure':   _recs[_recs['CAST'] == 'S'],
-                    'T - Technicals':  _recs[_recs['CAST'] == 'T'],
-                    'Front-end':       _recs[_recs['Front-end'] == 'Sì'],
+                    'Riepilogo CAST':  summarize_by_cast(_exp),
+                    'Tutte le racc.':  _exp,
+                    'C - Context':     _exp[_exp['CAST'] == 'C'],
+                    'A - Authority':   _exp[_exp['CAST'] == 'A'],
+                    'S - Structure':   _exp[_exp['CAST'] == 'S'],
+                    'T - Technicals':  _exp[_exp['CAST'] == 'T'],
+                    'Front-end':       _exp[_exp['Front-end'] == 'Sì'],
                     'Metrica x PageType': pivot_metric_by_pagetype(_recs),
                     'Catalogo':        catalog_dataframe(),
                 }
@@ -4564,7 +4753,8 @@ l'app. In caso di 403 sistematici (bot protection su CDN) esegui l'app in locale
                                   'Len desc new', 'Desc status'],
                     'Heading':   ['Brand', 'Page Type', 'URL', 'N. H1', 'H1 attuale',
                                   'H1 suggerito', 'Len h1 new', 'H1 status',
-                                  'Outline suggerito', 'Note'],
+                                  'Outline suggerito', 'Heading proposti da WSX',
+                                  'Note'],
                     'Relevance': ['Brand', 'Page Type', 'URL', 'Relevance — copy suggerito'],
                     'Grammar & Unique': ['Brand', 'URL', 'Grammar — correzioni',
                                          'Unique Content — suggerito'],
