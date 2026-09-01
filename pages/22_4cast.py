@@ -145,6 +145,7 @@ for key in [
     'tech_df', 'tech_result_df',
     # ALL — Recommendations (registro cross-CAST)
     'rec_files', 'rec_all_df', 'rec_tags_df',
+    'rec_clu_items', 'rec_clu_summary',
     # LLM config (persisted across tabs)
     'llm_provider', 'llm_key', 'llm_model', 'llm_mode',
 ]:
@@ -1514,6 +1515,204 @@ def merge_suggestions_into_register(recs: pd.DataFrame,
         except Exception:
             pass
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CLUSTERING RACCOMANDAZIONI
+# ══════════════════════════════════════════════════════════════════════════════
+#  Le raccomandazioni WSX sono per-URL ma non per questo tutte diverse: molte
+#  ripetono la stessa azione su centinaia di pagine, spesso perché il problema
+#  sta in un componente condiviso (banner cookie, widget, blocco CTA) e non
+#  nel contenuto della singola pagina.
+#
+#  Il clustering serve a decidere COME lavorare prima di lavorare:
+#    · azioni di TEMPLATE  → un ticket al front-end risolve N URL insieme
+#    · azioni di PAGINA    → richiedono intervento editoriale una per una
+#
+#  Metodo: ogni raccomandazione viene spezzata nelle sue azioni atomiche, i
+#  riferimenti specifici (testi fra virgolette, numeri) vengono sostituiti da
+#  segnaposto per far emergere il pattern d'azione, poi TF-IDF + clustering
+#  agglomerativo su distanza coseno.
+# ══════════════════════════════════════════════════════════════════════════════
+
+#  Abbreviazioni da proteggere: contengono '.,' e romperebbero lo split
+_ABBR_GUARD = [('e.g.,', '\x01EG\x01'), ('i.e.,', '\x01IE\x01'),
+               ('etc.,', '\x01ET\x01'), ('vs.,', '\x01VS\x01')]
+
+_QUOTED = re.compile(r"['\u2018\u2019\"\u201c\u201d]([^'\u2018\u2019\"\u201c\u201d]{2,80})"
+                     r"['\u2018\u2019\"\u201c\u201d]")
+
+#  Entità che indicano arredo di sito condiviso anziché contenuto di pagina
+_TEMPLATE_HINT = re.compile(
+    r'privacy|cookie|consent|preferenz|skinconsult|acquista online|newsletter|'
+    r'accedi|login|carrello|breadcrumb|menu|footer|header|banner|pop-?up',
+    re.I)
+
+
+def split_recommendation_items(text: str) -> List[str]:
+    """Spezza una raccomandazione WSX nelle singole azioni atomiche."""
+    t = _clean_text(text)
+    if not t or is_already_ok(t):
+        return []
+    for a, ph in _ABBR_GUARD:
+        t = t.replace(a, ph)
+    parts = re.split(r'\.,\s+|\.\s+(?=[A-Z])|\n+', t)
+    out = []
+    for p in parts:
+        for a, ph in _ABBR_GUARD:
+            p = p.replace(ph, a)
+        p = p.strip(' .;·-')
+        if len(p) > 15:
+            out.append(p)
+    return out
+
+
+def item_entities(item: str) -> List[str]:
+    """Testi fra virgolette citati dalla raccomandazione (heading, CTA, label)."""
+    return [m.strip() for m in _QUOTED.findall(str(item)) if len(m.strip()) > 2]
+
+
+def normalize_item(item: str) -> str:
+    """Rimuove i riferimenti specifici per isolare il pattern d'azione."""
+    s = _QUOTED.sub(' <X> ', str(item).lower())
+    s = re.sub(r'\d+', ' <N> ', s)
+    s = re.sub(r'[^a-z<>\s]', ' ', s)
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def is_template_action(item: str) -> bool:
+    """True se l'azione riguarda un componente condiviso e non il contenuto."""
+    return bool(_TEMPLATE_HINT.search(str(item)))
+
+
+def explode_recommendation_items(recs: pd.DataFrame,
+                                 metrics: Optional[List[str]] = None
+                                 ) -> pd.DataFrame:
+    """Da 1 riga = 1 raccomandazione a 1 riga = 1 azione atomica."""
+    if recs is None or recs.empty or 'Raccomandazione WSX' not in recs.columns:
+        return pd.DataFrame()
+    sel = recs[recs['Metrica'].isin(metrics)] if metrics else recs
+    rows = []
+    for _, r in sel.iterrows():
+        for it in split_recommendation_items(r.get('Raccomandazione WSX', '')):
+            ents = item_entities(it)
+            rows.append({
+                'CAST':     r['CAST'],
+                'Brand':    r['Brand'],
+                'Metrica':  r['Metrica'],
+                'URL':      r['URL'],
+                'Page Type': r.get('Page Type', ''),
+                'Priority Score': r.get('Priority Score', 0),
+                'Azione atomica': it,
+                'Livello':  'Template' if is_template_action(it) else 'Pagina',
+                'Entità citate': ' | '.join(ents[:4]),
+            })
+    return pd.DataFrame(rows)
+
+
+def cluster_recommendation_items(items: pd.DataFrame,
+                                 n_clusters: int = 12) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Raggruppa le azioni atomiche per pattern.
+    Ritorna (items con colonna Cluster, tabella riassuntiva dei cluster).
+    """
+    if items is None or items.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    try:
+        import numpy as np
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.cluster import AgglomerativeClustering
+    except ImportError:
+        return items.assign(Cluster=-1), pd.DataFrame()
+
+    work = items.copy().reset_index(drop=True)
+    work['_norm'] = work['Azione atomica'].map(normalize_item)
+    work = work[work['_norm'].str.len() > 5].reset_index(drop=True)
+    if len(work) < 4:
+        return work.assign(Cluster=0), pd.DataFrame()
+
+    # min_df adattivo: su corpora piccoli 2 azzererebbe il vocabolario
+    for min_df in (2, 1):
+        try:
+            vec = TfidfVectorizer(ngram_range=(1, 3), min_df=min_df, max_df=0.85,
+                                  stop_words='english', sublinear_tf=True)
+            X = vec.fit_transform(work['_norm'])
+            if X.shape[1] >= 5:
+                break
+        except ValueError:
+            X = None
+    if X is None or X.shape[1] < 2:
+        return work.assign(Cluster=0), pd.DataFrame()
+
+    Xd = X.toarray()
+    keep = Xd.sum(axis=1) > 0          # righe senza termini utili → fuori
+    work = work[keep].reset_index(drop=True)
+    Xd = Xd[keep]
+    n = max(2, min(int(n_clusters), len(work) - 1))
+
+    model = AgglomerativeClustering(n_clusters=n, metric='cosine', linkage='average')
+    work['Cluster'] = model.fit_predict(Xd)
+
+    terms = np.array(vec.get_feature_names_out())
+    tot_url = work['URL'].nunique() or 1
+
+    summary = []
+    for c, g in work.groupby('Cluster'):
+        idxs = g.index.to_numpy()
+        centroid = Xd[idxs].mean(axis=0)
+        top_terms = terms[centroid.argsort()[::-1][:6]]
+        rep = g.iloc[int(np.argmax(Xd[idxs] @ centroid))]['Azione atomica']
+        ents = pd.Series([e for row in g['Entità citate']
+                          for e in str(row).split(' | ') if e]).value_counts()
+        n_tpl = int((g['Livello'] == 'Template').sum())
+        summary.append({
+            'Cluster':   f'C{c}',
+            'Azioni':    len(g),
+            'URL':       g['URL'].nunique(),
+            '% URL':     round(g['URL'].nunique() / tot_url * 100, 1),
+            'Livello':   'Template' if n_tpl > len(g) / 2 else 'Pagina',
+            '% template': round(n_tpl / len(g) * 100),
+            'Metriche':  ' · '.join(sorted(g['Metrica'].unique())),
+            'Pattern':   ' · '.join(top_terms),
+            'Esempio':   rep[:300],
+            'Entità ricorrenti': ' | '.join(
+                f'{k} ({v})' for k, v in ents.head(5).items()),
+        })
+
+    sm = (pd.DataFrame(summary)
+            .sort_values('Azioni', ascending=False)
+            .reset_index(drop=True))
+    return work.drop(columns='_norm'), sm
+
+
+def cluster_effort_summary(items: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per ogni metrica quantifica quanto lavoro si risolve col template e quanto
+    resta davvero da fare pagina per pagina.
+    """
+    if items is None or items.empty:
+        return pd.DataFrame()
+    out = []
+    for (metric, brand), g in items.groupby(['Metrica', 'Brand'], dropna=False):
+        per_url = g.groupby('URL')['Livello'].agg(
+            tpl=lambda s: int((s == 'Template').sum()), tot='count')
+        only_tpl = int((per_url['tpl'] == per_url['tot']).sum())
+        some_tpl = int((per_url['tpl'] > 0).sum())
+        n_url = len(per_url)
+        out.append({
+            'Metrica':   metric,
+            'Brand':     brand,
+            'URL':       n_url,
+            'Azioni':    len(g),
+            'Azioni template':  int((g['Livello'] == 'Template').sum()),
+            '% azioni template': round((g['Livello'] == 'Template').mean() * 100),
+            'URL toccate dal template': some_tpl,
+            'URL risolte dal solo template': only_tpl,
+            'URL da lavorare a mano': n_url - only_tpl,
+        })
+    return (pd.DataFrame(out)
+              .sort_values('Azioni', ascending=False)
+              .reset_index(drop=True))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3895,11 +4094,12 @@ with _tab_t:
 
 with _tab_all:
 
-    _r_setup, _r_reg, _r_tag, _r_cat = st.tabs([
+    _r_setup, _r_reg, _r_tag, _r_clu, _r_cat = st.tabs([
         '01 · Caricamento & Registro',
         '02 · Analisi per CAST',
         '03 · Suggerimenti front-end',
-        '04 · Catalogo raccomandazioni',
+        '04 · Cluster raccomandazioni',
+        '05 · Catalogo raccomandazioni',
     ])
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -4424,7 +4624,137 @@ l'app. In caso di 403 sistematici (bot protection su CDN) esegui l'app in locale
                         use_container_width=True)
 
     # ──────────────────────────────────────────────────────────────────────────
-    #  04 · CATALOGO RACCOMANDAZIONI
+    #  04 · CLUSTER RACCOMANDAZIONI
+    # ──────────────────────────────────────────────────────────────────────────
+    with _r_clu:
+        _recs = st.session_state.get('rec_all_df')
+
+        with st.expander('ℹ️ A cosa serve', expanded=False):
+            st.markdown("""
+Le raccomandazioni WSX sono scritte per singola URL, ma molte ripetono la
+stessa azione su centinaia di pagine — di solito perché il problema sta in un
+**componente condiviso** (banner cookie, widget, blocco CTA) e non nel
+contenuto della pagina.
+
+Il clustering separa i due casi prima di aprire i ticket:
+
+- **Template** → un intervento al front-end chiude N URL insieme
+- **Pagina** → serve lavoro editoriale una per una
+
+Ogni raccomandazione viene spezzata nelle sue **azioni atomiche**; i
+riferimenti specifici (testi fra virgolette, numeri) diventano segnaposto così
+da far emergere il pattern; poi TF-IDF e clustering agglomerativo su distanza
+coseno.
+
+Richiede gli export da settembre 2026: senza la colonna
+`<metrica> - Recommendation` non c'è testo da raggruppare.
+""")
+
+        if _recs is None or _recs.empty:
+            st.info('Nessun registro in memoria: esegui prima l\'estrazione '
+                    'nella tab «01 · Caricamento & Registro».')
+        elif 'Raccomandazione WSX' not in _recs.columns or \
+                not (_recs['Raccomandazione WSX'].astype(str).str.len() > 0).any():
+            st.warning('I file caricati non contengono testo di raccomandazione: '
+                       'sono export precedenti a settembre 2026. Il clustering '
+                       'non è applicabile.')
+        else:
+            _with_text = _recs[_recs['Raccomandazione WSX'].astype(str).str.len() > 0]
+
+            st.markdown('<div class="section-label">Parametri</div>',
+                        unsafe_allow_html=True)
+            _q1, _q2, _q3 = st.columns([2, 1, 1])
+            with _q1:
+                _cm = st.multiselect(
+                    'Metriche da raggruppare',
+                    sorted(_with_text['Metrica'].unique()),
+                    default=[m for m in ['Heading', 'Relevance']
+                             if m in set(_with_text['Metrica'])],
+                    key='clu_m',
+                    help='Ha senso sulle metriche con raccomandazioni per-URL. '
+                         'Su quelle con testo di playbook identico per tutti '
+                         'produce un cluster solo.')
+            with _q2:
+                _nc = st.slider('Numero cluster', 3, 25, 12, 1, key='clu_n')
+            with _q3:
+                _cb = st.multiselect('Brand',
+                                     sorted(_with_text['Brand'].dropna().unique()),
+                                     key='clu_b')
+
+            if st.button('▶ Calcola cluster', key='clu_run', type='primary'):
+                _base = _with_text[_with_text['Brand'].isin(_cb)] if _cb else _with_text
+                with st.spinner('Estrazione azioni e clustering…'):
+                    _items = explode_recommendation_items(_base, metrics=_cm or None)
+                    _it, _sm = cluster_recommendation_items(_items, n_clusters=_nc)
+                    st.session_state['rec_clu_items']   = _it
+                    st.session_state['rec_clu_summary'] = _sm
+
+            _it = st.session_state.get('rec_clu_items')
+            _sm = st.session_state.get('rec_clu_summary')
+
+            if _it is not None and not _it.empty:
+                st.markdown('<br>', unsafe_allow_html=True)
+                st.markdown('<div class="section-label">Riepilogo</div>',
+                            unsafe_allow_html=True)
+                _n_tpl = int((_it['Livello'] == 'Template').sum())
+                metrics_row(_it, {
+                    'Azioni atomiche': len(_it),
+                    'URL':             _it['URL'].nunique(),
+                    'Cluster':         _it['Cluster'].nunique(),
+                    'Azioni template': _n_tpl,
+                    '% template':      f'{round(_n_tpl / max(len(_it), 1) * 100)}%',
+                    'Azioni di pagina': len(_it) - _n_tpl,
+                })
+                st.markdown('<br>', unsafe_allow_html=True)
+
+                st.markdown('<div class="section-label">Carico di lavoro reale</div>',
+                            unsafe_allow_html=True)
+                _eff = cluster_effort_summary(_it)
+                st.dataframe(_eff, use_container_width=True, hide_index=True)
+                st.caption(
+                    '«URL risolte dal solo template»: pagine in cui **tutte** le '
+                    'azioni riguardano componenti condivisi — si chiudono senza '
+                    'toccare il contenuto. «Da lavorare a mano»: le restanti.')
+
+                st.markdown('<br>', unsafe_allow_html=True)
+                st.markdown('<div class="section-label">Cluster individuati</div>',
+                            unsafe_allow_html=True)
+                if _sm is not None and not _sm.empty:
+                    st.dataframe(_sm, use_container_width=True, hide_index=True,
+                                 height=420)
+
+                    st.markdown('<br>', unsafe_allow_html=True)
+                    _pick = st.selectbox('Ispeziona un cluster',
+                                         _sm['Cluster'].tolist(), key='clu_pick')
+                    _cid = int(str(_pick).lstrip('C'))
+                    _cg = _it[_it['Cluster'] == _cid]
+                    _r0 = _sm[_sm['Cluster'] == _pick].iloc[0]
+                    st.markdown(f"**{_r0['Livello']}** · {_r0['Azioni']} azioni su "
+                                f"{_r0['URL']} URL · pattern: *{_r0['Pattern']}*")
+                    if _r0['Entità ricorrenti']:
+                        st.markdown(f"Entità citate: {_r0['Entità ricorrenti']}")
+                    st.dataframe(
+                        _cg[['Brand', 'Page Type', 'Metrica', 'Livello',
+                             'Azione atomica', 'Entità citate', 'URL']],
+                        use_container_width=True, hide_index=True, height=340)
+
+                st.markdown('<div class="section-label">Export</div>',
+                            unsafe_allow_html=True)
+                st.download_button(
+                    '⬇ Cluster e azioni (.xlsx)',
+                    data=to_excel_workbook({
+                        'Carico di lavoro': _eff,
+                        'Cluster':          _sm if _sm is not None else pd.DataFrame(),
+                        'Azioni atomiche':  _it,
+                        'Solo template':    _it[_it['Livello'] == 'Template'],
+                        'Solo pagina':      _it[_it['Livello'] == 'Pagina'],
+                    }),
+                    file_name='wsx_cluster_raccomandazioni.xlsx',
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    type='primary')
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  05 · CATALOGO RACCOMANDAZIONI
     # ──────────────────────────────────────────────────────────────────────────
     with _r_cat:
         st.markdown('<div class="section-label">Catalogo delle raccomandazioni WSX per tipo CAST</div>',
