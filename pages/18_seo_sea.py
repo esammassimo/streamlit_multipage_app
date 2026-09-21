@@ -355,13 +355,22 @@ def parse_gsc_file(uploaded_file) -> pd.DataFrame:
     suffix = Path(name).suffix.lower()
     buf = io.BytesIO(uploaded_file.read())
 
-    def _find_query_header(frame, max_rows=15):
-        """Indice della riga che contiene l'intestazione della colonna query, altrimenti None."""
+    def _is_query_label(v: str) -> bool:
+        # copre "Query", "Top queries", "Query principali", "Query più frequenti"…
+        return v in GSC_QUERY_VARIANTS or "query" in v or "queries" in v
+
+    def _find_query_header(frame, max_rows=15, allow_metrics_only=False):
+        """Indice della riga header con la colonna query, altrimenti None.
+        Con allow_metrics_only accetta anche una riga con sole metriche (Clic/Impressioni),
+        usata per i fogli già riconosciuti come 'Query' dal nome."""
+        fallback = None
         for i, row in frame.head(max_rows).iterrows():
             vals = [normalize_col(str(v)) for v in row if pd.notna(v) and str(v).strip()]
-            if any(v in GSC_QUERY_VARIANTS for v in vals):
+            if any(_is_query_label(v) for v in vals):
                 return i
-        return None
+            if fallback is None and any(v in GSC_CLICKS_VARIANTS or v in GSC_IMPR_VARIANTS for v in vals):
+                fallback = i
+        return fallback if allow_metrics_only else None
 
     sheet_names = []
     if suffix in (".xlsx", ".xls"):
@@ -369,12 +378,14 @@ def parse_gsc_file(uploaded_file) -> pd.DataFrame:
         # Pagine/Pages, Paesi, Dispositivi, Filtri…): serve quello delle query.
         buf.seek(0)
         sheet_names = pd.ExcelFile(buf).sheet_names
-        preferred = sorted(sheet_names, key=lambda n: 0 if normalize_col(n) in ("query", "queries", "query principali", "top queries") else 1)
+        def _is_query_sheet(n):
+            return _is_query_label(normalize_col(n))
+        preferred = sorted(sheet_names, key=lambda n: 0 if _is_query_sheet(n) else 1)
         raw, header_row = None, None
         for sh in preferred:
             buf.seek(0)
             candidate = pd.read_excel(buf, sheet_name=sh, header=None, dtype=str)
-            hr = _find_query_header(candidate)
+            hr = _find_query_header(candidate, allow_metrics_only=_is_query_sheet(sh))
             if hr is not None:
                 raw, header_row, target_sheet = candidate, hr, sh
                 break
@@ -400,7 +411,17 @@ def parse_gsc_file(uploaded_file) -> pd.DataFrame:
 
     # Rename diretto senza detect_and_rename per evitare conflitti con COL_MAP Ads
     rename = {}
+    # Colonna query: nome noto o contenente "query"; altrimenti la prima colonna
+    # (nell'export GSC la query è sempre la prima colonna del foglio Query)
+    query_col = next((c for c in df.columns if _is_query_label(normalize_col(c))), None)
+    if query_col is None and len(df.columns) and not any(
+            normalize_col(df.columns[0]) in v for v in (GSC_CLICKS_VARIANTS, GSC_IMPR_VARIANTS, GSC_POS_VARIANTS)):
+        query_col = df.columns[0]
+    if query_col is not None:
+        rename[query_col] = "gsc_keyword"
     for c in df.columns:
+        if c == query_col:
+            continue
         cn = normalize_col(c)
         if cn in GSC_QUERY_VARIANTS and "gsc_keyword" not in rename.values():
             rename[c] = "gsc_keyword"
