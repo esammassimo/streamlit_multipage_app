@@ -3,8 +3,10 @@ NVL Agency · SEO/SEA Analysis Tool
 Streamlit app — integra Google Ads + Search Console e produce report Excel
 """
 
+import csv
 import io
 import re
+from copy import copy
 from pathlib import Path
 
 import numpy as np
@@ -41,7 +43,8 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────
 
 COL_MAP = {
-    "keyword":           ["search keyword", "keyword", "parola chiave"],
+    "keyword":           ["search keyword", "keyword", "parola chiave",
+                          "search term", "termine di ricerca", "termini di ricerca"],
     "keyword_status":    ["search keyword status", "keyword status", "stato parola chiave", "status"],
     "match_type":        ["search keyword match type", "match type", "tipo di corrispondenza", "tipo corrispondenza"],
     "brand_nobrand":     ["brand / no-brand", "brand / no brand", "brand/no-brand", "brand/no brand"],
@@ -75,6 +78,114 @@ QS_TEXT_MAP = {"above average": 8, "average": 5, "below average": 3}
 
 def normalize_col(name: str) -> str:
     return str(name).strip().lower().replace("  ", " ")
+
+
+# ─────────────────────────────────────────────────────────────
+# LETTURA CSV ROBUSTA
+# Gestisce: UTF-8 (con/senza BOM), UTF-16 (export Google Ads "Excel .csv"),
+# cp1252; separatore virgola / punto e virgola / tab; righe di preambolo
+# con meno colonne dell'header (es. "Search terms report" + periodo).
+# ─────────────────────────────────────────────────────────────
+
+# Termini che identificano la colonna keyword nella riga header
+KEYWORD_HEADER_TERMS = ("keyword", "parola chiave", "search term", "termine di ricerca", "termini di ricerca")
+
+
+def _decode_bytes(data: bytes) -> str:
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16")
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data.decode("utf-8-sig")
+    head = data[:4000]
+    if head and head.count(b"\x00") > len(head) // 4:   # UTF-16 senza BOM
+        return data.decode("utf-16-le" if head[1:2] == b"\x00" else "utf-16-be")
+    for enc in ("utf-8", "cp1252"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            pass
+    return data.decode("latin-1")
+
+
+def _detect_sep(text: str) -> str:
+    sample = text.splitlines()[:50]
+    counts = {sep: sum(line.count(sep) for line in sample) for sep in ("\t", ";", ",")}
+    return max(counts, key=counts.get) if any(counts.values()) else ","
+
+
+def _read_csv_raw(buf: io.BytesIO, nrows=None) -> pd.DataFrame:
+    """Legge un CSV senza header, tutto come str, ammettendo righe di lunghezza diversa."""
+    buf.seek(0)
+    text = _decode_bytes(buf.read())
+    sep = _detect_sep(text)
+    max_cols = max((len(r) for r in csv.reader(io.StringIO(text), delimiter=sep)), default=1)
+    return pd.read_csv(
+        io.StringIO(text), header=None, names=range(max(max_cols, 1)),
+        sep=sep, dtype=str, nrows=nrows, skip_blank_lines=True,
+    )
+
+
+def _frame_from_raw(raw: pd.DataFrame, header_row: int) -> pd.DataFrame:
+    """Usa la riga header_row di un frame grezzo come intestazione (stesse convenzioni di pandas)."""
+    header = raw.loc[header_row].tolist()
+    names, seen = [], {}
+    for i, h in enumerate(header):
+        name = f"Unnamed: {i}" if pd.isna(h) or str(h).strip() == "" else str(h)
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}.{seen[name]}"
+        else:
+            seen[name] = 0
+        names.append(name)
+    df = raw.loc[raw.index > header_row].copy()
+    df.columns = names
+    # elimina colonne vuote aggiunte per righe più lunghe dell'header
+    unnamed_empty = [c for c in df.columns if c.startswith("Unnamed: ") and df[c].isna().all()]
+    return df.drop(columns=unnamed_empty).reset_index(drop=True)
+
+
+def read_csv_with_header(buf: io.BytesIO, header_row: int = 0) -> pd.DataFrame:
+    return _frame_from_raw(_read_csv_raw(buf), header_row)
+
+
+# ─────────────────────────────────────────────────────────────
+# PARSING NUMERICO (formati EN "1,234.56" e IT "1.234,56")
+# ─────────────────────────────────────────────────────────────
+
+_NUM_JUNK_RE = r"[€$£%\s\u00a0\u202f]"
+
+
+def detect_decimal_sep(df: pd.DataFrame, cols) -> str:
+    """Stima il separatore decimale del file guardando solo i valori non ambigui."""
+    dot = comma = 0
+    for c in cols:
+        if c not in df.columns:
+            continue
+        v = df[c].dropna().astype(str).head(5000).str.replace(_NUM_JUNK_RE, "", regex=True)
+        dot   += int(v.str.fullmatch(r"-?\d+\.(\d{1,2}|\d{4,})").sum())
+        dot   += int(v.str.fullmatch(r"-?\d{1,3}(,\d{3})+\.\d+").sum())
+        comma += int(v.str.fullmatch(r"-?\d+,(\d{1,2}|\d{4,})").sum())
+        comma += int(v.str.fullmatch(r"-?\d{1,3}(\.\d{3})+,\d+").sum())
+    return "," if comma > dot else "."
+
+
+def to_number(series: pd.Series, dec: str = ".", pct: bool = False) -> pd.Series:
+    """Converte stringhe numeriche in float. Con pct=True restituisce un rapporto (0-1)."""
+    s = series.astype(str).str.strip()
+    s = s.where(~s.isin(["--", "nan", "None", "NaN"]), "")
+    below_10 = s.str.fullmatch(r"<\s*10\s*%")
+    has_pct = s.str.contains("%", regex=False)
+    s = s.str.replace(_NUM_JUNK_RE, "", regex=True).str.lstrip("<>")
+    thou = "," if dec == "." else "."
+    s = s.str.replace(thou, "", regex=False)
+    if dec == ",":
+        s = s.str.replace(",", ".", regex=False)
+    out = pd.to_numeric(s, errors="coerce")
+    if pct:
+        out = out.where(~has_pct, out / 100)                 # "0.50%" → 0.005
+        out = out.where(has_pct | ~(out > 1), out / 100)     # "45.3" senza % → 0.453
+        out = out.where(~below_10, 0.09)                     # "< 10%" → 0.09
+    return out
 
 
 def detect_and_rename(df: pd.DataFrame) -> pd.DataFrame:
@@ -116,7 +227,8 @@ def parse_ads_file(uploaded_file) -> pd.DataFrame:
                     # Deve avere una colonna con nome ESATTO "keyword" o "parola chiave"
                     # (non url, non search term, non ad status)
                     has_keyword_col = any(
-                        v in ("keyword", "parola chiave", "search keyword")
+                        v in ("keyword", "parola chiave", "search keyword",
+                              "search term", "termine di ricerca", "termini di ricerca")
                         for v in vals
                     )
                     if has_keyword_col and len(vals) >= 5:
@@ -130,24 +242,26 @@ def parse_ads_file(uploaded_file) -> pd.DataFrame:
         buf.seek(0)
         raw = pd.read_excel(buf, sheet_name=target_sheet, header=None, dtype=str)
     else:
-        buf.seek(0)
-        raw = pd.read_csv(buf, header=None, dtype=str, encoding="utf-8-sig")
+        raw = _read_csv_raw(buf)
 
     header_row = None
-    for i, row in raw.iterrows():
+    for i, row in raw.head(50).iterrows():
         vals = [normalize_col(str(v)) for v in row if pd.notna(v) and str(v).strip()]
-        if len(vals) >= 3 and any("keyword" in v or "parola chiave" in v for v in vals):
+        if len(vals) >= 3 and any(t in v for v in vals for t in KEYWORD_HEADER_TERMS):
             header_row = i
             break
 
     if header_row is None:
-        raise ValueError(f"Impossibile trovare la riga header in '{name}'")
+        raise ValueError(
+            f"Impossibile trovare la riga header in '{name}'. "
+            "Serve un report Parole chiave o Termini di ricerca di Google Ads."
+        )
 
-    buf.seek(0)
     if suffix in (".xlsx", ".xls"):
+        buf.seek(0)
         df = pd.read_excel(buf, sheet_name=target_sheet, header=header_row, dtype=str)
     else:
-        df = pd.read_csv(buf, header=header_row, dtype=str, encoding="utf-8-sig")
+        df = _frame_from_raw(raw, header_row)
 
     df = df.dropna(how="all")
     df = detect_and_rename(df)
@@ -169,12 +283,26 @@ def parse_ads_file(uploaded_file) -> pd.DataFrame:
                          .str.replace(r'^\[|\]$', '', regex=True)
                          .str.replace(r'^"|"$', '', regex=True)
                          .str.strip())
+        # Rimuove righe di totale ("Total: Search", "Totale: account"…) e righe senza keyword
+        total_re = r"(?i)^\s*(?:total|totale|totali)\s*:"
+        first_col = df.iloc[:, 0].astype(str)
+        is_total = (df["keyword"].str.contains(total_re, regex=True, na=False)
+                    | first_col.str.contains(total_re, regex=True, na=False))
+        is_empty = df["keyword"].isin(["", "nan", "None", "--"])
+        df = df[~(is_total | is_empty)].reset_index(drop=True)
 
     if "match_type" in df.columns:
         mt_map = {
             "exact match": "Exact match", "exact": "Exact match", "corrispondenza esatta": "Exact match",
             "broad match": "Broad match", "broad": "Broad match", "corrispondenza generica": "Broad match",
             "phrase match": "Phrase match", "phrase": "Phrase match", "corrispondenza a frase": "Phrase match",
+            # Report Termini di ricerca
+            "exact match (close variant)": "Exact match (close variant)",
+            "corrispondenza esatta (variante simile)": "Exact match (close variant)",
+            "phrase match (close variant)": "Phrase match (close variant)",
+            "corrispondenza a frase (variante simile)": "Phrase match (close variant)",
+            "ai max": "AI Max",
+            "performance max": "Performance Max",
         }
         df["match_type"] = df["match_type"].str.strip().str.lower().map(
             lambda x: mt_map.get(x, x.title() if isinstance(x, str) else x))
@@ -193,22 +321,17 @@ def parse_ads_file(uploaded_file) -> pd.DataFrame:
         df["quality_score"] = df["quality_score"].apply(parse_qs)
 
     numeric_cols = ["impressions", "clicks", "cost", "avg_cpc", "max_cpc",
-                    "conv_rate", "conv_value", "conversions", "cost_per_conv"]
+                    "conv_value", "conversions", "cost_per_conv"]
+    pct_cols = ["ctr", "conv_rate", "search_impr_share", "search_lost_is_rank"]
+    dec = detect_decimal_sep(df, numeric_cols + pct_cols)
+
     for col in numeric_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(
-                df[col].astype(str).str.replace(",", ".").str.replace(" ", "")
-                .str.replace("--", "").str.replace(" --", ""), errors="coerce")
+            df[col] = to_number(df[col], dec)
 
-    for col in ["ctr", "search_impr_share", "search_lost_is_rank"]:
+    for col in pct_cols:
         if col in df.columns:
-            df[col] = (df[col].astype(str)
-                       .str.replace("< 10%", "0.09")
-                       .str.replace("%", "").str.replace("--", "").str.replace(" --", "")
-                       .str.replace(",", "."))
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-            mask = df[col] > 1
-            df.loc[mask, col] = df.loc[mask, col] / 100
+            df[col] = to_number(df[col], dec, pct=True)
 
     return df
 
@@ -234,8 +357,7 @@ def parse_gsc_file(uploaded_file) -> pd.DataFrame:
     if suffix in (".xlsx", ".xls"):
         raw = pd.read_excel(buf, sheet_name=0, header=None, dtype=str)
     else:
-        buf.seek(0)
-        raw = pd.read_csv(buf, header=None, dtype=str, encoding="utf-8-sig")
+        raw = _read_csv_raw(buf)
 
     # Trova riga header: contiene "query" o "keyword" o "clicks"
     header_row = 0
@@ -245,11 +367,11 @@ def parse_gsc_file(uploaded_file) -> pd.DataFrame:
             header_row = i
             break
 
-    buf.seek(0)
     if suffix in (".xlsx", ".xls"):
+        buf.seek(0)
         df = pd.read_excel(buf, sheet_name=0, header=header_row, dtype=str)
     else:
-        df = pd.read_csv(buf, header=header_row, dtype=str, encoding="utf-8-sig")
+        df = _frame_from_raw(raw, header_row)
 
     df = df.dropna(how="all")
 
@@ -275,9 +397,11 @@ def parse_gsc_file(uploaded_file) -> pd.DataFrame:
             f"Colonne rilevate: {list(df.columns)}"
         )
 
-    for col in ["pos_organica", "gsc_clicks", "gsc_impressions"]:
+    gsc_num_cols = ["pos_organica", "gsc_clicks", "gsc_impressions"]
+    dec = detect_decimal_sep(df, gsc_num_cols)
+    for col in gsc_num_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", "."), errors="coerce")
+            df[col] = to_number(df[col], dec)
 
     df["gsc_keyword"] = df["gsc_keyword"].str.strip().str.lower()
 
@@ -337,8 +461,7 @@ def parse_screaming_frog(uploaded_file) -> pd.DataFrame:
     if suffix in (".xlsx", ".xls"):
         raw = pd.read_excel(buf, sheet_name=0, header=None, nrows=3, dtype=str)
     else:
-        buf.seek(0)
-        raw = pd.read_csv(buf, header=None, nrows=3, dtype=str, encoding="utf-8-sig")
+        raw = _read_csv_raw(buf, nrows=3)
 
     header_row = 0
     for i, row in raw.iterrows():
@@ -351,7 +474,7 @@ def parse_screaming_frog(uploaded_file) -> pd.DataFrame:
     if suffix in (".xlsx", ".xls"):
         df = pd.read_excel(buf, sheet_name=0, header=header_row, dtype=str)
     else:
-        df = pd.read_csv(buf, header=header_row, dtype=str, encoding="utf-8-sig")
+        df = read_csv_with_header(buf, header_row)
 
     df = df.dropna(how="all")
     rename = {}
@@ -524,8 +647,7 @@ def parse_classification_file(uploaded_file):
     if suffix in (".xlsx", ".xls"):
         df = pd.read_excel(buf, dtype=str)
     else:
-        buf.seek(0)
-        df = pd.read_csv(buf, dtype=str, encoding="utf-8-sig")
+        df = read_csv_with_header(buf, 0)
 
     df = df.dropna(how="all")
 
@@ -778,8 +900,19 @@ def sanitize_sheet_title(title: str, max_len: int = 31) -> str:
     return title[:max_len]
 
 
-def build_ads_sheet(wb, df, name, periodo, color, classif_cols=None):
+# Limite righe per i fogli KW dell'Excel: oltre questa soglia (tipico dei report
+# Termini di ricerca) si esportano le righe con più costo. I fogli di riepilogo
+# (TABELLE, TOP10, critiche) restano calcolati sull'intero dataset.
+EXCEL_MAX_ROWS = 20000
+
+
+def build_ads_sheet(wb, df, name, periodo, color, classif_cols=None, max_rows=EXCEL_MAX_ROWS):
     classif_cols = classif_cols or []
+    n_total = len(df)
+    truncated = max_rows is not None and n_total > max_rows
+    if truncated:
+        sort_col = next((c for c in ("cost", "clicks", "impressions") if c in df.columns), None)
+        df = (df.sort_values(sort_col, ascending=False, na_position="last") if sort_col else df).head(max_rows)
     # Colonne classificazione inserite dopo keyword e match_type (prime 2 di OUTPUT_COLS)
     EXTRA_COLS = [(c, c) for c in classif_cols if c in df.columns]
     # Costruisci lista colonne finale: fissi fino a match_type, poi classif, poi il resto
@@ -795,6 +928,8 @@ def build_ads_sheet(wb, df, name, periodo, color, classif_cols=None):
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n)
     c = ws.cell(row=1, column=1)
     c.value = f"Google Ads · {name} · {periodo}"
+    if truncated:
+        c.value += f" · prime {max_rows:,} righe per costo su {n_total:,}".replace(",", ".")
     c.fill = PatternFill("solid", fgColor=color)
     c.font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
     c.alignment = Alignment(horizontal="center", vertical="center")
@@ -813,39 +948,59 @@ def build_ads_sheet(wb, df, name, periodo, color, classif_cols=None):
 
     check_col = next((j for j, (k, _) in enumerate(ALL_COLS, 1) if k == "check_qs"), None)
 
-    for i, (_, row) in enumerate(df.iterrows()):
-        r = i + 3
-        for j, (internal, _) in enumerate(ALL_COLS, 1):
-            val = row.get(internal, "")
-            if pd.isna(val):
-                val = ""
-            if internal == "quality_score" and val != "":
-                try:
-                    val = int(float(val))
-                except Exception:
-                    pass
-            elif internal in ("cost", "avg_cpc") and val != "":
-                try:
-                    val = round(float(val), 2)
-                except Exception:
-                    pass
-            elif internal == "pos_organica" and val != "":
-                try:
-                    val = round(float(val), 1)
-                except Exception:
-                    pass
-            ws.cell(row=r, column=j).value = val
-        data_row(ws, r, alt=(i % 2 == 1))
-        if check_col:
-            cell = ws.cell(row=r, column=check_col)
-            if cell.value == "OK":
-                cell.fill = PatternFill("solid", fgColor=C_OK)
-                cell.font = Font(name="Arial", size=9, bold=True, color="276221")
-            elif cell.value == "KO":
-                cell.fill = PatternFill("solid", fgColor=C_KO)
-                cell.font = Font(name="Arial", size=9, bold=True, color="9C0006")
+    # Stili creati una sola volta e riusati (creare oggetti per cella è molto lento)
+    fill_white = PatternFill("solid", fgColor=C_WHITE)
+    fill_gray  = PatternFill("solid", fgColor=C_GRAY)
+    font_data  = Font(name="Arial", size=9)
+    border     = thin()
+    align      = Alignment(vertical="center")
+    fill_ok, font_ok = PatternFill("solid", fgColor=C_OK), Font(name="Arial", size=9, bold=True, color="276221")
+    fill_ko, font_ko = PatternFill("solid", fgColor=C_KO), Font(name="Arial", size=9, bold=True, color="9C0006")
 
-    auto_width(ws)
+    def _fmt(internal, val):
+        if val is None or (isinstance(val, float) and np.isnan(val)) or val is pd.NA:
+            return ""
+        try:
+            if internal == "quality_score":
+                return int(float(val))
+            if internal in ("cost", "avg_cpc"):
+                return round(float(val), 2)
+            if internal == "pos_organica":
+                return round(float(val), 1)
+        except (TypeError, ValueError):
+            pass
+        return val
+
+    keys = [k for k, _ in ALL_COLS]
+    values = df.reindex(columns=keys).astype(object).to_numpy()
+    widths = [len(str(lbl)) for _, lbl in ALL_COLS]
+
+    # Registra ogni combinazione di stile una volta sola, poi copia lo StyleArray
+    # interno nelle celle (assegnare font/fill per cella costa ~80µs ciascuno)
+    def _style_template(fill, font):
+        tpl = ws.cell(row=3, column=1)
+        tpl.font, tpl.fill, tpl.border, tpl.alignment = font, fill, border, align
+        return copy(tpl._style)
+    st_white = _style_template(fill_white, font_data)
+    st_gray  = _style_template(fill_gray,  font_data)
+    st_ok    = _style_template(fill_ok,    font_ok)
+    st_ko    = _style_template(fill_ko,    font_ko)
+
+    for i, row_vals in enumerate(values):
+        r = i + 3
+        base = st_gray if i % 2 == 1 else st_white
+        for j, (internal, raw_val) in enumerate(zip(keys, row_vals), 1):
+            val = _fmt(internal, raw_val)
+            cell = ws.cell(row=r, column=j, value=val)
+            style = base
+            if j == check_col:
+                style = st_ok if val == "OK" else (st_ko if val == "KO" else base)
+            cell._style = copy(style)
+            if val != "":
+                widths[j - 1] = max(widths[j - 1], len(str(val)))
+
+    for j, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(j)].width = min(max(w + 2, 8), 42)
     ws.freeze_panes = "C3"
     ws.auto_filter.ref = f"A2:{get_column_letter(n)}2"
 
@@ -1439,17 +1594,17 @@ row2_c1, row2_c2 = st.columns(2)
 with row1_c1:
     st.markdown("**1 · Google Ads PRIMA** ✱")
     file_prima = st.file_uploader(
-        "Export keyword report periodo precedente",
+        "Export Parole chiave o Termini di ricerca, periodo precedente",
         type=["xlsx", "xls", "csv"], key="ads_prima",
-        help="Sheet 'Keyword' dell'export Google Ads. Obbligatorio."
+        help="Report Parole chiave o Termini di ricerca di Google Ads (CSV o Excel CSV). Obbligatorio."
     )
 
 with row1_c2:
     st.markdown("**2 · Google Ads DOPO** ✱")
     file_dopo = st.file_uploader(
-        "Export keyword report periodo corrente",
+        "Export Parole chiave o Termini di ricerca, periodo corrente",
         type=["xlsx", "xls", "csv"], key="ads_dopo",
-        help="Sheet 'Keyword' dell'export Google Ads. Obbligatorio."
+        help="Report Parole chiave o Termini di ricerca di Google Ads (CSV o Excel CSV). Obbligatorio."
     )
 
 with row2_c1:
@@ -2052,12 +2207,22 @@ Le **{n_kw_ko} keyword critiche** (QS KO con spesa) vengono esportate come testo
 
         col_dl1, col_dl2 = st.columns([2, 3])
         with col_dl1:
-            with st.spinner("Generazione Excel..."):
-                xlsx_bytes = generate_excel(
-                    df_prima, df_dopo, periodo_prima, periodo_dopo,
-                    qs_thr_brand, qs_thr_nobrand, classif_extra_cols,
-                    brand_col_detected, brand_flag_values
-                )
+            # Rigenera l'Excel solo se cambiano file, periodi o soglie
+            _xlsx_key = (st.session_state.get("_cache_key"), periodo_prima, periodo_dopo,
+                         qs_thr_brand, qs_thr_nobrand)
+            if st.session_state.get("_xlsx_key") != _xlsx_key:
+                _big = max(len(df_prima), len(df_dopo)) > EXCEL_MAX_ROWS
+                with st.spinner("Generazione Excel..." + (" (dataset grande, può richiedere un minuto)" if _big else "")):
+                    st.session_state["_xlsx_bytes"] = generate_excel(
+                        df_prima, df_dopo, periodo_prima, periodo_dopo,
+                        qs_thr_brand, qs_thr_nobrand, classif_extra_cols,
+                        brand_col_detected, brand_flag_values
+                    )
+                st.session_state["_xlsx_key"] = _xlsx_key
+            xlsx_bytes = st.session_state["_xlsx_bytes"]
+            if max(len(df_prima), len(df_dopo)) > EXCEL_MAX_ROWS:
+                st.caption(f"Fogli KW limitati alle prime {EXCEL_MAX_ROWS:,} righe per costo; "
+                           "i riepiloghi usano tutti i dati.".replace(",", "."))
 
             filename = f"analisi_seo_sea_{cliente.lower().replace(' ', '_')}_{periodo_dopo.lower().replace(' ', '_')}.xlsx"
             st.download_button(
