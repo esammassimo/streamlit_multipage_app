@@ -337,9 +337,10 @@ def parse_ads_file(uploaded_file) -> pd.DataFrame:
 
 
 # Varianti colonna query GSC (IT + EN)
-GSC_QUERY_VARIANTS  = ("query", "top queries", "search query", "keyword", "parola chiave", "query di ricerca")
+GSC_QUERY_VARIANTS  = ("query", "top queries", "queries", "query principali", "search query",
+                       "keyword", "parola chiave", "query di ricerca")
 GSC_POS_VARIANTS    = ("position", "avg. position", "avg, position", "posizione media", "posizione", "pos. media")
-GSC_PAGE_VARIANTS   = ("page", "top pages", "pagina", "landing page", "url")
+GSC_PAGE_VARIANTS   = ("page", "top pages", "pagine principali", "pagina", "landing page", "url")
 GSC_CLICKS_VARIANTS = ("clicks", "clic", "click")
 GSC_IMPR_VARIANTS   = ("impressions", "impressioni")
 
@@ -354,23 +355,45 @@ def parse_gsc_file(uploaded_file) -> pd.DataFrame:
     suffix = Path(name).suffix.lower()
     buf = io.BytesIO(uploaded_file.read())
 
+    def _find_query_header(frame, max_rows=15):
+        """Indice della riga che contiene l'intestazione della colonna query, altrimenti None."""
+        for i, row in frame.head(max_rows).iterrows():
+            vals = [normalize_col(str(v)) for v in row if pd.notna(v) and str(v).strip()]
+            if any(v in GSC_QUERY_VARIANTS for v in vals):
+                return i
+        return None
+
+    sheet_names = []
     if suffix in (".xlsx", ".xls"):
-        raw = pd.read_excel(buf, sheet_name=0, header=None, dtype=str)
+        # L'export dall'interfaccia GSC ha più fogli (Grafico/Chart, Query/Queries,
+        # Pagine/Pages, Paesi, Dispositivi, Filtri…): serve quello delle query.
+        buf.seek(0)
+        sheet_names = pd.ExcelFile(buf).sheet_names
+        preferred = sorted(sheet_names, key=lambda n: 0 if normalize_col(n) in ("query", "queries", "query principali", "top queries") else 1)
+        raw, header_row = None, None
+        for sh in preferred:
+            buf.seek(0)
+            candidate = pd.read_excel(buf, sheet_name=sh, header=None, dtype=str)
+            hr = _find_query_header(candidate)
+            if hr is not None:
+                raw, header_row, target_sheet = candidate, hr, sh
+                break
+        if raw is None:
+            raise ValueError(
+                f"Nel file GSC '{name}' non c'è un foglio con la colonna delle query. "
+                f"Fogli trovati: {sheet_names}. Serve l'export del report Prestazioni "
+                "con il foglio 'Query' (EN: 'Queries')."
+            )
+        df = _frame_from_raw(raw, header_row)
     else:
         raw = _read_csv_raw(buf)
-
-    # Trova riga header: contiene "query" o "keyword" o "clicks"
-    header_row = 0
-    for i, row in raw.iterrows():
-        vals = [normalize_col(str(v)) for v in row if pd.notna(v) and str(v).strip()]
-        if any(v in GSC_QUERY_VARIANTS or v in GSC_CLICKS_VARIANTS for v in vals):
-            header_row = i
-            break
-
-    if suffix in (".xlsx", ".xls"):
-        buf.seek(0)
-        df = pd.read_excel(buf, sheet_name=0, header=header_row, dtype=str)
-    else:
+        header_row = _find_query_header(raw)
+        if header_row is None:
+            raise ValueError(
+                f"Il file GSC '{name}' non contiene una colonna query. "
+                "Se hai esportato in CSV da Search Console, carica il file 'Query.csv' "
+                "(EN: 'Queries.csv') contenuto nello zip, non 'Grafico.csv' o 'Pagine.csv'."
+            )
         df = _frame_from_raw(raw, header_row)
 
     df = df.dropna(how="all")
