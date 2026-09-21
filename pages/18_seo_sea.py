@@ -152,7 +152,7 @@ def read_csv_with_header(buf: io.BytesIO, header_row: int = 0) -> pd.DataFrame:
 # PARSING NUMERICO (formati EN "1,234.56" e IT "1.234,56")
 # ─────────────────────────────────────────────────────────────
 
-_NUM_JUNK_RE = r"[€$£%\s\u00a0\u202f]"
+_NUM_JUNK_RE = "[€$£%\\s  ]"  # include NBSP e narrow NBSP come caratteri letterali (RE2 non accetta \\u)
 
 
 def detect_decimal_sep(df: pd.DataFrame, cols) -> str:
