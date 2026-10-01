@@ -83,6 +83,65 @@ FIELD_LABELS = {
 
 
 # =========================================================
+# CONFIG · RICERCA DA KEYWORD (engine=amazon)
+# =========================================================
+SEARCH_FIELDS = [
+    "organic_rank",
+    "sponsored_rank",
+    "sponsored",
+    "asin",
+    "title",
+    "brand",
+    "price",
+    "price_raw",
+    "currency",
+    "old_price",
+    "rating",
+    "reviews_count",
+    "bought_last_month",
+    "prime",
+    "availability",
+    "delivery",
+    "badges",
+    "options",
+    "thumbnail",
+    "product_url",
+]
+
+SEARCH_FIELD_LABELS = {
+    "organic_rank": "Ranking organico",
+    "sponsored_rank": "Ranking sponsorizzato",
+    "sponsored": "Sponsorizzato",
+    "asin": "ASIN",
+    "title": "Nome prodotto",
+    "brand": "Brand",
+    "price": "Prezzo",
+    "price_raw": "Prezzo (testo)",
+    "currency": "Valuta",
+    "old_price": "Prezzo barrato",
+    "rating": "Rating",
+    "reviews_count": "Numero recensioni",
+    "bought_last_month": "Acquisti ultimo mese",
+    "prime": "Prime",
+    "availability": "Disponibilità",
+    "delivery": "Consegna",
+    "badges": "Badge",
+    "options": "Opzioni / varianti",
+    "thumbnail": "Immagine",
+    "product_url": "URL prodotto",
+}
+
+SORT_OPTIONS = {
+    "Rilevanza (default Amazon)": "",
+    "Prezzo crescente": "price-asc-rank",
+    "Prezzo decrescente": "price-desc-rank",
+    "Recensioni migliori": "review-rank",
+    "Novità": "date-desc-rank",
+    "Più venduti": "exact-aware-popularity-rank",
+}
+
+
+# =========================================================
 # SESSION STATE
 # =========================================================
 def init_session_state():
@@ -104,6 +163,23 @@ def init_session_state():
         "results_df": None,
         "raw_results": [],
         "run_completed": False,
+        # --- Tab "Ricerca da keyword" ---
+        "kw_uploaded_file_name": None,
+        "kw_input_df": None,
+        "kw_sheet_names": [],
+        "kw_selected_sheet": None,
+        "kw_column": None,
+        "kw_list": [],
+        "kw_deduplicate": True,
+        "kw_amazon_domain": "amazon.it",
+        "kw_sort": "",
+        "kw_delay_seconds": 1.0,
+        "kw_include_sponsored": True,
+        "kw_max_results": 0,
+        "kw_show_logs": True,
+        "kw_selected_fields": SEARCH_FIELDS.copy(),
+        "kw_results_df": None,
+        "kw_run_completed": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -191,6 +267,35 @@ def number_from_any(value):
         return float(filtered)
     except Exception:
         return safe_str(value)
+
+
+def make_arrow_safe(df):
+    """
+    Uniforma i tipi delle colonne object: Streamlit (pyarrow) va in errore
+    quando una colonna mescola numeri e stringhe vuote.
+    """
+    for col in df.columns:
+        if df[col].dtype != object:
+            continue
+        series = df[col]
+        values = [v for v in series.tolist() if v is not None and v != ""]
+
+        if not values:
+            df[col] = series.apply(lambda v: "" if v is None else str(v))
+            continue
+
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
+            numeric = pd.to_numeric(series.replace("", None), errors="coerce")
+            if all(isinstance(v, int) for v in values):
+                try:
+                    numeric = numeric.astype("Int64")
+                except Exception:
+                    pass
+            df[col] = numeric
+        elif any(not isinstance(v, str) for v in values):
+            df[col] = series.apply(lambda v: "" if v is None or v == "" else str(v))
+
+    return df
 
 
 def json_dumps_safe(data):
@@ -779,8 +884,371 @@ def process_asin_list(
             time.sleep(delay_seconds)
 
     status_placeholder.write("✅ Estrazione completata.")
-    df = pd.DataFrame(rows)
+    df = make_arrow_safe(pd.DataFrame(rows))
     return df, raw_results
+
+
+# =========================================================
+# RICERCA DA KEYWORD · INPUT
+# =========================================================
+def normalize_keyword(value):
+    return " ".join(safe_str(value).split())
+
+
+def extract_keywords_from_df(df, keyword_column, deduplicate=True):
+    if keyword_column not in df.columns:
+        raise ValueError(f"La colonna '{keyword_column}' non esiste nel file.")
+
+    raw_values = df[keyword_column].dropna().tolist()
+    cleaned = [normalize_keyword(v) for v in raw_values]
+    cleaned = [x for x in cleaned if x]
+
+    duplicates_removed = 0
+    if deduplicate:
+        original_count = len(cleaned)
+        seen = {}
+        for kw in cleaned:
+            seen.setdefault(kw.lower(), kw)
+        cleaned = list(seen.values())
+        duplicates_removed = original_count - len(cleaned)
+
+    return cleaned, duplicates_removed
+
+
+# =========================================================
+# RICERCA DA KEYWORD · SERPAPI (engine=amazon)
+# =========================================================
+def get_amazon_search_data(keyword, api_key, amazon_domain="amazon.it", sort_by="", page=1):
+    cache_key = f"SEARCH|{keyword.lower()}|{amazon_domain}|{sort_by}|{page}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    params = {
+        "engine": "amazon",
+        "api_key": api_key,
+        "amazon_domain": amazon_domain,
+        "k": keyword,
+        "page": page,
+        "output": "json",
+    }
+    if sort_by:
+        params["s"] = sort_by
+
+    response = requests.get(API_URL, params=params, timeout=60)
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Errore API per la keyword '{keyword}' - HTTP {response.status_code}: {response.text[:300]}"
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise RuntimeError(f"Risposta non valida per la keyword '{keyword}' (JSON non parsabile).")
+
+    if "error" in data:
+        raise RuntimeError(f"Errore API per la keyword '{keyword}': {data['error']}")
+
+    _cache_set(cache_key, data)
+    return data
+
+
+def extract_currency_symbol(price_text):
+    text = safe_str(price_text)
+    if not text:
+        return ""
+    symbols = "".join(
+        ch for ch in text if not ch.isdigit() and ch not in {".", ",", " ", " "}
+    )
+    return symbols.strip()
+
+
+def price_number_from_text(value):
+    """
+    Converte un prezzo testuale in numero gestendo sia il formato europeo
+    (1.299,00 €) sia quello anglosassone ($1,299.00).
+    """
+    if value is None or value == "":
+        return ""
+    if isinstance(value, (int, float)):
+        return value
+
+    text = safe_str(value)
+    digits = "".join(ch for ch in text if ch.isdigit() or ch in {".", ","})
+    if not digits:
+        return ""
+
+    last_dot = digits.rfind(".")
+    last_comma = digits.rfind(",")
+
+    if last_dot > last_comma:
+        # separatore decimale = punto, virgole = migliaia
+        digits = digits.replace(",", "")
+    elif last_comma > last_dot:
+        # separatore decimale = virgola, punti = migliaia
+        digits = digits.replace(".", "").replace(",", ".")
+    else:
+        digits = digits.replace(",", "").replace(".", "")
+
+    try:
+        return float(digits)
+    except Exception:
+        return safe_str(value)
+
+
+def bool_to_label(value):
+    if value is True:
+        return "Sì"
+    if value is False:
+        return "No"
+    if value in (None, ""):
+        return ""
+    return safe_str(value)
+
+
+def parse_search_brand(item):
+    """
+    L'engine 'amazon' di SerpAPI non espone sempre il brand:
+    lo recuperiamo solo se presente (best effort), senza chiamate API aggiuntive.
+    """
+    brand = first_non_empty(
+        [
+            item.get("brand"),
+            item.get("manufacturer"),
+            item.get("byline"),
+            get_nested(item, "brand", "name"),
+        ],
+        default="",
+    )
+    if isinstance(brand, dict):
+        brand = first_non_empty(
+            [brand.get("name"), brand.get("text"), brand.get("value")],
+            default="",
+        )
+    return safe_str(brand)
+
+
+def collect_search_items(data, include_sponsored=True):
+    """
+    Raccoglie i prodotti dalla SERP Amazon in ordine di apparizione.
+    Ritorna una lista di tuple (item_dict, is_sponsored).
+    """
+    items = []
+
+    organic = data.get("organic_results") or []
+    if isinstance(organic, list):
+        for item in organic:
+            if not isinstance(item, dict):
+                continue
+            is_sponsored = bool(item.get("sponsored"))
+            if is_sponsored and not include_sponsored:
+                continue
+            items.append((item, is_sponsored))
+
+    if include_sponsored:
+        # Blocchi pubblicitari separati (Sponsored Brands / Product Ads)
+        for block_key in ("product_ads", "sponsored_brands", "ads"):
+            block = data.get(block_key)
+            if not block:
+                continue
+            candidates = []
+            if isinstance(block, dict):
+                candidates = block.get("products") or []
+            elif isinstance(block, list):
+                for entry in block:
+                    if isinstance(entry, dict) and isinstance(entry.get("products"), list):
+                        candidates.extend(entry["products"])
+                    elif isinstance(entry, dict):
+                        candidates.append(entry)
+            for item in candidates:
+                if isinstance(item, dict):
+                    items.append((item, True))
+
+    return items
+
+
+def parse_search_row(item, is_sponsored, keyword, amazon_domain, organic_rank, sponsored_rank, selected_fields):
+    asin = normalize_asin(item.get("asin"))
+
+    price_raw = safe_str(first_non_empty([item.get("price"), item.get("price_unit")], default=""))
+    price_value = first_non_empty(
+        [item.get("extracted_price"), item.get("extracted_price_unit")],
+        default="",
+    )
+    if price_value == "" and price_raw:
+        price_value = price_number_from_text(price_raw)
+
+    old_price = first_non_empty(
+        [item.get("extracted_old_price"), item.get("old_price")],
+        default="",
+    )
+    if isinstance(old_price, str) and old_price:
+        old_price = price_number_from_text(old_price)
+
+    link = safe_str(first_non_empty([item.get("link_clean"), item.get("link")], default=""))
+    if not link and asin:
+        link = f"https://{amazon_domain}/dp/{asin}"
+
+    badges = first_non_empty([item.get("badges"), item.get("tags"), item.get("badge")], default=[])
+    if isinstance(badges, (list, tuple)):
+        badges_text = list_to_pipe_text(list(badges))
+    else:
+        badges_text = safe_str(badges)
+
+    options = item.get("options")
+    if isinstance(options, (list, tuple)):
+        options_text = list_to_pipe_text(list(options))
+    else:
+        options_text = safe_str(options)
+
+    delivery = item.get("delivery")
+    if isinstance(delivery, (list, tuple)):
+        delivery_text = list_to_pipe_text(list(delivery))
+    else:
+        delivery_text = safe_str(delivery)
+
+    field_values = {
+        "organic_rank": organic_rank if organic_rank else "",
+        "sponsored_rank": sponsored_rank if sponsored_rank else "",
+        "sponsored": "Sì" if is_sponsored else "No",
+        "asin": asin,
+        "title": safe_str(item.get("title")),
+        "brand": parse_search_brand(item),
+        "price": price_value,
+        "price_raw": price_raw,
+        "currency": extract_currency_symbol(price_raw),
+        "old_price": old_price,
+        "rating": first_non_empty([item.get("rating")], default=""),
+        "reviews_count": first_non_empty([item.get("reviews"), item.get("reviews_count")], default=""),
+        "bought_last_month": safe_str(item.get("bought_last_month")),
+        "prime": bool_to_label(first_non_empty([item.get("prime"), item.get("has_prime")], default="")),
+        "availability": safe_str(first_non_empty([item.get("stock"), item.get("availability")], default="")),
+        "delivery": delivery_text,
+        "badges": badges_text,
+        "options": options_text,
+        "thumbnail": safe_str(item.get("thumbnail")),
+        "product_url": link,
+    }
+
+    now = datetime.now()
+    row = {
+        "Keyword": keyword,
+        "Marketplace": amazon_domain,
+        "Status": "OK",
+        "Error": "",
+        "Data estrazione": now.strftime("%Y-%m-%d"),
+        "Ora estrazione": now.strftime("%H:%M:%S"),
+    }
+    for field in selected_fields:
+        row[SEARCH_FIELD_LABELS[field]] = field_values.get(field, "")
+
+    return row
+
+
+def process_keyword_list(
+    keywords,
+    api_key,
+    amazon_domain,
+    selected_fields,
+    include_sponsored=True,
+    sort_by="",
+    max_results_per_keyword=0,
+    delay_seconds=1.0,
+    show_logs=True,
+):
+    rows = []
+
+    progress_bar = st.progress(0)
+    status_placeholder = st.empty()
+    log_placeholder = st.empty()
+
+    total = len(keywords)
+    log_lines = []
+
+    for idx, keyword in enumerate(keywords, start=1):
+        cache_key = f"SEARCH|{keyword.lower()}|{amazon_domain}|{sort_by}|1"
+        is_cached = _cache_get(cache_key) is not None
+        label = "(da cache) " if is_cached else ""
+        status_placeholder.write(f"🔎 {label}Cerco **{keyword}** ({idx}/{total})")
+
+        try:
+            data = get_amazon_search_data(
+                keyword=keyword,
+                api_key=api_key,
+                amazon_domain=amazon_domain,
+                sort_by=sort_by,
+            )
+            items = collect_search_items(data, include_sponsored=include_sponsored)
+
+            if max_results_per_keyword and max_results_per_keyword > 0:
+                items = items[:max_results_per_keyword]
+
+            if not items:
+                now = datetime.now()
+                empty_row = {
+                    "Keyword": keyword,
+                    "Marketplace": amazon_domain,
+                    "Status": "NO RESULTS",
+                    "Error": "",
+                    "Data estrazione": now.strftime("%Y-%m-%d"),
+                    "Ora estrazione": now.strftime("%H:%M:%S"),
+                }
+                for field in selected_fields:
+                    empty_row[SEARCH_FIELD_LABELS[field]] = ""
+                rows.append(empty_row)
+                if show_logs:
+                    log_lines.append(f"⚠️ {keyword} - nessun risultato")
+            else:
+                organic_counter = 0
+                sponsored_counter = 0
+                for item, is_sponsored in items:
+                    if is_sponsored:
+                        sponsored_counter += 1
+                    else:
+                        organic_counter += 1
+                    rows.append(
+                        parse_search_row(
+                            item=item,
+                            is_sponsored=is_sponsored,
+                            keyword=keyword,
+                            amazon_domain=amazon_domain,
+                            organic_rank=0 if is_sponsored else organic_counter,
+                            sponsored_rank=sponsored_counter if is_sponsored else 0,
+                            selected_fields=selected_fields,
+                        )
+                    )
+                if show_logs:
+                    log_lines.append(f"✅ {keyword} - {len(items)} risultati")
+
+        except Exception as exc:
+            error_message = safe_str(exc)
+            now = datetime.now()
+            error_row = {
+                "Keyword": keyword,
+                "Marketplace": amazon_domain,
+                "Status": "ERROR",
+                "Error": error_message,
+                "Data estrazione": now.strftime("%Y-%m-%d"),
+                "Ora estrazione": now.strftime("%H:%M:%S"),
+            }
+            for field in selected_fields:
+                error_row[SEARCH_FIELD_LABELS[field]] = ""
+            rows.append(error_row)
+
+            if show_logs:
+                log_lines.append(f"❌ {keyword} - {error_message}")
+
+        progress_bar.progress(idx / total)
+
+        if show_logs:
+            log_placeholder.text("\n".join(log_lines[-15:]))
+
+        if not is_cached and delay_seconds > 0 and idx < total:
+            time.sleep(delay_seconds)
+
+    status_placeholder.write("✅ Ricerca completata.")
+    return make_arrow_safe(pd.DataFrame(rows))
 
 
 # =========================================================
@@ -805,7 +1273,7 @@ def dataframe_to_excel_bytes(df, sheet_name="Amazon_ASIN"):
             worksheet.write(0, col_num, value, header_format)
             max_len = max(
                 len(str(value)),
-                df.iloc[:, col_num].astype(str).map(len).max() if not df.empty else 10,
+                int(df.iloc[:, col_num].map(lambda v: len(str(v))).max()) if not df.empty else 10,
             )
             worksheet.set_column(col_num, col_num, min(max(max_len + 2, 15), 50), wrap_format)
 
@@ -1083,33 +1551,301 @@ def render_phase_5_download():
 
 
 # =========================================================
-# MAIN
+# UI · TAB RICERCA DA KEYWORD
 # =========================================================
-def main():
-    st.set_page_config(
-        page_title="Amazon ASIN Extractor",
-        page_icon="🛒",
-        layout="wide",
-    )
+def render_keyword_upload():
+    st.header("Fase 1 · Upload lista keyword")
 
-    init_session_state()
+    with st.container(border=True):
+        uploaded_file = st.file_uploader(
+            "Carica un file XLSX o CSV con le parole chiave",
+            type=["csv", "xlsx"],
+            key="kw_file_uploader",
+        )
 
-    st.title("🛒 Amazon ASIN Extractor · SerpAPI")
+        if uploaded_file is None:
+            st.info("Carica un file per selezionare la colonna delle keyword.")
+            return
+
+        try:
+            preview_df, sheet_names, file_type = load_input_file(uploaded_file)
+            st.session_state["kw_uploaded_file_name"] = uploaded_file.name
+            st.session_state["kw_sheet_names"] = sheet_names
+
+            if file_type == "xlsx":
+                selected_sheet = st.selectbox(
+                    "Seleziona il foglio Excel",
+                    options=sheet_names,
+                    index=0,
+                    key="kw_sheet_select",
+                )
+                st.session_state["kw_selected_sheet"] = selected_sheet
+                preview_df = read_dataframe_from_uploaded_file(uploaded_file, selected_sheet=selected_sheet)
+            else:
+                st.session_state["kw_selected_sheet"] = None
+
+            st.session_state["kw_input_df"] = preview_df
+
+            st.write("Anteprima file:")
+            st.dataframe(preview_df.head(20), use_container_width=True)
+
+            keyword_column = st.selectbox(
+                "Seleziona la colonna contenente le keyword",
+                options=list(preview_df.columns),
+                index=0 if len(preview_df.columns) > 0 else None,
+                key="kw_column_select",
+            )
+            st.session_state["kw_column"] = keyword_column
+
+            deduplicate = st.checkbox(
+                "Rimuovi keyword duplicate",
+                value=st.session_state.get("kw_deduplicate", True),
+                key="kw_dedup_checkbox",
+            )
+            st.session_state["kw_deduplicate"] = deduplicate
+
+            keywords, duplicates_removed = extract_keywords_from_df(
+                preview_df,
+                keyword_column=keyword_column,
+                deduplicate=deduplicate,
+            )
+            st.session_state["kw_list"] = keywords
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Keyword valide", len(keywords))
+            col2.metric("Duplicati rimossi", duplicates_removed)
+            col3.metric("Chiamate API stimate", len(keywords))
+
+            if keywords:
+                st.write("Prime 20 keyword pulite:")
+                st.code("\n".join(keywords[:20]))
+            else:
+                st.warning("Nessuna keyword valida trovata nella colonna selezionata.")
+
+        except Exception as exc:
+            st.error(f"Errore nella lettura del file: {exc}")
+
+
+def render_keyword_options():
+    st.header("Fase 2 · Opzioni di ricerca")
+
+    with st.container(border=True):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            amazon_domain = st.selectbox(
+                "Marketplace Amazon",
+                options=MARKETPLACES,
+                index=MARKETPLACES.index(st.session_state.get("kw_amazon_domain", "amazon.it")),
+                key="kw_marketplace_select",
+            )
+            st.session_state["kw_amazon_domain"] = amazon_domain
+
+            sort_labels = list(SORT_OPTIONS.keys())
+            current_sort = st.session_state.get("kw_sort", "")
+            current_label = next(
+                (label for label, value in SORT_OPTIONS.items() if value == current_sort),
+                sort_labels[0],
+            )
+            sort_label = st.selectbox(
+                "Ordinamento risultati",
+                options=sort_labels,
+                index=sort_labels.index(current_label),
+                key="kw_sort_select",
+            )
+            st.session_state["kw_sort"] = SORT_OPTIONS[sort_label]
+
+            delay_seconds = st.slider(
+                "Delay tra le richieste (secondi)",
+                min_value=0.0,
+                max_value=5.0,
+                value=float(st.session_state.get("kw_delay_seconds", 1.0)),
+                step=0.5,
+                key="kw_delay_slider",
+            )
+            st.session_state["kw_delay_seconds"] = delay_seconds
+
+        with col2:
+            st.session_state["kw_include_sponsored"] = st.checkbox(
+                "Includi risultati sponsorizzati (Sponsored / Product Ads)",
+                value=st.session_state.get("kw_include_sponsored", True),
+                help="I risultati sponsorizzati restano distinguibili grazie alla colonna «Sponsorizzato».",
+                key="kw_sponsored_checkbox",
+            )
+
+            st.session_state["kw_max_results"] = int(
+                st.number_input(
+                    "Max risultati per keyword (0 = tutti quelli della prima pagina)",
+                    min_value=0,
+                    max_value=100,
+                    value=int(st.session_state.get("kw_max_results", 0)),
+                    step=1,
+                    key="kw_max_results_input",
+                )
+            )
+
+            st.session_state["kw_show_logs"] = st.checkbox(
+                "Mostra log dettagliato",
+                value=st.session_state.get("kw_show_logs", True),
+                key="kw_logs_checkbox",
+            )
+
+        st.subheader("Colonne da esportare")
+
+        default_fields = st.session_state.get("kw_selected_fields", SEARCH_FIELDS.copy())
+        selected_fields = []
+
+        cols = st.columns(3)
+        for idx, field in enumerate(SEARCH_FIELDS):
+            with cols[idx % 3]:
+                checked = st.checkbox(
+                    SEARCH_FIELD_LABELS[field],
+                    value=field in default_fields,
+                    key=f"kw_field_{field}",
+                )
+                if checked:
+                    selected_fields.append(field)
+
+        st.session_state["kw_selected_fields"] = selected_fields
+
+        if not selected_fields:
+            st.warning("Seleziona almeno una colonna da esportare.")
+        else:
+            st.success(f"Colonne selezionate: {len(selected_fields)}")
+
+
+def render_keyword_extraction():
+    st.header("Fase 3 · Esecuzione ricerca")
+
+    with st.container(border=True):
+        api_key = st.session_state.get("serpapi_key", "").strip()
+        keywords = st.session_state.get("kw_list", [])
+        selected_fields = st.session_state.get("kw_selected_fields", [])
+
+        checks = {
+            "API key configurata": bool(api_key),
+            "Keyword disponibili": len(keywords) > 0,
+            "Colonne selezionate": len(selected_fields) > 0,
+        }
+
+        for label, ok in checks.items():
+            if ok:
+                st.success(label)
+            else:
+                st.error(label)
+
+        if st.button("🚀 Avvia ricerca da keyword", use_container_width=True, key="kw_run_button"):
+            if not all(checks.values()):
+                st.warning("Completa prima tutte le fasi precedenti.")
+                return
+
+            try:
+                results_df = process_keyword_list(
+                    keywords=keywords,
+                    api_key=api_key,
+                    amazon_domain=st.session_state.get("kw_amazon_domain", "amazon.it"),
+                    selected_fields=selected_fields,
+                    include_sponsored=st.session_state.get("kw_include_sponsored", True),
+                    sort_by=st.session_state.get("kw_sort", ""),
+                    max_results_per_keyword=st.session_state.get("kw_max_results", 0),
+                    delay_seconds=st.session_state.get("kw_delay_seconds", 1.0),
+                    show_logs=st.session_state.get("kw_show_logs", True),
+                )
+
+                st.session_state["kw_results_df"] = results_df
+                st.session_state["kw_run_completed"] = True
+
+                ok_count = int((results_df["Status"] == "OK").sum()) if "Status" in results_df.columns else 0
+                err_count = int((results_df["Status"] == "ERROR").sum()) if "Status" in results_df.columns else 0
+
+                st.success(
+                    f"Ricerca completata. Righe prodotto: {ok_count} · Keyword in errore: {err_count}"
+                )
+                st.dataframe(results_df.head(30), use_container_width=True)
+
+            except Exception as exc:
+                st.error(f"Errore durante la ricerca: {exc}")
+
+
+def render_keyword_download():
+    st.header("Fase 4 · Preparazione file e download")
+
+    with st.container(border=True):
+        df = st.session_state.get("kw_results_df")
+
+        if df is None or df.empty:
+            st.info("Nessun file pronto. Esegui prima la ricerca.")
+            return
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Righe totali", len(df))
+        col2.metric("Keyword elaborate", df["Keyword"].nunique() if "Keyword" in df.columns else 0)
+        if "Sponsorizzato" in df.columns:
+            col3.metric("Risultati sponsorizzati", int((df["Sponsorizzato"] == "Sì").sum()))
+
+        st.write("Anteprima risultati:")
+        st.dataframe(df, use_container_width=True)
+
+        base_name = st.text_input(
+            "Nome base file output",
+            value="amazon_keyword_search",
+            key="kw_base_name",
+        )
+
+        csv_bytes = dataframe_to_csv_bytes(df)
+        xlsx_bytes = dataframe_to_excel_bytes(df, sheet_name="Amazon_Keyword")
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            st.download_button(
+                label="⬇️ Scarica CSV",
+                data=csv_bytes,
+                file_name=f"{base_name}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="kw_download_csv",
+            )
+
+        with col_b:
+            st.download_button(
+                label="⬇️ Scarica XLSX",
+                data=xlsx_bytes,
+                file_name=f"{base_name}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="kw_download_xlsx",
+            )
+
+
+def render_keyword_search_tab():
     st.write(
         """
-        Tool Streamlit per estrarre dati prodotto Amazon da una lista di ASIN
-        usando **SerpAPI**, con workflow verticale in 5 fasi e output finale
-        in **CSV** e **XLSX**.
+        Carica una lista di **parole chiave** e scarica i risultati di ricerca Amazon
+        (ranking, ASIN, nome prodotto, brand, prezzo, rating, recensioni, disponibilità…)
+        in un unico foglio CSV/XLSX.
         """
     )
 
-    st.sidebar.title("Stato sessione")
-    st.sidebar.write(f"API key configurata: {'Sì' if st.session_state.get('serpapi_key') else 'No'}")
-    st.sidebar.write(f"ASIN caricati: {len(st.session_state.get('asin_list', []))}")
-    st.sidebar.write(f"Risultati disponibili: {'Sì' if st.session_state.get('results_df') is not None else 'No'}")
-
-    render_phase_1_api_config()
+    render_keyword_upload()
     st.divider()
+
+    render_keyword_options()
+    st.divider()
+
+    render_keyword_extraction()
+    st.divider()
+
+    render_keyword_download()
+
+
+def render_asin_tab():
+    st.write(
+        """
+        Estrai i dati di dettaglio prodotto a partire da una lista di **ASIN**,
+        con workflow verticale in 5 fasi e output finale in **CSV** e **XLSX**.
+        """
+    )
 
     render_phase_2_upload_input()
     st.divider()
@@ -1121,6 +1857,48 @@ def main():
     st.divider()
 
     render_phase_5_download()
+
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    st.set_page_config(
+        page_title="Amazon Extractor",
+        page_icon="🛒",
+        layout="wide",
+    )
+
+    init_session_state()
+
+    st.title("🛒 Amazon Extractor · SerpAPI")
+    st.write(
+        """
+        Tool Streamlit per estrarre dati da Amazon tramite **SerpAPI**:
+        dettaglio prodotto a partire da una lista di **ASIN** oppure
+        risultati di ricerca a partire da una lista di **keyword**.
+        """
+    )
+
+    st.sidebar.title("Stato sessione")
+    st.sidebar.write(f"API key configurata: {'Sì' if st.session_state.get('serpapi_key') else 'No'}")
+    st.sidebar.write(f"ASIN caricati: {len(st.session_state.get('asin_list', []))}")
+    st.sidebar.write(f"Keyword caricate: {len(st.session_state.get('kw_list', []))}")
+    st.sidebar.write(f"Risultati ASIN: {'Sì' if st.session_state.get('results_df') is not None else 'No'}")
+    st.sidebar.write(f"Risultati keyword: {'Sì' if st.session_state.get('kw_results_df') is not None else 'No'}")
+
+    render_phase_1_api_config()
+    st.divider()
+
+    tab_asin, tab_keyword = st.tabs(
+        ["📦 Estrazione da ASIN", "🔎 Ricerca da keyword"]
+    )
+
+    with tab_asin:
+        render_asin_tab()
+
+    with tab_keyword:
+        render_keyword_search_tab()
 
 
 if __name__ == "__main__":
